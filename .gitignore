@@ -11,3 +11,7 @@ obj/
 # Fichiers sources téléchargés pour DataBuilder (OpenAssistant, livres Gutenberg bruts)
 *.jsonl
 *.jsonl.gz
+
+# Dossier et archive produits par publish.ps1
+publish/
+*.zip

@@ -6,8 +6,13 @@
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
     <RootNamespace>MiniChat</RootNamespace>
-    <!-- DataBuilder est un projet à part : ses fichiers ne font pas partie de MiniChat. -->
-    <DefaultItemExcludes>$(DefaultItemExcludes);DataBuilder/**</DefaultItemExcludes>
+    <!-- DataBuilder est un projet à part : ses fichiers ne font pas partie de MiniChat.
+         publish/ est le dossier produit par publish.ps1 : à ne pas reprendre dans le projet. -->
+    <DefaultItemExcludes>$(DefaultItemExcludes);DataBuilder/**;publish/**</DefaultItemExcludes>
+
+    <!-- Où chercher les modèles entraînés à mettre dans le dossier publié : là où "dotnet run" les crée.
+         Autre dossier : dotnet publish ... -p:ModelsSource=D:\MesModeles -->
+    <ModelsSource Condition="'$(ModelsSource)' == ''">$(MSBuildProjectDirectory)\bin\Debug\$(TargetFramework)</ModelsSource>
   </PropertyGroup>
 
   <ItemGroup>
@@ -17,8 +22,23 @@
   </ItemGroup>
 
   <ItemGroup>
-    <!-- Copie les données d'entraînement à côté de l'exécutable. -->
-    <None Update="data\**" CopyToOutputDirectory="PreserveNewest" />
+    <!-- Copie les données d'entraînement à côté de l'exécutable (compilation et dotnet publish). -->
+    <None Update="data\**" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" />
   </ItemGroup>
+
+  <!-- Après dotnet publish : copie model/ et model-pretrain/ dans le dossier publié, s'ils existent.
+       (Ils sont créés à l'exécution, pas à la compilation : MSBuild ne les connaît pas autrement.) -->
+  <Target Name="PublishTrainedModels" AfterTargets="Publish">
+    <ItemGroup>
+      <TrainedModelFile Include="$(ModelsSource)\model\**" Folder="model" />
+      <TrainedModelFile Include="$(ModelsSource)\model-pretrain\**" Folder="model-pretrain" />
+    </ItemGroup>
+    <Copy SourceFiles="@(TrainedModelFile)"
+          DestinationFiles="@(TrainedModelFile->'$(PublishDir)%(Folder)\%(RecursiveDir)%(Filename)%(Extension)')" />
+    <Message Importance="high" Condition="'@(TrainedModelFile)' != ''"
+             Text="Modèles entraînés copiés depuis $(ModelsSource) : @(TrainedModelFile->'%(Folder)'->Distinct())" />
+    <Message Importance="high" Condition="'@(TrainedModelFile)' == ''"
+             Text="Aucun modèle entraîné dans $(ModelsSource) : le dossier publié entraînera au premier lancement." />
+  </Target>
 
 </Project>

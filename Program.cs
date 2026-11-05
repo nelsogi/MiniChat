@@ -17,13 +17,29 @@ Console.InputEncoding = Encoding.UTF8;
 // Taille du vocabulaire BPE : plus grand = mots entiers plus souvent, mais plus de données nécessaires.
 const int TokenizerVocabSize = 2000;
 
-// Chemins à côté de l'exécutable : marche avec "dotnet run" comme avec F5 dans Visual Studio.
-string pretrainPath = Path.Combine(AppContext.BaseDirectory, "data", "texte.txt");
-string dialoguesPath = Path.Combine(AppContext.BaseDirectory, "data", "dialogues.txt");
-string questionsPath = Path.Combine(AppContext.BaseDirectory, "data", "questions-test.txt");
+// Deux dossiers, par défaut à côté de l'exécutable (marche avec "dotnet run", F5 et le dossier publié) :
+//   --data <dossier>    texte.txt, dialogues.txt, questions-test.txt
+//   --models <dossier>  model/, model-pretrain/, et ce que l'entraînement écrit : checkpoint/, results/
+// Un chemin relatif part du dossier courant de la console.
+string? dataOption = ReadOption(args, "--data");
+string? modelsOption = ReadOption(args, "--models");
+string dataFolder = Path.GetFullPath(dataOption ?? Path.Combine(AppContext.BaseDirectory, "data"));
+string modelsFolder = Path.GetFullPath(modelsOption ?? AppContext.BaseDirectory);
+
+if (!Directory.Exists(dataFolder))
+{
+    Console.WriteLine($"Dossier de données introuvable : {dataFolder}");
+    return;
+}
+if (dataOption is not null) Console.WriteLine($"Données : {dataFolder}");
+if (modelsOption is not null) Console.WriteLine($"Modèles : {modelsFolder}");
+
+string pretrainPath = Path.Combine(dataFolder, "texte.txt");
+string dialoguesPath = Path.Combine(dataFolder, "dialogues.txt");
+string questionsPath = Path.Combine(dataFolder, "questions-test.txt");
 
 // Sauvegarde régulière de l'entraînement en cours (pour --resume). Supprimée quand l'entraînement finit.
-string checkpointFolder = Path.Combine(AppContext.BaseDirectory, "checkpoint");
+string checkpointFolder = Path.Combine(modelsFolder, "checkpoint");
 bool resume = args.Contains("--resume");
 if (resume && !Checkpoint.ExistsIn(checkpointFolder))
 {
@@ -37,7 +53,7 @@ CheckpointState? resumeState = resume ? Checkpoint.ReadState(checkpointFolder) :
 //   <date>-loss.csv  les loss mesurées pendant l'entraînement
 // Une reprise garde la date de l'entraînement d'origine : le CSV continue au même endroit.
 string runId = resumeState?.RunId ?? DateTime.Now.ToString("yyyy-MM-dd_HH-mm-ss");
-string resultsFolder = Path.Combine(AppContext.BaseDirectory, "results");
+string resultsFolder = Path.Combine(modelsFolder, "results");
 var log = new TrainingLog(Path.Combine(resultsFolder, $"{runId}-loss.csv"), questionsPath);
 var checkpoint = new Checkpoint(checkpointFolder, runId);
 
@@ -49,8 +65,8 @@ Console.WriteLine(device.type == DeviceType.CUDA
     : "MiniChat - calcul sur : CPU (pas de GPU NVIDIA utilisable ; si tu en as un, mets à jour son pilote)");
 
 // Deux sauvegardes : le modèle pré-entraîné (base pour refaire le fine-tuning) et le modèle final.
-var pretrainStore = new ModelStore(Path.Combine(AppContext.BaseDirectory, "model-pretrain"));
-var store = new ModelStore(Path.Combine(AppContext.BaseDirectory, "model"));
+var pretrainStore = new ModelStore(Path.Combine(modelsFolder, "model-pretrain"));
+var store = new ModelStore(Path.Combine(modelsFolder, "model"));
 
 MiniGpt model;
 BpeTokenizer tokenizer;
@@ -266,6 +282,19 @@ static bool TryReadCommand(string input, string command, out double value)
     return input.StartsWith(command + " ")
         && double.TryParse(input[(command.Length + 1)..].Replace(',', '.'),
             System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out value);
+}
+
+// Valeur d'une option "--nom valeur", ou null si l'option n'est pas là.
+static string? ReadOption(string[] args, string name)
+{
+    int i = Array.IndexOf(args, name);
+    if (i < 0) return null;
+    if (i + 1 >= args.Length || args[i + 1].StartsWith("--"))
+    {
+        Console.WriteLine($"{name} attend un dossier, par exemple : {name} D:\\MiniChat\\{name[2..]}");
+        Environment.Exit(1);
+    }
+    return args[i + 1];
 }
 
 /// <summary>Où un entraînement écrit son suivi : le CSV des loss, et les questions pour les exemples.</summary>

@@ -37,7 +37,48 @@ voir `BatchSize` / `EffectiveBatchSize`). Sur une NVIDIA T400 4 Go : ~2 Go de m�
 Le modèle entraîné est sauvegardé dans `bin/.../model/` : les lancements suivants
 démarrent directement le chat.
 
-Carte NVIDIA ? Dans `MiniChat.csproj`, remplace `TorchSharp-cpu` par `TorchSharp-cuda-windows`.
+GPU NVIDIA utilisé automatiquement s'il y en a un (pilote récent), CPU sinon : rien à configurer.
+
+Autres dossiers, sans recompiler :
+
+```bash
+dotnet run -- --data D:\MesDonnees      # texte.txt, dialogues.txt, questions-test.txt
+dotnet run -- --models D:\MesModeles    # model/, model-pretrain/ (+ checkpoint/ et results/ y sont écrits)
+```
+
+## Lancer sur un autre PC
+
+### Préparer le paquet (sur ton PC)
+
+```powershell
+powershell -ExecutionPolicy Bypass -File publish.ps1
+```
+
+Le script fait `dotnet publish -c Release -r win-x64 --self-contained true -o publish`, puis zippe
+le dossier dans `MiniChat-win-x64.zip`. Le dossier `publish/` contient :
+
+- `MiniChat.exe` et le runtime .NET (rien à installer côté .NET sur l'autre PC),
+- TorchSharp et libtorch (CUDA et CPU),
+- `data/`,
+- `model/` et `model-pretrain/` s'ils existent (pris dans `bin\Debug\net8.0`, là où `dotnet run`
+  les crée ; autre source : `publish.ps1 -ModelsSource D:\MesModeles`).
+
+Attention à la taille : libtorch CUDA fait plusieurs Go (voir la taille affichée à la fin du script).
+
+### Sur l'autre PC
+
+1. Dézippe l'archive où tu veux (par exemple `C:\MiniChat`).
+2. Lance `MiniChat.exe` depuis ce dossier, ou depuis n'importe où :
+   `C:\MiniChat\MiniChat.exe`. Les options marchent pareil :
+   `MiniChat.exe --train`, `--finetune`, `--resume`, `--data <dossier>`, `--models <dossier>`.
+3. Pré-requis sur l'autre PC :
+   - Windows 10/11 64 bits.
+   - [Visual C++ Redistributable x64](https://aka.ms/vs/17/release/vc_redist.x64.exe) (libtorch en a besoin ;
+     il est déjà présent sur la plupart des PC).
+   - Pour le GPU : une carte NVIDIA avec un pilote récent (version 528 ou plus, CUDA 12).
+     Sans ça, MiniChat tourne quand même, sur CPU.
+   - Si `MiniChat.exe` est dans un dossier protégé (ex. `C:\Program Files`), donne-lui `--models`
+     vers un dossier où il peut écrire (entraînement, `results/`, `checkpoint/`).
 
 ## Suivre les entraînements
 

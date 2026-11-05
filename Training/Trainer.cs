@@ -30,6 +30,9 @@ public sealed class Trainer
     private readonly TextDataset? _generalText;
     private readonly TrainingConfig _config;
     private readonly Device _device;
+    private readonly string _phase;
+    private readonly string? _lossCsvPath;
+    private readonly Action<int>? _showSample;
 
     // Meilleurs poids rencontrés (copies, indépendantes du modèle qui continue d'apprendre).
     private Dictionary<string, Tensor>? _bestWeights;
@@ -41,13 +44,20 @@ public sealed class Trainer
     /// Texte général mélangé dans les batchs d'entraînement (part = config.GeneralTextRatio),
     /// pour que le fine-tuning n'efface pas ce que le pré-entraînement a appris. null = pas de mélange.
     /// </param>
-    public Trainer(MiniGpt model, TextDataset dataset, TrainingConfig config, Device device, TextDataset? generalText = null)
+    /// <param name="phase">Nom court de la phase ("pretrain", "finetune"), écrit dans le CSV.</param>
+    /// <param name="lossCsvPath">Fichier CSV où ajouter une ligne à chaque mesure de loss. null = pas de CSV.</param>
+    /// <param name="showSample">Affiche une réponse d'exemple, appelé tous les config.SampleInterval pas.</param>
+    public Trainer(MiniGpt model, TextDataset dataset, TrainingConfig config, Device device, TextDataset? generalText = null,
+        string phase = "", string? lossCsvPath = null, Action<int>? showSample = null)
     {
         _model = model;
         _dataset = dataset;
         _generalText = generalText;
         _config = config;
         _device = device;
+        _phase = phase;
+        _lossCsvPath = lossCsvPath;
+        _showSample = showSample;
     }
 
     public void Train()
@@ -60,6 +70,12 @@ public sealed class Trainer
         {
             if (step % _config.EvalInterval == 0)
                 Report(step, clock.Elapsed);
+
+            if (_showSample is not null && step > 0 && step % _config.SampleInterval == 0)
+            {
+                _showSample(step);
+                _model.train();   // la génération a mis le modèle en mode évaluation
+            }
 
             // Tous les tenseurs créés dans ce scope sont libérés à la fin du tour (mémoire).
             using var scope = NewDisposeScope();
@@ -161,6 +177,26 @@ public sealed class Trainer
 
         Console.WriteLine($"  Étape {step,5}/{_config.Steps}  |  loss entraînement {train:F3}  |  loss vérification {val:F3}" +
                           $"  |  lr {LearningRateAt(step):0.0e0}  |  {Format(elapsed)}  |  reste {Remaining(step, elapsed)}{best}");
+
+        WriteCsvLine(step, train, val, elapsed);
+    }
+
+    /// <summary>
+    /// Ajoute une ligne au CSV des loss (s'ouvre dans Excel, ou se trace en courbe).
+    /// Nombres avec un point (format international), sinon la virgule française casserait les colonnes.
+    /// </summary>
+    private void WriteCsvLine(int step, float train, float val, TimeSpan elapsed)
+    {
+        if (_lossCsvPath is null) return;
+
+        if (!File.Exists(_lossCsvPath))
+        {
+            Directory.CreateDirectory(Path.GetDirectoryName(_lossCsvPath)!);
+            File.WriteAllText(_lossCsvPath, "phase,etape,loss_entrainement,loss_verification,learning_rate,secondes\n");
+        }
+
+        File.AppendAllText(_lossCsvPath, string.Create(System.Globalization.CultureInfo.InvariantCulture,
+            $"{_phase},{step},{train:F4},{val:F4},{LearningRateAt(step):G4},{elapsed.TotalSeconds:F0}\n"));
     }
 
     /// <summary>Moyenne de la loss sur plusieurs batchs, sans apprendre (mode évaluation).</summary>

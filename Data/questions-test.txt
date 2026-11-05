@@ -1,0 +1,12 @@
+# Questions posées au modèle après chaque entraînement (une par ligne, # = commentaire).
+# Toujours les mêmes, avec la même température et la même graine : on compare les entraînements entre eux.
+Bonjour !
+Comment tu t'appelles ?
+Tu es qui ?
+Comment ça va aujourd'hui ?
+Qu'est-ce que tu aimes faire ?
+Peux-tu m'expliquer ce qu'est une étoile ?
+Quel temps fait-il chez toi ?
+Donne-moi un conseil pour bien dormir.
+Raconte-moi une petite histoire.
+Merci et au revoir !

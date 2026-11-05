@@ -2,6 +2,7 @@ using System.Text;
 using MiniChat.Chat;
 using MiniChat.Config;
 using MiniChat.Data;
+using MiniChat.Evaluation;
 using MiniChat.Generation;
 using MiniChat.Model;
 using MiniChat.Storage;
@@ -19,6 +20,14 @@ const int TokenizerVocabSize = 2000;
 // Chemins à côté de l'exécutable : marche avec "dotnet run" comme avec F5 dans Visual Studio.
 string pretrainPath = Path.Combine(AppContext.BaseDirectory, "data", "texte.txt");
 string dialoguesPath = Path.Combine(AppContext.BaseDirectory, "data", "dialogues.txt");
+string questionsPath = Path.Combine(AppContext.BaseDirectory, "data", "questions-test.txt");
+
+// Chaque entraînement laisse deux fichiers avec la même date dans results/ :
+//   <date>.txt       les réponses aux questions de test
+//   <date>-loss.csv  les loss mesurées pendant l'entraînement
+string runId = DateTime.Now.ToString("yyyy-MM-dd_HH-mm-ss");
+string resultsFolder = Path.Combine(AppContext.BaseDirectory, "results");
+var log = new TrainingLog(Path.Combine(resultsFolder, $"{runId}-loss.csv"), questionsPath);
 
 // GPU NVIDIA s'il y en a un d'utilisable, sinon CPU. Tout le reste suit ce device :
 // le modèle (.to(device)), les batchs (GetBatch) et les tenseurs créés pendant les calculs.
@@ -33,6 +42,7 @@ var store = new ModelStore(Path.Combine(AppContext.BaseDirectory, "model"));
 
 MiniGpt model;
 BpeTokenizer tokenizer;
+string? training = null;   // ce qui a été entraîné dans ce lancement (null = modèle juste chargé)
 
 if (args.Contains("--finetune"))
 {
@@ -44,7 +54,8 @@ if (args.Contains("--finetune"))
     }
     (model, tokenizer) = pretrainStore.Load(device);
     Console.WriteLine("Modèle pré-entraîné chargé depuis 'model-pretrain'.");
-    FineTune(model, tokenizer, dialoguesPath, pretrainPath, store, device);
+    FineTune(model, tokenizer, dialoguesPath, pretrainPath, store, device, log);
+    training = "fine-tuning seul (--finetune)";
 }
 else if (store.Exists && !args.Contains("--train"))
 {
@@ -53,8 +64,17 @@ else if (store.Exists && !args.Contains("--train"))
 }
 else
 {
-    (model, tokenizer) = Pretrain(pretrainPath, dialoguesPath, pretrainStore, device);
-    FineTune(model, tokenizer, dialoguesPath, pretrainPath, store, device);
+    (model, tokenizer) = Pretrain(pretrainPath, dialoguesPath, pretrainStore, device, log);
+    FineTune(model, tokenizer, dialoguesPath, pretrainPath, store, device, log);
+    training = "pré-entraînement + fine-tuning";
+}
+
+// Après chaque entraînement : le même examen, pour comparer les entraînements entre eux.
+if (training is not null)
+{
+    QuestionTest.Run(new TextGenerator(model, tokenizer, device), questionsPath,
+        Path.Combine(resultsFolder, $"{runId}.txt"),
+        $"Entraînement : {training} | {model.ParameterCount:N0} paramètres | loss : {Path.GetFileName(log.LossCsvPath)}");
 }
 
 RunChat(new ChatSession(new TextGenerator(model, tokenizer, device)));
@@ -62,7 +82,7 @@ RunChat(new ChatSession(new TextGenerator(model, tokenizer, device)));
 // ---------------------------------------------------------------------------
 
 // Phase 1 : crée un nouveau modèle et lui apprend la langue sur texte.txt.
-static (MiniGpt, BpeTokenizer) Pretrain(string pretrainPath, string dialoguesPath, ModelStore store, Device device)
+static (MiniGpt, BpeTokenizer) Pretrain(string pretrainPath, string dialoguesPath, ModelStore store, Device device, TrainingLog log)
 {
     var config = TrainingConfig.Pretraining;
     manual_seed(config.Seed);
@@ -79,7 +99,7 @@ static (MiniGpt, BpeTokenizer) Pretrain(string pretrainPath, string dialoguesPat
     Console.WriteLine($"Modèle : {model.ParameterCount:N0} paramètres.");
     var dataset = new TextDataset(text, tokenizer, config.Seed);
     Console.WriteLine($"texte.txt : {text.Length:N0} caractères -> {dataset.TrainLength + dataset.ValidationLength:N0} tokens.");
-    TrainPhase("Phase 1 - pré-entraînement", dataset, model, config, device);
+    TrainPhase("Phase 1 - pré-entraînement", "pretrain", dataset, model, tokenizer, config, device, log);
 
     store.Save(model, tokenizer);
     Console.WriteLine("Modèle pré-entraîné sauvegardé dans 'model-pretrain'.");
@@ -89,7 +109,7 @@ static (MiniGpt, BpeTokenizer) Pretrain(string pretrainPath, string dialoguesPat
 // Phase 2 : spécialise le modèle (déjà pré-entraîné) sur les dialogues.
 // Le modèle n'est noté que sur les réponses "IA:", et 20 % de chaque batch vient de texte.txt
 // pour qu'il n'oublie pas le français général.
-static void FineTune(MiniGpt model, BpeTokenizer tokenizer, string dialoguesPath, string pretrainPath, ModelStore store, Device device)
+static void FineTune(MiniGpt model, BpeTokenizer tokenizer, string dialoguesPath, string pretrainPath, ModelStore store, Device device, TrainingLog log)
 {
     var config = TrainingConfig.FineTuning;
     manual_seed(config.Seed);
@@ -99,17 +119,23 @@ static void FineTune(MiniGpt model, BpeTokenizer tokenizer, string dialoguesPath
     var generalText = new TextDataset(ReadText(pretrainPath), tokenizer, config.Seed + 1);
 
     TrainPhase($"Phase 2 - fine-tuning (loss sur les réponses IA, {config.GeneralTextRatio:P0} de texte général)",
-        dialogues, model, config, device, generalText);
+        "finetune", dialogues, model, tokenizer, config, device, log, generalText);
 
     store.Save(model, tokenizer);
     Console.WriteLine("Modèle final sauvegardé dans 'model'.");
 }
 
-static void TrainPhase(string name, TextDataset dataset, MiniGpt model, TrainingConfig config, Device device, TextDataset? generalText = null)
+static void TrainPhase(string name, string phase, TextDataset dataset, MiniGpt model, BpeTokenizer tokenizer,
+    TrainingConfig config, Device device, TrainingLog log, TextDataset? generalText = null)
 {
+    // Lu dès le début : si le fichier de questions manque, on le sait tout de suite, pas après des heures.
+    string sampleQuestion = QuestionTest.ReadQuestions(log.QuestionsPath)[0];
+    var generator = new TextGenerator(model, tokenizer, device);
+
     Console.WriteLine();
     Console.WriteLine($"{name} : {dataset.TrainLength + dataset.ValidationLength:N0} tokens, {config.Steps} étapes.");
-    new Trainer(model, dataset, config, device, generalText).Train();
+    new Trainer(model, dataset, config, device, generalText, phase, log.LossCsvPath,
+        showSample: step => QuestionTest.PrintSample(generator, sampleQuestion, step)).Train();
 }
 
 // Lit un fichier de données. Sur Windows les fins de ligne sont "\r\n" : on garde seulement "\n".
@@ -180,3 +206,6 @@ static bool TryReadCommand(string input, string command, out double value)
         && double.TryParse(input[(command.Length + 1)..].Replace(',', '.'),
             System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out value);
 }
+
+/// <summary>Où un entraînement écrit son suivi : le CSV des loss, et les questions pour les exemples.</summary>
+record TrainingLog(string LossCsvPath, string QuestionsPath);

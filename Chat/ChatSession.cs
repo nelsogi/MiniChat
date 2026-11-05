@@ -32,6 +32,9 @@ public sealed class ChatSession
     /// <summary>Longueur max d'une réponse, en tokens (~3 caractères chacun).</summary>
     public int MaxReplyTokens { get; set; } = 80;
 
+    /// <summary>Graine du tirage au sort : même graine = même réponse. null = hasard différent à chaque fois.</summary>
+    public long? Seed { get; set; }
+
     public ChatSession(TextGenerator generator) => _generator = generator;
 
     /// <summary>Envoie un message et renvoie la réponse, caractère par caractère via onChar.</summary>
@@ -44,7 +47,7 @@ public sealed class ChatSession
             if (c == '\n') return false;   // fin de la réponse de l'IA
             onChar(c);
             return true;
-        });
+        }, Seed);
 
         _history.Append($"{UserPrefix}{userMessage.Trim()}\n{BotPrefix}{reply}\n");
         return reply;

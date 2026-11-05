@@ -52,6 +52,9 @@ public sealed class TrainingConfig
     /// <summary>Étapes de "chauffe" : la vitesse monte de 0 à LearningRate pour éviter un départ brutal.</summary>
     public int WarmupSteps { get; init; } = 100;
 
+    /// <summary>Tous les combien de pas on affiche une réponse d'exemple (première question de questions-test.txt).</summary>
+    public int SampleInterval { get; init; } = 1000;
+
     /// <summary>Tous les combien de pas on affiche la loss.</summary>
     public int EvalInterval { get; init; } = 50;
 

@@ -29,6 +29,17 @@ démarrent directement le chat.
 
 Carte NVIDIA ? Dans `MiniChat.csproj`, remplace `TorchSharp-cpu` par `TorchSharp-cuda-windows`.
 
+## Suivre les entraînements
+
+Chaque entraînement (`--train` ou `--finetune`) laisse deux fichiers avec la même date dans `bin/.../results/` :
+
+- `<date>.txt` : les réponses aux questions de `data/questions-test.txt`, posées à la fin avec
+  une température (0.7) et une graine (1234) fixes. Seul le modèle change : compare les fichiers entre eux.
+- `<date>-loss.csv` : les loss mesurées pendant l'entraînement (s'ouvre dans Excel pour tracer les courbes).
+
+Pendant l'entraînement, une réponse d'exemple à la première question s'affiche tous les 1000 pas
+(`SampleInterval` dans `TrainingConfig`).
+
 ## Préparer les données (DataBuilder)
 
 Un petit projet console à part, dans `DataBuilder/` :
@@ -63,6 +74,7 @@ Attention : la sortie est **écrasée**. Garde une copie de tes `dialogues.txt` 
 | `Training/`      | `Trainer`             | La boucle d'apprentissage |
 | `Generation/`    | `TextGenerator`       | Écrit du texte token par token (top-k, top-p) |
 | `Chat/`          | `ChatSession`         | Transforme la génération en conversation |
+| `Evaluation/`    | `QuestionTest`        | Questions de test après l'entraînement, exemples pendant |
 | `Storage/`       | `ModelStore`          | Sauvegarde / chargement du modèle |
 
 ## Ce qu'il faut savoir

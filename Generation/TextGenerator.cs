@@ -33,11 +33,16 @@ public sealed class TextGenerator
     /// 1 = pas de limite.
     /// </param>
     /// <param name="onChar">Appelé à chaque caractère écrit. Renvoie false pour arrêter.</param>
-    public string Generate(string prompt, int maxNewTokens, double temperature, int topK, double topP, Func<char, bool> onChar)
+    /// <param name="seed">
+    /// Graine du tirage : même graine + même modèle = même texte. null = hasard global.
+    /// Avec une graine, le tirage a son propre générateur : il ne touche pas au hasard de l'entraînement.
+    /// </param>
+    public string Generate(string prompt, int maxNewTokens, double temperature, int topK, double topP, Func<char, bool> onChar, long? seed = null)
     {
         _model.eval();
         using var noGrad = no_grad();
         using var scope = NewDisposeScope();
+        using var random = seed is null ? null : new Generator((ulong)seed.Value, _device);
 
         // À l'entraînement, l'espace est collé au mot qui le suit (" Coucou"). Un prompt qui finit
         // par un espace ("IA: ") ne ressemble donc à rien de connu : on retire cet espace et on laisse
@@ -66,7 +71,7 @@ public sealed class TextGenerator
 
             // Tirage au sort selon les probabilités (pas toujours le plus probable = plus naturel),
             // mais seulement parmi les candidats sérieux : on évite les tokens absurdes.
-            var next = SampleTopKTopP(probabilities, topK, topP);
+            var next = SampleTopKTopP(probabilities, topK, topP, random);
             ids = cat(new[] { ids, next }, 1);
 
             // Un token peut faire plusieurs caractères : on les donne un par un à onChar.
@@ -96,7 +101,7 @@ public sealed class TextGenerator
     /// </summary>
     /// <param name="probabilities">Forme (1, VocabSize).</param>
     /// <returns>L'id choisi, forme (1, 1).</returns>
-    private static Tensor SampleTopKTopP(Tensor probabilities, int topK, double topP)
+    private static Tensor SampleTopKTopP(Tensor probabilities, int topK, double topP, Generator? random)
     {
         // Du plus probable au moins probable. indices[i] = id du i-ème meilleur token.
         var (sorted, indices) = probabilities.sort(dim: -1, descending: true);
@@ -114,7 +119,7 @@ public sealed class TextGenerator
 
         // Les exclus passent à 0 ; multinomial n'a pas besoin que la somme fasse 1.
         var filtered = sorted.masked_fill(keep.logical_not(), 0);
-        var rank = multinomial(filtered, 1);
+        var rank = multinomial(filtered, 1, generator: random);
         return indices.gather(-1, rank);
     }
 }

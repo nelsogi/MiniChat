@@ -1,0 +1,120 @@
+using MiniChat.Model;
+using MiniChat.Tokenization;
+using static TorchSharp.torch;
+using static TorchSharp.torch.nn;
+
+namespace MiniChat.Generation;
+
+/// <summary>
+/// Fait écrire le modèle : on lui donne un début, il prédit un token (un morceau de mot),
+/// on l'ajoute, il prédit le suivant, etc.
+/// </summary>
+public sealed class TextGenerator
+{
+    private readonly MiniGpt _model;
+    private readonly BpeTokenizer _tokenizer;
+    private readonly Device _device;
+
+    public TextGenerator(MiniGpt model, BpeTokenizer tokenizer, Device device)
+    {
+        _model = model;
+        _tokenizer = tokenizer;
+        _device = device;
+    }
+
+    /// <param name="prompt">Le début du texte.</param>
+    /// <param name="maxNewTokens">Limite de sécurité, en tokens.</param>
+    /// <param name="temperature">
+    /// &lt; 1 : plus prudent et répétitif. &gt; 1 : plus créatif mais plus de fautes.
+    /// </param>
+    /// <param name="topK">Ne tire au sort que parmi les K tokens les plus probables (0 = pas de limite).</param>
+    /// <param name="topP">
+    /// Ne garde que les tokens les plus probables dont les chances cumulées font topP (0.9 = 90 %).
+    /// 1 = pas de limite.
+    /// </param>
+    /// <param name="onChar">Appelé à chaque caractère écrit. Renvoie false pour arrêter.</param>
+    public string Generate(string prompt, int maxNewTokens, double temperature, int topK, double topP, Func<char, bool> onChar)
+    {
+        _model.eval();
+        using var noGrad = no_grad();
+        using var scope = NewDisposeScope();
+
+        // À l'entraînement, l'espace est collé au mot qui le suit (" Coucou"). Un prompt qui finit
+        // par un espace ("IA: ") ne ressemble donc à rien de connu : on retire cet espace et on laisse
+        // le modèle l'écrire lui-même avec le premier mot. On ne réaffiche pas cet espace.
+        bool spaceRemoved = prompt.EndsWith(' ');
+        if (spaceRemoved)
+            prompt = prompt[..^1];
+
+        var promptIds = _tokenizer.Encode(prompt);
+        if (promptIds.Length == 0)
+            return string.Empty;
+
+        var ids = tensor(promptIds, device: _device).unsqueeze(0); // (1, temps)
+        int blockSize = _model.Config.BlockSize;
+        var result = new System.Text.StringBuilder();
+
+        for (int i = 0; i < maxNewTokens; i++)
+        {
+            // Le modèle ne voit que les BlockSize derniers tokens.
+            long length = ids.shape[1];
+            var context = length <= blockSize ? ids : ids.narrow(1, length - blockSize, blockSize);
+
+            // On ne garde que la prédiction de la dernière position.
+            var logits = _model.forward(context).select(1, -1) / temperature;
+            var probabilities = functional.softmax(logits, -1);
+
+            // Tirage au sort selon les probabilités (pas toujours le plus probable = plus naturel),
+            // mais seulement parmi les candidats sérieux : on évite les tokens absurdes.
+            var next = SampleTopKTopP(probabilities, topK, topP);
+            ids = cat(new[] { ids, next }, 1);
+
+            // Un token peut faire plusieurs caractères : on les donne un par un à onChar.
+            foreach (char c in _tokenizer.Decode(next.item<long>()))
+            {
+                if (spaceRemoved)
+                {
+                    spaceRemoved = false;
+                    if (c == ' ') continue;   // l'espace qu'on avait retiré du prompt
+                }
+
+                if (!onChar(c))
+                    return result.ToString();
+                result.Append(c);
+            }
+        }
+
+        return result.ToString();
+    }
+
+    /// <summary>
+    /// Tire un token en ne gardant que les meilleurs candidats.
+    /// Exemple avec topK = 3, topP = 0.9 et les chances : a 60 %, b 25 %, c 10 %, d 5 % :
+    ///   - top-k garde a, b, c (les 3 premiers),
+    ///   - top-p garde a, b, c aussi (60 + 25 = 85 % &lt; 90 %, donc il faut encore c pour atteindre 90 %),
+    ///   - on tire au sort parmi a, b, c ; d ne peut plus sortir.
+    /// </summary>
+    /// <param name="probabilities">Forme (1, VocabSize).</param>
+    /// <returns>L'id choisi, forme (1, 1).</returns>
+    private static Tensor SampleTopKTopP(Tensor probabilities, int topK, double topP)
+    {
+        // Du plus probable au moins probable. indices[i] = id du i-ème meilleur token.
+        var (sorted, indices) = probabilities.sort(dim: -1, descending: true);
+        long vocab = sorted.shape[^1];
+
+        // top-k : seuls les K premiers rangs ont le droit d'être tirés.
+        var keep = topK > 0
+            ? arange(vocab, device: sorted.device).lt(topK).unsqueeze(0)
+            : ones_like(sorted, dtype: ScalarType.Bool);
+
+        // top-p : on garde un token tant que ceux AVANT lui ne font pas encore topP.
+        // Le premier est donc toujours gardé, même s'il dépasse topP à lui seul.
+        var before = sorted.cumsum(-1) - sorted;
+        keep = keep.logical_and(before.lt(topP));
+
+        // Les exclus passent à 0 ; multinomial n'a pas besoin que la somme fasse 1.
+        var filtered = sorted.masked_fill(keep.logical_not(), 0);
+        var rank = multinomial(filtered, 1);
+        return indices.gather(-1, rank);
+    }
+}

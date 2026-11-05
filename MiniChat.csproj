@@ -21,6 +21,65 @@
     <PackageReference Include="TorchSharp-cuda-windows" Version="0.105.*" />
   </ItemGroup>
 
+  <!-- Les plus grosses DLL de libtorch arrivent en morceaux (paquets ...-primary + ...-fragmentN) que chaque
+       paquet -primary recolle au premier build. Celui de cusparse64_12.dll (part7-primary) a oublié ce script :
+       la DLL reste tronquée, torch_cuda.dll ne se charge pas et cuda.is_available() répond false.
+       On fait donc le recollage ici, dans le cache NuGet, avant la copie vers bin/. Les morceaux sont
+       supprimés une fois recollés : les builds suivants n'ont plus rien à faire. -->
+  <UsingTask TaskName="RestitchTorchFragments" TaskFactory="RoslynCodeTaskFactory"
+             AssemblyFile="$(MSBuildToolsPath)\Microsoft.Build.Tasks.Core.dll">
+    <ParameterGroup>
+      <Fragments ParameterType="Microsoft.Build.Framework.ITaskItem[]" Required="true" />
+    </ParameterGroup>
+    <Task>
+      <Using Namespace="System.IO" />
+      <Using Namespace="System.Security.Cryptography" />
+      <Code Type="Fragment" Language="cs"><![CDATA[
+        foreach (var item in Fragments)
+        {
+            // ...-fragment1\<v>\fragments\...\x.dll.fragment1  ->  ...-primary\<v>\runtimes\...\x.dll
+            string fragment1 = Path.GetFullPath(item.ItemSpec);
+            string primary = fragment1.Replace("-fragment1", "-primary").Replace(@"\fragments\", @"\runtimes\");
+            primary = primary.Substring(0, primary.Length - ".fragment1".Length);
+            if (!File.Exists(primary) || !File.Exists(primary + ".sha")) continue;
+
+            var parts = new List<string> { primary };
+            for (int i = 1; File.Exists(fragment1.Replace("fragment1", "fragment" + i)); i++)
+                parts.Add(fragment1.Replace("fragment1", "fragment" + i));
+
+            string tmp = primary + ".restitch";
+            using (var output = File.Create(tmp))
+                foreach (var part in parts)
+                    using (var input = File.OpenRead(part)) input.CopyTo(output);
+
+            string expected = File.ReadAllText(primary + ".sha").Trim().ToLowerInvariant();
+            string actual;
+            using (var sha = SHA256.Create())
+            using (var stream = File.OpenRead(tmp))
+                actual = BitConverter.ToString(sha.ComputeHash(stream)).Replace("-", "").ToLowerInvariant();
+            if (actual != expected)
+            {
+                File.Delete(tmp);
+                Log.LogError("Recollage de " + Path.GetFileName(primary) + " : SHA incorrect. Supprime les paquets libtorch-cuda du cache NuGet et relance.");
+                continue;
+            }
+
+            File.Delete(primary);
+            File.Move(tmp, primary);
+            foreach (var part in parts.Skip(1)) File.Delete(part);
+            Log.LogMessage(MessageImportance.High, "DLL libtorch recollée : " + primary);
+        }
+      ]]></Code>
+    </Task>
+  </UsingTask>
+
+  <Target Name="RestitchTorchFragments" AfterTargets="ResolveReferences" BeforeTargets="PrepareForBuild">
+    <ItemGroup>
+      <TorchFragment Include="$(NuGetPackageRoot)libtorch-*-fragment1\*\fragments\**\*.fragment1" />
+    </ItemGroup>
+    <RestitchTorchFragments Fragments="@(TorchFragment)" Condition="'@(TorchFragment)' != ''" />
+  </Target>
+
   <ItemGroup>
     <!-- Copie les données d'entraînement à côté de l'exécutable (compilation et dotnet publish). -->
     <None Update="data\**" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" />

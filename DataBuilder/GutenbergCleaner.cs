@@ -18,15 +18,20 @@ public static partial class GutenbergCleaner
 
         foreach (string block in BlankLines().Split(body))
         {
-            string paragraph = TextCleaner.Normalize(block);
-            paragraph = paragraph.Replace("_", "");   // Gutenberg écrit l'italique _comme ceci_
-            paragraph = TextCleaner.SingleLine(TextCleaner.RemoveForbidden(paragraph.Replace('\n', ' ')));
-
+            string paragraph = CleanParagraph(block);
             if (paragraph.Length > 0)
                 paragraphs.Add(paragraph);
         }
 
         return string.Join('\n', paragraphs) + '\n';
+    }
+
+    /// <summary>Un paragraphe sur une seule ligne, typographie normalisée, caractères exotiques retirés.</summary>
+    public static string CleanParagraph(string block)
+    {
+        string paragraph = TextCleaner.Normalize(block);
+        paragraph = paragraph.Replace("_", "");   // Gutenberg écrit l'italique _comme ceci_
+        return TextCleaner.SingleLine(TextCleaner.RemoveForbidden(paragraph.Replace('\n', ' ')));
     }
 
     /// <summary>Garde le texte entre les marqueurs START et END, ou tout le fichier s'ils sont absents.</summary>

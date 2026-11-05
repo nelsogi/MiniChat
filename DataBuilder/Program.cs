@@ -1,9 +1,11 @@
+using System.Globalization;
 using System.Text;
 using DataBuilder;
 
 // Prépare les fichiers de données de MiniChat.
 //   oasst      : OpenAssistant (*.messages.jsonl[.gz]) -> dialogues au format Toi:/IA: (dialogues.txt)
 //   gutenberg  : livres du Projet Gutenberg (.txt)      -> texte propre pour le pré-entraînement (texte.txt)
+//   parquet    : une colonne de texte de fichiers .parquet (Wikipedia, FineWeb...) -> idem
 
 Console.OutputEncoding = Encoding.UTF8;
 
@@ -11,10 +13,12 @@ const string Usage = """
     Utilisation :
       dotnet run --project DataBuilder -- oasst     <sortie.txt> <messages.jsonl[.gz]>... [--lang fr] [--max 300] [--sentences 2]
       dotnet run --project DataBuilder -- gutenberg <sortie.txt> <livre.txt>...
+      dotnet run --project DataBuilder -- parquet   <sortie.txt> <fichier.parquet>... [--column text] [--max-mo 50]
 
     Exemples :
       dotnet run --project DataBuilder -- oasst     Data/dialogues.txt 2023-04-12_oasst_ready.messages.jsonl.gz
       dotnet run --project DataBuilder -- gutenberg Data/texte.txt pg17489.txt pg135.txt
+      dotnet run --project DataBuilder -- parquet   Data/texte.txt train-00000-of-00002.parquet --max-mo 50
     """;
 
 // Sépare les options (--lang fr) des chemins de fichiers.
@@ -65,6 +69,27 @@ switch (command)
             books.Append(cleaned);
         }
         output = books.ToString();
+        break;
+
+    case "parquet":
+        string column = options.GetValueOrDefault("--column", "text");
+        long? maxBytes = options.TryGetValue("--max-mo", out var maxMo)
+            ? (long)(double.Parse(maxMo, CultureInfo.InvariantCulture) * 1024 * 1024)
+            : null;
+
+        var parquet = new ParquetConverter(column, maxBytes);
+        try
+        {
+            output = await parquet.ConvertAsync(inputs);
+        }
+        catch (InvalidDataException e)
+        {
+            Console.WriteLine(e.Message);
+            return 1;
+        }
+        Console.WriteLine($"Documents gardés : {parquet.Kept:N0}"
+            + (parquet.ReachedMaxSize ? $" (arrêt à {maxMo} Mo)" : "")
+            + $", vides après nettoyage : {parquet.Empty:N0}.");
         break;
 
     default:

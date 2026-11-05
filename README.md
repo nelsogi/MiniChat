@@ -101,12 +101,18 @@ dotnet run --project DataBuilder -- oasst Data/dialogues.txt 2023-04-12_oasst_re
 
 # Livres du Projet Gutenberg (.txt) -> texte propre pour le pré-entraînement
 dotnet run --project DataBuilder -- gutenberg Data/texte.txt pg4650.txt pg17489.txt
+
+# Colonne de texte de fichiers .parquet (Wikipedia, FineWeb... sur Hugging Face), arrêt à 50 Mo
+dotnet run --project DataBuilder -- parquet Data/texte.txt train-00000-of-00002.parquet --column text --max-mo 50
 ```
 
 - **oasst** suit la réponse la mieux classée de chaque conversation, ignore les messages supprimés,
   refusés, trop longs, avec du code ou des caractères exotiques (emoji...).
 - **gutenberg** retire l'en-tête et la licence, recolle les paragraphes (un par ligne),
   simplifie la typographie (’ … — -> ' ... -) et lit aussi les vieux fichiers en Latin-1.
+- **parquet** lit la colonne `--column` (par défaut `text`) : un document par valeur, nettoyé comme
+  pour Gutenberg, une ligne du document = un paragraphe. `--max-mo` arrête avant le document qui
+  ferait dépasser la taille ; sans cette option, tout est gardé. Affiche le nombre de documents gardés.
 
 Attention : la sortie est **écrasée**. Garde une copie de tes `dialogues.txt` faits à la main.
 

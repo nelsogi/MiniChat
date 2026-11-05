@@ -8,9 +8,10 @@ obj/
 .vscode/
 *.user
 
-# Fichiers sources téléchargés pour DataBuilder (OpenAssistant, livres Gutenberg bruts)
+# Fichiers sources téléchargés pour DataBuilder (OpenAssistant, livres Gutenberg bruts, Parquet)
 *.jsonl
 *.jsonl.gz
+*.parquet
 
 # Dossier et archive produits par publish.ps1
 publish/

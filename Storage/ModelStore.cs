@@ -30,7 +30,7 @@ public sealed class ModelStore
 
     private string ConfigPath => Path.Combine(_folder, "config.json");
     private string TokenizerPath => Path.Combine(_folder, "tokenizer.json");
-    private string WeightsPath => Path.Combine(_folder, "weights.dat");
+    public string WeightsPath => Path.Combine(_folder, "weights.dat");
 
     public bool Exists => File.Exists(ConfigPath) && File.Exists(TokenizerPath) && File.Exists(WeightsPath);
 

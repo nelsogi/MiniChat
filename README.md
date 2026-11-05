@@ -9,7 +9,15 @@ Un mini-GPT (Transformer) écrit de zéro avec **TorchSharp**, qui apprend à di
 dotnet run                 # entraîne (la 1re fois) puis ouvre le chat
 dotnet run -- --train      # refait tout : pré-entraînement + fine-tuning
 dotnet run -- --finetune   # refait seulement le fine-tuning, depuis model-pretrain/
+dotnet run -- --resume     # reprend un entraînement interrompu (coupure, plantage, Ctrl+C)
 ```
+
+Pendant l'entraînement, l'avancement est sauvegardé tous les 250 pas dans `bin/.../checkpoint/`
+(`CheckpointInterval`) : poids, état de l'optimiseur, meilleurs poids. `--resume` repart de là.
+Le dossier est supprimé quand l'entraînement va jusqu'au bout.
+
+Arrêt anticipé : si la loss de vérification ne s'améliore plus pendant 2000 pas
+(`EarlyStoppingPatience`, 0 = jamais), la phase s'arrête et garde le meilleur modèle.
 
 L'entraînement se fait en deux phases (réglages dans `TrainingConfig.Pretraining` / `FineTuning`) :
 

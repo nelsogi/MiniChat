@@ -17,8 +17,10 @@ namespace MiniChat.Training;
 ///
 /// En plus :
 ///   - la vitesse d'apprentissage suit un warmup puis une descente en cosinus,
-///   - on garde une copie des poids quand la loss de vérification est la plus basse,
-///     et on la remet dans le modèle à la fin (le modèle sauvegardé = le meilleur vu),
+///   - on garde une copie des poids quand la loss de vérification est la plus basse (sur disque,
+///     checkpoint/best.dat), et on la remet dans le modèle à la fin (le modèle sauvegardé = le meilleur vu),
+///   - l'avancement est sauvegardé régulièrement pour pouvoir reprendre (voir Checkpoint, --resume),
+///   - arrêt anticipé si la loss de vérification ne s'améliore plus (voir EarlyStoppingPatience),
 ///   - la loss ne compte que les caractères dont le masque vaut 1 (voir TextDataset),
 ///   - on peut mélanger un peu de texte général dans chaque batch (voir GeneralTextRatio),
 ///   - weight decay sur les matrices, et gradient clipping (voir WeightDecay, GradClip),
@@ -34,11 +36,14 @@ public sealed class Trainer
     private readonly string _phase;
     private readonly string? _lossCsvPath;
     private readonly Action<int>? _showSample;
+    private readonly Checkpoint _checkpoint;
 
-    // Meilleurs poids rencontrés (copies, indépendantes du modèle qui continue d'apprendre).
-    private Dictionary<string, Tensor>? _bestWeights;
+    // Meilleure loss de vérification vue (les poids correspondants sont dans le checkpoint).
     private float _bestValLoss = float.MaxValue;
     private int _bestStep;
+
+    // Premier pas de ce lancement (0, ou le pas sauvegardé si on reprend) : sert au temps restant.
+    private int _startStep;
 
     // Petits batchs par étape (EffectiveBatchSize / BatchSize), et pic de mémoire GPU vu.
     private readonly int _accumulation;
@@ -52,9 +57,11 @@ public sealed class Trainer
     /// <param name="phase">Nom court de la phase ("pretrain", "finetune"), écrit dans le CSV.</param>
     /// <param name="lossCsvPath">Fichier CSV où ajouter une ligne à chaque mesure de loss. null = pas de CSV.</param>
     /// <param name="showSample">Affiche une réponse d'exemple, appelé tous les config.SampleInterval pas.</param>
-    public Trainer(MiniGpt model, TextDataset dataset, TrainingConfig config, Device device, TextDataset? generalText = null,
-        string phase = "", string? lossCsvPath = null, Action<int>? showSample = null)
+    /// <param name="checkpoint">Où sauvegarder l'avancement et les meilleurs poids.</param>
+    public Trainer(MiniGpt model, TextDataset dataset, TrainingConfig config, Device device, Checkpoint checkpoint,
+        TextDataset? generalText = null, string phase = "", string? lossCsvPath = null, Action<int>? showSample = null)
     {
+        _checkpoint = checkpoint;
         _model = model;
         _dataset = dataset;
         _generalText = generalText;
@@ -69,19 +76,45 @@ public sealed class Trainer
         _accumulation = config.EffectiveBatchSize / config.BatchSize;
     }
 
-    public void Train()
+    /// <param name="resume">
+    /// Reprise d'un entraînement interrompu : on repart du pas sauvegardé, avec l'état de l'optimiseur
+    /// et la meilleure loss d'avant (les poids du modèle ont déjà été rechargés). null = depuis le début.
+    /// </param>
+    public void Train(CheckpointState? resume = null)
     {
         var optimizer = CreateOptimizer();
         var clock = Stopwatch.StartNew();
         _model.train();
 
+        if (resume is not null)
+        {
+            _checkpoint.LoadOptimizer(optimizer);
+            _startStep = resume.Step;
+            if (_checkpoint.ReadBest() is { } best)
+                (_bestValLoss, _bestStep) = (best.ValLoss, best.Step);
+            Console.WriteLine($"  Reprise au pas {_startStep} (meilleure loss de vérification : {_bestValLoss:F3}, au pas {_bestStep}).");
+        }
+
         Console.WriteLine($"  Batch : {_config.BatchSize} x {_accumulation} = {_config.EffectiveBatchSize} extraits " +
                           $"de {_model.Config.BlockSize} tokens par étape.");
 
-        for (int step = 0; step <= _config.Steps; step++)
+        for (int step = _startStep; step <= _config.Steps; step++)
         {
             if (step % _config.EvalInterval == 0)
+            {
                 Report(step, clock.Elapsed);
+
+                // Arrêt anticipé : plus de progrès depuis trop longtemps, continuer ne sert à rien.
+                if (_config.EarlyStoppingPatience > 0 && step - _bestStep >= _config.EarlyStoppingPatience)
+                {
+                    Console.WriteLine($"  Arrêt anticipé au pas {step} : pas d'amélioration de la loss de vérification " +
+                                      $"depuis {step - _bestStep} pas (meilleure au pas {_bestStep}).");
+                    break;
+                }
+            }
+
+            if (step % _config.CheckpointInterval == 0)
+                _checkpoint.SaveProgress(_model, optimizer, new CheckpointState(_phase, step, _checkpoint.RunId));
 
             if (_showSample is not null && step > 0 && step % _config.SampleInterval == 0)
             {
@@ -111,7 +144,9 @@ public sealed class Trainer
             optimizer.step();
         }
 
-        RestoreBestWeights();
+        // On remet les poids qui avaient la meilleure loss de vérification.
+        _checkpoint.LoadBest(_model);
+        Console.WriteLine($"Meilleur modèle gardé : étape {_bestStep}, loss vérification {_bestValLoss:F3}.");
 
         if (_peakGpuMb > 0)
             Console.WriteLine($"Mémoire GPU utilisée au maximum : {_peakGpuMb:N0} Mo.");
@@ -122,7 +157,7 @@ public sealed class Trainer
     /// Les biais et les LayerNorm (vecteurs, 1 dimension) n'en ont pas : les tirer vers 0 n'aide pas,
     /// et un LayerNorm à 0 éteindrait sa couche. C'est le réglage de GPT-2 / nanoGPT.
     /// </summary>
-    private optim.Optimizer CreateOptimizer()
+    private TorchSharp.Modules.AdamW CreateOptimizer()
     {
         var parameters = _model.parameters().ToList();
         var matrices = parameters.Where(p => p.dim() >= 2);
@@ -193,7 +228,8 @@ public sealed class Trainer
         string best = "";
         if (val < _bestValLoss)
         {
-            SaveBestWeights(step, val);
+            (_bestValLoss, _bestStep) = (val, step);
+            _checkpoint.SaveBest(_model, new BestScore(val, step));
             best = "  <- meilleur";
         }
 
@@ -251,11 +287,11 @@ public sealed class Trainer
         return total / _config.EvalBatches;
     }
 
-    /// <summary>Temps restant estimé : durée moyenne d'une étape jusqu'ici x étapes restantes.</summary>
+    /// <summary>Temps restant estimé : durée moyenne d'une étape depuis le lancement x étapes restantes.</summary>
     private string Remaining(int step, TimeSpan elapsed)
     {
-        if (step == 0) return "--:--";
-        return Format(elapsed / step * (_config.Steps - step));
+        if (step == _startStep) return "--:--";
+        return Format(elapsed / (step - _startStep) * (_config.Steps - step));
     }
 
     /// <summary>"mm:ss", ou "h:mm:ss" à partir d'une heure (un entraînement long peut durer des heures).</summary>
@@ -263,29 +299,4 @@ public sealed class Trainer
         time.TotalHours >= 1
             ? $"{(int)time.TotalHours}:{time:mm\\:ss}"
             : time.ToString(@"mm\:ss");
-
-    /// <summary>Copie les poids actuels (sans calcul de gradient, hors de tout DisposeScope).</summary>
-    private void SaveBestWeights(int step, float valLoss)
-    {
-        using var noGrad = no_grad();
-
-        if (_bestWeights is not null)
-            foreach (var tensor in _bestWeights.Values) tensor.Dispose();
-
-        _bestWeights = _model.state_dict().ToDictionary(kv => kv.Key, kv => kv.Value.detach().clone());
-        _bestValLoss = valLoss;
-        _bestStep = step;
-    }
-
-    /// <summary>Remet dans le modèle les poids qui avaient la loss de vérification la plus basse.</summary>
-    private void RestoreBestWeights()
-    {
-        if (_bestWeights is null) return;
-
-        _model.load_state_dict(_bestWeights);
-        foreach (var tensor in _bestWeights.Values) tensor.Dispose();
-        _bestWeights = null;
-
-        Console.WriteLine($"Meilleur modèle gardé : étape {_bestStep}, loss vérification {_bestValLoss:F3}.");
-    }
 }

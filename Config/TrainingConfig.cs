@@ -62,6 +62,15 @@ public sealed class TrainingConfig
     /// <summary>Étapes de "chauffe" : la vitesse monte de 0 à LearningRate pour éviter un départ brutal.</summary>
     public int WarmupSteps { get; init; } = 100;
 
+    /// <summary>Tous les combien de pas on sauvegarde l'avancement dans checkpoint/ (pour --resume).</summary>
+    public int CheckpointInterval { get; init; } = 250;
+
+    /// <summary>
+    /// Arrêt anticipé : on s'arrête si la loss de vérification ne s'est pas améliorée depuis ce nombre de pas.
+    /// Le modèle n'apprend alors plus rien d'utile (ou commence à apprendre par cœur). 0 = jamais.
+    /// </summary>
+    public int EarlyStoppingPatience { get; init; } = 2000;
+
     /// <summary>Tous les combien de pas on affiche une réponse d'exemple (première question de questions-test.txt).</summary>
     public int SampleInterval { get; init; } = 1000;
 

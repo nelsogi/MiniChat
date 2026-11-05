@@ -10,7 +10,29 @@ dotnet run                 # entraîne (la 1re fois) puis ouvre le chat
 dotnet run -- --train      # refait tout : pré-entraînement + fine-tuning
 dotnet run -- --finetune   # refait seulement le fine-tuning, depuis model-pretrain/
 dotnet run -- --resume     # reprend un entraînement interrompu (coupure, plantage, Ctrl+C)
+dotnet run -- --continue 2000            # 2000 pas de pré-entraînement en plus, depuis model-pretrain/
+dotnet run -- --continue-finetune 200    # 200 pas de fine-tuning en plus, depuis model/
+dotnet run -- --continue 2000 --lr 2e-4  # vitesse de départ choisie
 ```
+
+### Continuer un modèle (`--continue`, `--continue-finetune`)
+
+Pour entraîner plus longtemps, ou après avoir ajouté des données dans `data/` (relues à chaque lancement) :
+
+- Le modèle repart de ses poids **et** de l'état d'AdamW, sauvegardés avec lui (`optimizer.dat`), et les pas
+  continuent sa numérotation (`training.json`) : `--continue 2000` sur un modèle arrêté au pas 9000 va de 9000 à 11000.
+- Le tokenizer n'est jamais réentraîné : le modèle garde le sien, les caractères qu'il ne connaît pas sont ignorés.
+- Nouveau warmup court (200 pas, moitié des pas si tu en demandes moins de 400), puis cosinus depuis une vitesse
+  plus basse : 3e-4 en pré-entraînement, 1e-4 en fine-tuning (à 3e-4 il apprend les dialogues par cœur).
+  `--lr` change ce départ ; la fin du cosinus est toujours dix fois plus bas.
+- Le modèle sauvegardé n'est remplacé que si la loss de vérification est meilleure. L'ancienne est mesurée au
+  premier pas, sur les données actuelles (comparaison juste même si elles ont changé) ; les deux sont affichées.
+- Les loss s'ajoutent au CSV de l'entraînement d'origine (`results/<date>-loss.csv`). Les réponses aux
+  questions de test vont dans un nouveau `<date>.txt`.
+- `--continue` ne refait pas le fine-tuning : relance ensuite `--finetune` pour que le chat en profite.
+- Une continuation interrompue se reprend avec `--resume`, avec les mêmes réglages.
+- Un modèle sauvegardé avant cette option n'a ni `optimizer.dat` ni `training.json` : AdamW repart de zéro
+  et les pas sont comptés depuis 0. Son CSV d'origine n'est pas connu : un nouveau est créé.
 
 Pendant l'entraînement, l'avancement est sauvegardé tous les 250 pas dans `bin/.../checkpoint/`
 (`CheckpointInterval`) : poids, état de l'optimiseur, meilleurs poids. `--resume` repart de là.
@@ -76,7 +98,8 @@ Attention à la taille : libtorch CUDA fait plusieurs Go (voir la taille affich�
 1. Dézippe l'archive où tu veux (par exemple `C:\MiniChat`).
 2. Lance `MiniChat.exe` depuis ce dossier, ou depuis n'importe où :
    `C:\MiniChat\MiniChat.exe`. Les options marchent pareil :
-   `MiniChat.exe --train`, `--finetune`, `--resume`, `--data <dossier>`, `--models <dossier>`.
+   `MiniChat.exe --train`, `--finetune`, `--resume`, `--continue <pas>`, `--continue-finetune <pas>`, `--lr <vitesse>`,
+   `--data <dossier>`, `--models <dossier>`.
 3. Pré-requis sur l'autre PC :
    - Windows 10/11 64 bits.
    - [Visual C++ Redistributable x64](https://aka.ms/vs/17/release/vc_redist.x64.exe) (libtorch en a besoin ;

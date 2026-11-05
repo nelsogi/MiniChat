@@ -1,8 +1,35 @@
 namespace MiniChat.Config;
 
 /// <summary>Réglages de l'entraînement.</summary>
-public sealed class TrainingConfig
+public sealed record TrainingConfig
 {
+    /// <summary>Vitesse d'apprentissage par défaut pour continuer un modèle déjà entraîné (--continue).</summary>
+    public const double ContinueLearningRate = 3e-4;
+
+    /// <summary>Warmup d'une continuation : court, le modèle et AdamW sont déjà "chauds".</summary>
+    public const int ContinueWarmupSteps = 200;
+
+    /// <summary>
+    /// Continuer un modèle déjà entraîné (--continue, --continue-finetune) : steps pas de plus,
+    /// numérotés à partir de firstStep (le pas où il s'était arrêté). Nouveau warmup court, puis
+    /// cosinus depuis une vitesse plus basse qu'au premier entraînement : il s'agit d'affiner,
+    /// pas de bousculer ce qui est appris. Sans learningRate : ContinueLearningRate, ou la vitesse
+    /// de la phase si elle est déjà plus basse (fine-tuning, 1e-4 : à 3e-4 il apprend les dialogues par cœur).
+    /// Warmup réduit à la moitié des pas pour une petite continuation (sinon il ne finirait jamais).
+    /// </summary>
+    public TrainingConfig Continuation(int firstStep, int steps, double? learningRate = null)
+    {
+        double lr = learningRate ?? Math.Min(ContinueLearningRate, LearningRate);
+        return this with
+        {
+            FirstStep = firstStep,
+            Steps = firstStep + steps,
+            LearningRate = lr,
+            MinLearningRate = lr / 10,
+            WarmupSteps = Math.Min(ContinueWarmupSteps, steps / 2),
+        };
+    }
+
     /// <summary>Phase 1 : apprendre la langue sur un gros texte général (data/texte.txt).</summary>
     public static TrainingConfig Pretraining => new();
 
@@ -37,8 +64,15 @@ public sealed class TrainingConfig
     /// Nombre d'étapes d'apprentissage. Pré-entraînement : 20 000 x 64 extraits x 256 tokens = 330 millions
     /// de tokens, ~70 % de texte.txt sans jamais le relire. Mesuré sur RTX 3060 Ti avec le modèle de
     /// 27 M de paramètres : 0,46 s par étape, soit ~2 h 35 (interruptible, reprise avec --resume).
+    /// C'est le numéro du dernier pas : la phase va de FirstStep à Steps.
     /// </summary>
-    public int Steps { get; init; } = 20000;
+    public int Steps { get; init; } = 9000;
+
+    /// <summary>
+    /// Numéro du premier pas : 0 pour un nouvel entraînement, le pas atteint avant pour une continuation.
+    /// Le warmup et le cosinus partent d'ici.
+    /// </summary>
+    public int FirstStep { get; init; } = 0;
 
     /// <summary>
     /// Nombre d'extraits envoyés au GPU en une fois. Limité par la mémoire du GPU :

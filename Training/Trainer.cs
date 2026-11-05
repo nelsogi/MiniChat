@@ -9,6 +9,18 @@ using static TorchSharp.torch.nn;
 namespace MiniChat.Training;
 
 /// <summary>
+/// Bilan d'une phase. StartValLoss = loss de vérification du modèle de départ (au premier pas),
+/// BestValLoss/BestStep = les poids gardés, LastStep = pas atteint (arrêt anticipé ou fin).
+/// OptimizerStatePath = état d'AdamW à la fin, à sauvegarder avec le modèle pour pouvoir continuer (--continue).
+/// </summary>
+public sealed record TrainingResult(float StartValLoss, float BestValLoss, int BestStep, int LastStep,
+    string OptimizerStatePath)
+{
+    /// <summary>Les poids gardés sont meilleurs que ceux du départ (sinon ce sont les mêmes).</summary>
+    public bool Improved => BestValLoss < StartValLoss;
+}
+
+/// <summary>
 /// La boucle d'apprentissage. À chaque étape :
 ///   1. le modèle prédit le caractère suivant pour chaque position,
 ///   2. on mesure son erreur (la "loss", cross-entropy),
@@ -42,7 +54,10 @@ public sealed class Trainer
     private float _bestValLoss = float.MaxValue;
     private int _bestStep;
 
-    // Premier pas de ce lancement (0, ou le pas sauvegardé si on reprend) : sert au temps restant.
+    // Loss de vérification au premier pas de la phase (FirstStep) : celle du modèle de départ.
+    private float? _startValLoss;
+
+    // Premier pas de ce lancement (FirstStep, ou le pas sauvegardé si on reprend) : sert au temps restant.
     private int _startStep;
 
     // Petits batchs par étape (EffectiveBatchSize / BatchSize), et pic de mémoire GPU vu.
@@ -78,29 +93,53 @@ public sealed class Trainer
 
     /// <param name="resume">
     /// Reprise d'un entraînement interrompu : on repart du pas sauvegardé, avec l'état de l'optimiseur
-    /// et la meilleure loss d'avant (les poids du modèle ont déjà été rechargés). null = depuis le début.
+    /// et la meilleure loss d'avant (les poids du modèle ont déjà été rechargés). null = depuis FirstStep.
     /// </param>
-    public void Train(CheckpointState? resume = null)
+    /// <param name="optimizerPath">
+    /// Sans reprise : état d'AdamW sauvegardé avec le modèle, à recharger (continuation, --continue).
+    /// null ou fichier absent = AdamW repart de zéro.
+    /// </param>
+    public TrainingResult Train(CheckpointState? resume = null, string? optimizerPath = null)
     {
         var optimizer = CreateOptimizer();
         var clock = Stopwatch.StartNew();
         _model.train();
+        _startStep = _config.FirstStep;
 
         if (resume is not null)
         {
             _checkpoint.LoadOptimizer(optimizer);
             _startStep = resume.Step;
+            _startValLoss = resume.StartValLoss;
             if (_checkpoint.ReadBest() is { } best)
                 (_bestValLoss, _bestStep) = (best.ValLoss, best.Step);
             Console.WriteLine($"  Reprise au pas {_startStep} (meilleure loss de vérification : {_bestValLoss:F3}, au pas {_bestStep}).");
+        }
+        else if (optimizerPath is not null)
+        {
+            if (File.Exists(optimizerPath))
+            {
+                optimizer.load_state_dict(optimizerPath);
+                Console.WriteLine("  État de l'optimiseur (AdamW) rechargé.");
+            }
+            else
+            {
+                Console.WriteLine("  Pas d'état d'optimiseur sauvegardé avec ce modèle : AdamW repart de zéro.");
+            }
         }
 
         Console.WriteLine($"  Batch : {_config.BatchSize} x {_accumulation} = {_config.EffectiveBatchSize} extraits " +
                           $"de {_model.Config.BlockSize} tokens par étape.");
 
+        int lastStep = _startStep;
         for (int step = _startStep; step <= _config.Steps; step++)
         {
-            if (step % _config.EvalInterval == 0)
+            lastStep = step;
+
+            // Mesure aussi au premier pas (la loss du modèle de départ, à battre) et au dernier,
+            // même s'ils ne tombent pas sur EvalInterval (une continuation peut commencer au pas 9 137).
+            bool last = step == _config.Steps;
+            if (step % _config.EvalInterval == 0 || step == _config.FirstStep || last)
             {
                 Report(step, clock.Elapsed);
 
@@ -113,8 +152,11 @@ public sealed class Trainer
                 }
             }
 
+            // Dernier pas mesuré : un pas de plus ne serait jamais vérifié, donc jamais gardé.
+            if (last) break;
+
             if (step % _config.CheckpointInterval == 0)
-                _checkpoint.SaveProgress(_model, optimizer, new CheckpointState(_phase, step, _checkpoint.RunId));
+                _checkpoint.SaveProgress(_model, optimizer, new CheckpointState(_phase, step, _checkpoint.RunId, _startValLoss));
 
             if (_showSample is not null && step > 0 && step % _config.SampleInterval == 0)
             {
@@ -144,12 +186,15 @@ public sealed class Trainer
             optimizer.step();
         }
 
-        // On remet les poids qui avaient la meilleure loss de vérification.
+        // On remet les poids qui avaient la meilleure loss de vérification (optimiseur sauvegardé avant, voir SaveFinalOptimizer).
+        string optimizerState = _checkpoint.SaveFinalOptimizer(optimizer);
         _checkpoint.LoadBest(_model);
         Console.WriteLine($"Meilleur modèle gardé : étape {_bestStep}, loss vérification {_bestValLoss:F3}.");
 
         if (_peakGpuMb > 0)
             Console.WriteLine($"Mémoire GPU utilisée au maximum : {_peakGpuMb:N0} Mo.");
+
+        return new TrainingResult(_startValLoss ?? _bestValLoss, _bestValLoss, _bestStep, lastStep, optimizerState);
     }
 
     /// <summary>
@@ -178,10 +223,13 @@ public sealed class Trainer
     /// </summary>
     private double LearningRateAt(int step)
     {
-        if (step < _config.WarmupSteps)
-            return _config.LearningRate * (step + 1) / _config.WarmupSteps;
+        // Compté depuis FirstStep : une continuation a son propre warmup et son propre cosinus.
+        int done = step - _config.FirstStep;
+        int total = _config.Steps - _config.FirstStep;
+        if (done < _config.WarmupSteps)
+            return _config.LearningRate * (done + 1) / _config.WarmupSteps;
 
-        double progress = (double)(step - _config.WarmupSteps) / Math.Max(1, _config.Steps - _config.WarmupSteps);
+        double progress = (double)(done - _config.WarmupSteps) / Math.Max(1, total - _config.WarmupSteps);
         double cosine = 0.5 * (1 + Math.Cos(Math.PI * Math.Min(progress, 1.0)));   // 1 -> 0
         return _config.MinLearningRate + (_config.LearningRate - _config.MinLearningRate) * cosine;
     }
@@ -224,6 +272,7 @@ public sealed class Trainer
     {
         float train = EstimateLoss(validation: false);
         float val = EstimateLoss(validation: true);
+        _startValLoss ??= val;
 
         string best = "";
         if (val < _bestValLoss)

@@ -7,8 +7,18 @@ using static TorchSharp.torch;
 
 namespace MiniChat.Training;
 
-/// <summary>Où en est un entraînement. Step = prochain pas à faire (les pas d'avant sont faits).</summary>
-public sealed record CheckpointState(string Phase, int Step, string RunId);
+/// <summary>
+/// Où en est un entraînement. Step = prochain pas à faire (les pas d'avant sont faits).
+/// StartValLoss = loss de vérification du modèle au premier pas de la phase (null si pas encore mesurée) :
+/// pour une continuation, c'est la loss de l'ancien modèle, à battre pour le remplacer.
+/// </summary>
+public sealed record CheckpointState(string Phase, int Step, string RunId, float? StartValLoss = null);
+
+/// <summary>
+/// Une continuation (--continue, --continue-finetune) : Steps pas de plus à partir de FirstStep,
+/// à la vitesse LearningRate. Gardée pour que --resume refasse les mêmes réglages.
+/// </summary>
+public sealed record ContinueState(string Phase, int FirstStep, int Steps, double LearningRate);
 
 /// <summary>La meilleure loss de vérification de la phase en cours, et à quel pas (va avec best.dat).</summary>
 public sealed record BestScore(float ValLoss, int Step);
@@ -21,6 +31,7 @@ public sealed record BestScore(float ValLoss, int Step);
 ///   best.dat, best.json                        -> les poids qui ont eu la meilleure loss de vérification,
 ///                                                 et cette loss (écrits ensemble, à chaque amélioration)
 ///   state.json                                 -> phase et pas de la dernière sauvegarde (voir CheckpointState)
+///   continue.json                              -> seulement pour --continue : ses réglages (voir ContinueState)
 /// Supprimé à la fin d'un entraînement complet : s'il existe, c'est qu'un entraînement a été interrompu.
 /// </summary>
 public sealed class Checkpoint
@@ -42,6 +53,7 @@ public sealed class Checkpoint
     private string OptimizerPath => Path.Combine(_folder, "optimizer.dat");
     private string BestPath => Path.Combine(_folder, "best.dat");
     private string BestScorePath => Path.Combine(_folder, "best.json");
+    private string ContinuePath => Path.Combine(_folder, "continue.json");
 
     public static bool ExistsIn(string folder) =>
         File.Exists(Path.Combine(folder, "state.json")) && new ModelStore(folder).Exists;
@@ -50,12 +62,21 @@ public sealed class Checkpoint
         JsonSerializer.Deserialize<CheckpointState>(File.ReadAllText(Path.Combine(folder, "state.json")))
         ?? throw new InvalidDataException("checkpoint/state.json illisible.");
 
-    /// <summary>Nouveau départ : efface l'ancienne sauvegarde et enregistre la forme du modèle et le tokenizer.</summary>
-    public void Start(MiniGpt model, BpeTokenizer tokenizer)
+    /// <summary>
+    /// Nouveau départ : efface l'ancienne sauvegarde et enregistre la forme du modèle et le tokenizer.
+    /// continuation : réglages d'un --continue, relus par ReadContinuation à la reprise.
+    /// </summary>
+    public void Start(MiniGpt model, BpeTokenizer tokenizer, ContinueState? continuation = null)
     {
         Delete();
         _store.Save(model, tokenizer);
+        if (continuation is not null)
+            File.WriteAllText(ContinuePath, JsonSerializer.Serialize(continuation));
     }
+
+    /// <summary>Les réglages du --continue en cours, ou null si c'est un entraînement normal.</summary>
+    public ContinueState? ReadContinuation() =>
+        File.Exists(ContinuePath) ? JsonSerializer.Deserialize<ContinueState>(File.ReadAllText(ContinuePath)) : null;
 
     /// <summary>Le modèle (poids au dernier checkpoint) et son tokenizer.</summary>
     public (MiniGpt Model, BpeTokenizer Tokenizer) LoadModel(Device device) => _store.Load(device);
@@ -78,6 +99,18 @@ public sealed class Checkpoint
     }
 
     public void LoadOptimizer(TorchSharp.Modules.OptimizerHelper optimizer) => optimizer.load_state_dict(OptimizerPath);
+
+    /// <summary>
+    /// État d'AdamW à la fin de la phase, dans final-optimizer.dat (copié ensuite avec le modèle, voir ModelStore).
+    /// À appeler AVANT LoadBest : recharger des poids remplace les tenseurs des paramètres,
+    /// et l'optimiseur, qui pointe encore sur les anciens, ne peut plus se sauvegarder.
+    /// </summary>
+    public string SaveFinalOptimizer(TorchSharp.Modules.OptimizerHelper optimizer)
+    {
+        string path = Path.Combine(_folder, "final-optimizer.dat");
+        optimizer.save_state_dict(path);
+        return path;
+    }
 
     /// <summary>
     /// Garde les poids actuels comme "meilleurs" (sur disque : ils survivent à une coupure).

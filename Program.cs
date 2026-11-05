@@ -152,7 +152,7 @@ static string ReadText(string path)
 static void RunChat(ChatSession chat)
 {
     Console.WriteLine();
-    Console.WriteLine("Discute avec ton IA. Commandes : /reset (oublier la conversation), /temp 0.8, /topk 20, /topp 0.9, /quit");
+    Console.WriteLine("Discute avec ton IA. Commandes : /reset (oublier la conversation), /temp 0.8, /topk 20, /topp 0.9, /info, /quit");
     Console.WriteLine();
 
     while (true)
@@ -169,6 +169,12 @@ static void RunChat(ChatSession chat)
         {
             chat.Reset();
             Console.WriteLine("(conversation oubliée)");
+            continue;
+        }
+
+        if (input.Trim() == "/info")
+        {
+            Console.WriteLine(chat.Info());
             continue;
         }
 

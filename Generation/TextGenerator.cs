@@ -22,6 +22,12 @@ public sealed class TextGenerator
         _device = device;
     }
 
+    public MiniGpt Model => _model;
+    public Device Device => _device;
+
+    /// <summary>Nombre de tokens d'un texte (pour savoir ce qui tient dans la mémoire du modèle).</summary>
+    public int CountTokens(string text) => _tokenizer.Encode(text).Length;
+
     /// <param name="prompt">Le début du texte.</param>
     /// <param name="maxNewTokens">Limite de sécurité, en tokens.</param>
     /// <param name="temperature">

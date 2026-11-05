@@ -77,10 +77,11 @@ switch (command)
             ? (long)(double.Parse(maxMo, CultureInfo.InvariantCulture) * 1024 * 1024)
             : null;
 
+        // Écrit lui-même le fichier au fur et à mesure (la sortie peut dépasser la taille max d'une chaîne).
         var parquet = new ParquetConverter(column, maxBytes);
         try
         {
-            output = await parquet.ConvertAsync(inputs);
+            await parquet.ConvertAsync(inputs, outputPath);
         }
         catch (InvalidDataException e)
         {
@@ -90,7 +91,8 @@ switch (command)
         Console.WriteLine($"Documents gardés : {parquet.Kept:N0}"
             + (parquet.ReachedMaxSize ? $" (arrêt à {maxMo} Mo)" : "")
             + $", vides après nettoyage : {parquet.Empty:N0}.");
-        break;
+        Console.WriteLine($"Écrit : {outputPath} ({parquet.Characters:N0} caractères, {parquet.Vocabulary} caractères différents).");
+        return 0;
 
     default:
         Console.WriteLine($"Commande inconnue : {command}\n\n{Usage}");

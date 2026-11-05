@@ -110,8 +110,9 @@ dotnet run --project DataBuilder -- parquet Data/texte.txt train-00000-of-00002.
   refusés, trop longs, avec du code ou des caractères exotiques (emoji...).
 - **gutenberg** retire l'en-tête et la licence, recolle les paragraphes (un par ligne),
   simplifie la typographie (’ … — -> ' ... -) et lit aussi les vieux fichiers en Latin-1.
-- **parquet** lit la colonne `--column` (par défaut `text`) : un document par valeur, nettoyé comme
-  pour Gutenberg, une ligne du document = un paragraphe. `--max-mo` arrête avant le document qui
+- **parquet** lit la colonne `--column` (par défaut `text`) ; un fichier sans cette colonne mais avec une
+  seule colonne de texte (TinyStories : `french-tinystories`) utilise celle-là. Un document par valeur,
+  nettoyé comme pour Gutenberg, une ligne du document = un paragraphe. `--max-mo` arrête avant le document qui
   ferait dépasser la taille ; sans cette option, tout est gardé. Affiche le nombre de documents gardés.
 
 Attention : la sortie est **écrasée**. Garde une copie de tes `dialogues.txt` faits à la main.

@@ -12,15 +12,25 @@ namespace DataBuilder;
 /// ces textes ne sont pas coupés à ~70 caractères comme les livres, et beaucoup séparent leurs paragraphes
 /// par un seul saut de ligne. Résultat : un paragraphe par ligne.
 ///
-/// Après Convert(), les compteurs (Kept, Empty...) disent ce qui a été gardé.
+/// Le texte est écrit dans le fichier au fur et à mesure : un seul fichier Wikipedia peut donner plusieurs Go,
+/// trop pour une chaîne .NET (1 milliard de caractères au plus).
+///
+/// Après ConvertAsync(), les compteurs (Kept, Empty...) disent ce qui a été gardé.
 /// </summary>
 public sealed class ParquetConverter
 {
     private readonly string _column;
     private readonly long? _maxBytes;
+    private readonly HashSet<char> _vocabulary = new();
 
     /// <summary>Documents écrits dans le fichier.</summary>
     public int Kept { get; private set; }
+
+    /// <summary>Caractères écrits dans le fichier.</summary>
+    public long Characters { get; private set; }
+
+    /// <summary>Nombre de caractères différents écrits.</summary>
+    public int Vocabulary => _vocabulary.Count;
 
     /// <summary>Documents vides (ou null) après nettoyage.</summary>
     public int Empty { get; private set; }
@@ -36,16 +46,27 @@ public sealed class ParquetConverter
         _maxBytes = maxBytes;
     }
 
-    /// <returns>Le texte nettoyé. Un document qui ferait dépasser la taille max n'est pas gardé.</returns>
-    public async Task<string> ConvertAsync(IEnumerable<string> inputPaths)
+    /// <summary>Écrit le texte nettoyé dans outputPath. Un document qui ferait dépasser la taille max n'est pas gardé.</summary>
+    public async Task ConvertAsync(IEnumerable<string> inputPaths, string outputPath)
     {
-        var output = new StringBuilder();
+        // Les colonnes de tous les fichiers d'abord (ça ne lit que l'en-tête) : une erreur sur le dernier
+        // fichier arrive tout de suite, pas après avoir lu tous les autres pour rien, et la sortie n'est pas écrasée.
+        var columns = new Dictionary<string, string>();
+        foreach (string path in inputPaths)
+        {
+            await using var reader = await ParquetReader.CreateAsync(path);
+            columns[path] = FindColumn(reader.Schema, path).Name;
+        }
+
+        // UTF-8 sans BOM, fins de ligne "\n" : exactement ce que MiniChat attend.
+        Directory.CreateDirectory(Path.GetDirectoryName(Path.GetFullPath(outputPath))!);
+        await using var output = new StreamWriter(outputPath, false, new UTF8Encoding(false));
         long bytes = 0;
 
         foreach (string path in inputPaths)
         {
             await using var reader = await ParquetReader.CreateAsync(path);
-            DataField field = FindColumn(reader.Schema, path);
+            DataField field = reader.Schema.GetDataFields().First(f => f.Name == columns[path]);
             int keptBefore = Kept;
 
             for (int i = 0; i < reader.RowGroupCount; i++)
@@ -68,19 +89,19 @@ public sealed class ParquetConverter
                     {
                         ReachedMaxSize = true;
                         Console.WriteLine($"  {Path.GetFileName(path)} : {Kept - keptBefore:N0} documents (taille max atteinte).");
-                        return output.ToString();
+                        return;
                     }
 
-                    output.Append(cleaned);
+                    await output.WriteAsync(cleaned);
+                    _vocabulary.UnionWith(cleaned);
                     bytes += size;
+                    Characters += cleaned.Length;
                     Kept++;
                 }
             }
 
             Console.WriteLine($"  {Path.GetFileName(path)} : {Kept - keptBefore:N0} documents.");
         }
-
-        return output.ToString();
     }
 
     /// <summary>Un paragraphe nettoyé par ligne, "" si rien ne reste.</summary>
@@ -96,15 +117,27 @@ public sealed class ParquetConverter
         return text.Length > 0 ? text + '\n' : "";
     }
 
+    /// <summary>
+    /// La colonne demandée, sinon la seule colonne de texte du fichier s'il n'y en a qu'une
+    /// (les jeux de données ne l'appellent pas tous "text" : TinyStories l'appelle "french-tinystories").
+    /// </summary>
     private DataField FindColumn(ParquetSchema schema, string path)
     {
         var fields = schema.GetDataFields();
-        // Parquet.Net 6 annonce les colonnes de texte en ReadOnlyMemory<char> (string dans les versions d'avant).
-        return fields.FirstOrDefault(f => f.Name == _column && IsText(f))
-            ?? throw new InvalidDataException(
-                $"{Path.GetFileName(path)} : pas de colonne de texte '{_column}'. "
-                + $"Colonnes : {string.Join(", ", fields.Select(f => $"{f.Name} ({(IsText(f) ? "texte" : f.ClrType.Name)})"))}. "
-                + "Choisis-en une avec --column.");
+        var requested = fields.FirstOrDefault(f => f.Name == _column && IsText(f));
+        if (requested is not null) return requested;
+
+        var textFields = fields.Where(IsText).ToList();
+        if (textFields.Count == 1)
+        {
+            Console.WriteLine($"  {Path.GetFileName(path)} : pas de colonne '{_column}', lecture de la seule colonne de texte '{textFields[0].Name}'.");
+            return textFields[0];
+        }
+
+        throw new InvalidDataException(
+            $"{Path.GetFileName(path)} : pas de colonne de texte '{_column}'. "
+            + $"Colonnes : {string.Join(", ", fields.Select(f => $"{f.Name} ({(IsText(f) ? "texte" : f.ClrType.Name)})"))}. "
+            + "Choisis-en une avec --column.");
     }
 
     // Parquet.Net 6 annonce les colonnes de texte en ReadOnlyMemory<char> (string dans les versions d'avant).

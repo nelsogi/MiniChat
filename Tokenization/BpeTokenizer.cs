@@ -62,8 +62,9 @@ public sealed partial class BpeTokenizer
 
         var merges = new List<(int, int)>();
 
-        // ponytail: on recompte toutes les paires à chaque fusion. Quelques secondes à ~1 Mo de texte ;
-        // si texte.txt grossit beaucoup, mettre à jour les comptes seulement autour des fusions.
+        // ponytail: on recompte toutes les paires à chaque fusion. ~1 min 30 pour 20 Mo et 4000 tokens :
+        // c'est pour ça que Program.cs n'en donne qu'un échantillon de texte.txt (TokenizerSampleMb).
+        // Pour aller plus loin, mettre à jour les comptes seulement autour des fusions.
         while (alphabet.Length + merges.Count < vocabSize)
         {
             var pairCounts = new Dictionary<(int, int), long>();

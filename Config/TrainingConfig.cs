@@ -9,14 +9,22 @@ public sealed class TrainingConfig
     /// <summary>
     /// Phase 2 : spécialiser le modèle sur les dialogues (data/dialogues.txt).
     /// Vitesse plus basse et moins d'étapes : on ajuste ce qui est déjà appris, sans tout effacer.
+    ///
+    /// dialogues.txt est petit (~30 000 tokens) et chaque étape en lit ~16 000 : le modèle l'apprend
+    /// vite par cœur. Avec 800 étapes à 3e-4, la loss de vérification était au plus bas à l'étape 50
+    /// puis remontait (entraînement 0,06, vérification 3,5). D'où peu d'étapes, une vitesse basse,
+    /// une mesure tous les 25 pas pour attraper le meilleur moment, et un arrêt dès que ça empire.
     /// </summary>
     public static TrainingConfig FineTuning => new()
     {
-        Steps = 800,
-        LearningRate = 3e-4,
-        MinLearningRate = 3e-5,
-        WarmupSteps = 50,
+        Steps = 300,
+        LearningRate = 1e-4,
+        MinLearningRate = 1e-5,
+        WarmupSteps = 20,
         GeneralTextRatio = 0.2,
+        EvalInterval = 25,
+        EarlyStoppingPatience = 100,
+        SampleInterval = 100,
     };
 
     /// <summary>
@@ -25,8 +33,12 @@ public sealed class TrainingConfig
     /// </summary>
     public double GeneralTextRatio { get; init; } = 0;
 
-    /// <summary>Nombre d'étapes d'apprentissage.</summary>
-    public int Steps { get; init; } = 10000;
+    /// <summary>
+    /// Nombre d'étapes d'apprentissage. Pré-entraînement : 20 000 x 64 extraits x 256 tokens = 330 millions
+    /// de tokens, ~70 % de texte.txt sans jamais le relire. Mesuré sur RTX 3060 Ti avec le modèle de
+    /// 27 M de paramètres : 0,46 s par étape, soit ~2 h 35 (interruptible, reprise avec --resume).
+    /// </summary>
+    public int Steps { get; init; } = 20000;
 
     /// <summary>
     /// Nombre d'extraits envoyés au GPU en une fois. Limité par la mémoire du GPU :
@@ -74,8 +86,11 @@ public sealed class TrainingConfig
     /// <summary>Tous les combien de pas on affiche une réponse d'exemple (première question de questions-test.txt).</summary>
     public int SampleInterval { get; init; } = 1000;
 
-    /// <summary>Tous les combien de pas on affiche la loss.</summary>
-    public int EvalInterval { get; init; } = 50;
+    /// <summary>
+    /// Tous les combien de pas on mesure et affiche la loss (et on sauvegarde le modèle s'il est le meilleur).
+    /// 100 en pré-entraînement : la loss y bouge lentement, et chaque mesure coûte du temps de calcul.
+    /// </summary>
+    public int EvalInterval { get; init; } = 100;
 
     /// <summary>Nombre de batchs moyennés pour mesurer la loss proprement.</summary>
     public int EvalBatches { get; init; } = 20;

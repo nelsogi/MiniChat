@@ -15,7 +15,12 @@ Console.OutputEncoding = Encoding.UTF8;
 Console.InputEncoding = Encoding.UTF8;
 
 // Taille du vocabulaire BPE : plus grand = mots entiers plus souvent, mais plus de données nécessaires.
-const int TokenizerVocabSize = 2000;
+// 4000 : texte.txt fait maintenant des centaines de millions de tokens, de quoi apprendre chaque token.
+const int TokenizerVocabSize = 4000;
+
+// Le tokenizer apprend sur un échantillon de texte.txt réparti dans tout le fichier, pas sur le fichier entier :
+// ~1 min 30 pour 20 Mo et 4000 tokens, et les fusions apprises ne changent presque plus au-delà.
+const int TokenizerSampleMb = 20;
 
 // Deux dossiers, par défaut à côté de l'exécutable (marche avec "dotnet run", F5 et le dossier publié) :
 //   --data <dossier>    texte.txt, dialogues.txt, questions-test.txt
@@ -147,8 +152,8 @@ static (MiniGpt, BpeTokenizer) CreateModel(string pretrainPath, string dialogues
 
     // Le tokenizer apprend sur les DEUX fichiers : il connaît les mots des dialogues,
     // et le modèle garde le même vocabulaire (donc la même taille de sortie) entre les deux phases.
-    Console.WriteLine($"Entraînement du tokenizer BPE ({TokenizerVocabSize} tokens)...");
-    var tokenizer = BpeTokenizer.Train(ReadText(pretrainPath) + "\n" + ReadText(dialoguesPath), TokenizerVocabSize);
+    Console.WriteLine($"Entraînement du tokenizer BPE ({TokenizerVocabSize} tokens, sur {TokenizerSampleMb} Mo de texte.txt au plus)...");
+    var tokenizer = BpeTokenizer.Train(ReadSample(pretrainPath, TokenizerSampleMb) + "\n" + ReadText(dialoguesPath), TokenizerVocabSize);
     var model = new MiniGpt(new ModelConfig { VocabSize = tokenizer.VocabSize }).to(device);
 
     Console.WriteLine($"Vocabulaire : {tokenizer.VocabSize} tokens ({tokenizer.Alphabet.Length} caractères de base + {tokenizer.Merges.Count} fusions).");
@@ -165,9 +170,9 @@ static void Pretrain(MiniGpt model, BpeTokenizer tokenizer, string pretrainPath,
     int seed = config.Seed + (resume?.Step ?? 0);
     manual_seed(seed);
 
-    string text = ReadText(pretrainPath);
-    var dataset = new TextDataset(text, tokenizer, seed);
-    Console.WriteLine($"texte.txt : {text.Length:N0} caractères -> {dataset.TrainLength + dataset.ValidationLength:N0} tokens.");
+    Console.WriteLine("Lecture et découpage en tokens de texte.txt...");
+    var dataset = TextDataset.FromFile(CheckExists(pretrainPath), tokenizer, seed);
+    Console.WriteLine($"texte.txt : {dataset.Characters:N0} caractères -> {dataset.TrainLength + dataset.ValidationLength:N0} tokens.");
     TrainPhase("Phase 1 - pré-entraînement", "pretrain", dataset, model, tokenizer, config, device, log, checkpoint, resume);
 
     store.Save(model, tokenizer);
@@ -186,7 +191,7 @@ static void FineTune(MiniGpt model, BpeTokenizer tokenizer, string dialoguesPath
 
     var dialogues = new TextDataset(ReadText(dialoguesPath), tokenizer, seed, onlyReplies: true);
     // Autre graine : les extraits de texte général ne suivent pas le même tirage que les dialogues.
-    var generalText = new TextDataset(ReadText(pretrainPath), tokenizer, seed + 1);
+    var generalText = TextDataset.FromFile(CheckExists(pretrainPath), tokenizer, seed + 1);
 
     TrainPhase($"Phase 2 - fine-tuning (loss sur les réponses IA, {config.GeneralTextRatio:P0} de texte général)",
         "finetune", dialogues, model, tokenizer, config, device, log, checkpoint, resume, generalText);
@@ -210,11 +215,36 @@ static void TrainPhase(string name, string phase, TextDataset dataset, MiniGpt m
 }
 
 // Lit un fichier de données. Sur Windows les fins de ligne sont "\r\n" : on garde seulement "\n".
-static string ReadText(string path)
+static string ReadText(string path) => File.ReadAllText(CheckExists(path)).Replace("\r\n", "\n");
+
+static string CheckExists(string path) =>
+    File.Exists(path) ? path : throw new FileNotFoundException($"Fichier de données introuvable : {path}");
+
+// Un fichier de plus de maxMb Mo : maxMb blocs de 1 Mo pris à intervalles réguliers, coupés aux fins de ligne.
+// Réparti dans tout le fichier, l'échantillon voit chaque source (texte.txt en colle souvent plusieurs bout à bout).
+// Un fichier plus petit est lu en entier.
+static string ReadSample(string path, int maxMb)
 {
-    if (!File.Exists(path))
-        throw new FileNotFoundException($"Fichier de données introuvable : {path}");
-    return File.ReadAllText(path).Replace("\r\n", "\n");
+    const int BlockSize = 1 << 20;
+    long length = new FileInfo(CheckExists(path)).Length;
+    if (length <= (long)maxMb * BlockSize)
+        return ReadText(path);
+
+    var sample = new StringBuilder();
+    var buffer = new byte[BlockSize];
+    using var file = File.OpenRead(path);
+    for (int i = 0; i < maxMb; i++)
+    {
+        file.Position = length / maxMb * i;
+        int read = file.ReadAtLeast(buffer, BlockSize, throwOnEndOfStream: false);
+        // Le bloc commence et finit au milieu d'une ligne (voire d'un caractère UTF-8) : on garde les lignes entières.
+        string block = Encoding.UTF8.GetString(buffer, 0, read);
+        int first = block.IndexOf('\n') + 1;
+        int last = block.LastIndexOf('\n') + 1;
+        if (last > first)
+            sample.Append(block, first, last - first);
+    }
+    return sample.Replace("\r\n", "\n").ToString();
 }
 
 static void RunChat(ChatSession chat)

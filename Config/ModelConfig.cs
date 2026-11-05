@@ -13,14 +13,18 @@ public sealed class ModelConfig
     public int BlockSize { get; init; } = 256;
 
     /// <summary>Taille du vecteur qui représente chaque token.</summary>
-    public int EmbedDim { get; init; } = 384;
+    public int EmbedDim { get; init; } = 512;
 
     /// <summary>Nombre de têtes d'attention (doit diviser EmbedDim).</summary>
-    public int Heads { get; init; } = 6;
+    public int Heads { get; init; } = 8;
 
     /// <summary>Nombre de blocs Transformer empilés.</summary>
-    public int Layers { get; init; } = 6;
+    public int Layers { get; init; } = 8;
 
-    /// <summary>Probabilité d'éteindre des neurones à l'entraînement (évite d'apprendre par cœur).</summary>
-    public double Dropout { get; init; } = 0.2;
+    /// <summary>
+    /// Probabilité d'éteindre des neurones à l'entraînement (évite d'apprendre par cœur).
+    /// 0.1 et pas plus : en pré-entraînement le modèle ne revoit presque jamais le même texte, il n'y a rien
+    /// à apprendre par cœur, et un dropout fort ne ferait que ralentir l'apprentissage.
+    /// </summary>
+    public double Dropout { get; init; } = 0.1;
 }

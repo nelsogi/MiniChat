@@ -16,23 +16,29 @@ Pendant l'entraînement, l'avancement est sauvegardé tous les 250 pas dans `bin
 (`CheckpointInterval`) : poids, état de l'optimiseur, meilleurs poids. `--resume` repart de là.
 Le dossier est supprimé quand l'entraînement va jusqu'au bout.
 
-Arrêt anticipé : si la loss de vérification ne s'améliore plus pendant 2000 pas
+Arrêt anticipé : si la loss de vérification ne s'améliore plus pendant 2000 pas (100 en fine-tuning)
 (`EarlyStoppingPatience`, 0 = jamais), la phase s'arrête et garde le meilleur modèle.
 
 L'entraînement se fait en deux phases (réglages dans `TrainingConfig.Pretraining` / `FineTuning`) :
 
 1. **Pré-entraînement** sur `data/texte.txt` (beaucoup de texte général) -> sauvegardé dans `model-pretrain/`.
-2. **Fine-tuning** sur `data/dialogues.txt` -> sauvegardé dans `model/`.
+   20 000 étapes. `texte.txt` peut faire plusieurs Go : il est lu ligne par ligne, et ses tokens
+   prennent 2 octets chacun en mémoire (1,5 Go de texte -> ~460 M tokens -> ~0,9 Go de RAM, ~1 min de découpage).
+2. **Fine-tuning** sur `data/dialogues.txt` -> sauvegardé dans `model/`. Court (300 étapes, vitesse 1e-4) :
+   les dialogues sont petits et le modèle les apprend vite par cœur.
 
-Le tokenizer BPE (2000 tokens, `TokenizerVocabSize` dans `Program.cs`) est entraîné au début
-de la phase 1 sur les deux fichiers, puis sauvegardé avec le modèle (`tokenizer.json`).
+Le tokenizer BPE (4000 tokens, `TokenizerVocabSize` dans `Program.cs`) est entraîné au début
+de la phase 1 sur les dialogues et un échantillon de 20 Mo de `texte.txt` réparti dans tout le fichier
+(`TokenizerSampleMb`, ~1 min 30), puis sauvegardé avec le modèle (`tokenizer.json`).
 Si tu changes beaucoup les dialogues, refais un `--train` complet : `--finetune` garde
 l'ancien tokenizer (les caractères nouveaux seront ignorés).
 
-Le modèle (EmbedDim 384, 6 couches, 6 têtes, mémoire de 256 tokens, ~11,5 M paramètres) apprend
+Le modèle (EmbedDim 512, 8 couches, 8 têtes, mémoire de 256 tokens, dropout 0,1, ~27 M paramètres) apprend
 à chaque étape sur 64 extraits, envoyés au GPU par paquets de 16 (accumulation de gradients,
-voir `BatchSize` / `EffectiveBatchSize`). Sur une NVIDIA T400 4 Go : ~2 Go de mémoire GPU,
-~3,5 s par étape. La mémoire GPU utilisée s'affiche à chaque mesure de loss.
+voir `BatchSize` / `EffectiveBatchSize`). Sur une RTX 3060 Ti 8 Go : ~3,2 Go de mémoire GPU (toute la carte),
+0,46 s par étape, soit ~2 h 35 de pré-entraînement. Des paquets de 32 ne vont pas plus vite.
+La mémoire GPU utilisée s'affiche à chaque mesure de loss.
+Les modèles déjà entraînés gardent leur taille (`config.json`) : ces réglages valent pour le prochain `--train`.
 
 Le modèle entraîné est sauvegardé dans `bin/.../model/` : les lancements suivants
 démarrent directement le chat.

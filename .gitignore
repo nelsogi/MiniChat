@@ -16,3 +16,6 @@ obj/
 # Dossier et archive produits par publish.ps1
 publish/
 *.zip
+
+# Texte de pré-entraînement produit par DataBuilder : trop gros pour GitHub (limite 100 Mo par fichier)
+Data/texte.txt

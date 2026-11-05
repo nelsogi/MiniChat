@@ -21,7 +21,8 @@ namespace MiniChat.Training;
 ///     et on la remet dans le modèle à la fin (le modèle sauvegardé = le meilleur vu),
 ///   - la loss ne compte que les caractères dont le masque vaut 1 (voir TextDataset),
 ///   - on peut mélanger un peu de texte général dans chaque batch (voir GeneralTextRatio),
-///   - weight decay sur les matrices, et gradient clipping (voir WeightDecay, GradClip).
+///   - weight decay sur les matrices, et gradient clipping (voir WeightDecay, GradClip),
+///   - accumulation de gradients : plusieurs petits batchs par étape (voir EffectiveBatchSize).
 /// </summary>
 public sealed class Trainer
 {
@@ -38,6 +39,10 @@ public sealed class Trainer
     private Dictionary<string, Tensor>? _bestWeights;
     private float _bestValLoss = float.MaxValue;
     private int _bestStep;
+
+    // Petits batchs par étape (EffectiveBatchSize / BatchSize), et pic de mémoire GPU vu.
+    private readonly int _accumulation;
+    private long _peakGpuMb;
 
     /// <param name="dataset">Le texte principal. La loss de vérification (et donc le meilleur modèle) se mesure dessus.</param>
     /// <param name="generalText">
@@ -58,6 +63,10 @@ public sealed class Trainer
         _phase = phase;
         _lossCsvPath = lossCsvPath;
         _showSample = showSample;
+
+        if (config.EffectiveBatchSize % config.BatchSize != 0)
+            throw new ArgumentException($"EffectiveBatchSize ({config.EffectiveBatchSize}) doit être un multiple de BatchSize ({config.BatchSize}).");
+        _accumulation = config.EffectiveBatchSize / config.BatchSize;
     }
 
     public void Train()
@@ -65,6 +74,9 @@ public sealed class Trainer
         var optimizer = CreateOptimizer();
         var clock = Stopwatch.StartNew();
         _model.train();
+
+        Console.WriteLine($"  Batch : {_config.BatchSize} x {_accumulation} = {_config.EffectiveBatchSize} extraits " +
+                          $"de {_model.Config.BlockSize} tokens par étape.");
 
         for (int step = 0; step <= _config.Steps; step++)
         {
@@ -83,16 +95,26 @@ public sealed class Trainer
             foreach (var group in optimizer.ParamGroups)
                 group.LearningRate = LearningRateAt(step);
 
-            var (x, y, mask) = GetTrainingBatch();
-            var loss = ComputeLoss(x, y, mask);
-
+            // Accumulation : backward() ADDITIONNE les gradients tant qu'on ne les remet pas à zéro.
+            // Chaque petit batch compte pour 1/accumulation : à la fin, les gradients sont ceux d'un
+            // seul gros batch de EffectiveBatchSize extraits, mais sans jamais l'avoir en mémoire d'un coup.
             optimizer.zero_grad();
-            loss.backward();
+            for (int micro = 0; micro < _accumulation; micro++)
+            {
+                // Scope par petit batch : ses activations sont libérées avant le suivant.
+                using var microScope = NewDisposeScope();
+                var (x, y, mask) = GetTrainingBatch();
+                (ComputeLoss(x, y, mask) / _accumulation).backward();
+            }
+
             nn.utils.clip_grad_norm_(_model.parameters(), _config.GradClip);
             optimizer.step();
         }
 
         RestoreBestWeights();
+
+        if (_peakGpuMb > 0)
+            Console.WriteLine($"Mémoire GPU utilisée au maximum : {_peakGpuMb:N0} Mo.");
     }
 
     /// <summary>
@@ -130,8 +152,8 @@ public sealed class Trainer
     }
 
     /// <summary>
-    /// Un batch d'entraînement. Exemple avec BatchSize 32 et GeneralTextRatio 0.2 :
-    /// 26 extraits du texte principal + 6 extraits du texte général, empilés ensemble.
+    /// Un (petit) batch d'entraînement. Exemple avec BatchSize 16 et GeneralTextRatio 0.2 :
+    /// 13 extraits du texte principal + 3 extraits du texte général, empilés ensemble.
     /// </summary>
     private (Tensor X, Tensor Y, Tensor Mask) GetTrainingBatch()
     {
@@ -176,9 +198,19 @@ public sealed class Trainer
         }
 
         Console.WriteLine($"  Étape {step,5}/{_config.Steps}  |  loss entraînement {train:F3}  |  loss vérification {val:F3}" +
-                          $"  |  lr {LearningRateAt(step):0.0e0}  |  {Format(elapsed)}  |  reste {Remaining(step, elapsed)}{best}");
+                          $"  |  lr {LearningRateAt(step):0.0e0}{GpuMemoryText()}  |  {Format(elapsed)}  |  reste {Remaining(step, elapsed)}{best}");
 
         WriteCsvLine(step, train, val, elapsed);
+    }
+
+    /// <summary>"  |  GPU 2 345/4 096 Mo" sur GPU, rien sur CPU. Retient aussi le pic.</summary>
+    private string GpuMemoryText()
+    {
+        if (_device.type != DeviceType.CUDA || GpuMemory.Read() is not var (used, total))
+            return "";
+
+        _peakGpuMb = Math.Max(_peakGpuMb, used);
+        return $"  |  GPU {used:N0}/{total:N0} Mo";
     }
 
     /// <summary>
@@ -204,11 +236,13 @@ public sealed class Trainer
     {
         _model.eval();
         using var noGrad = no_grad();
-        using var scope = NewDisposeScope();
 
         float total = 0;
         for (int i = 0; i < _config.EvalBatches; i++)
         {
+            // Un scope par batch : TorchSharp ne libère un tenseur qu'à la fin de son scope. Avec un seul
+            // scope pour toute la boucle, les activations des EvalBatches passes s'empilaient sur le GPU.
+            using var scope = NewDisposeScope();
             var (x, y, mask) = _dataset.GetBatch(validation, _config.BatchSize, _model.Config.BlockSize, _device);
             total += ComputeLoss(x, y, mask).item<float>();
         }

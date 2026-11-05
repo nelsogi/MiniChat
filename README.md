@@ -21,8 +21,10 @@ de la phase 1 sur les deux fichiers, puis sauvegardé avec le modèle (`tokenize
 Si tu changes beaucoup les dialogues, refais un `--train` complet : `--finetune` garde
 l'ancien tokenizer (les caractères nouveaux seront ignorés).
 
-Le modèle (EmbedDim 256, 6 couches, 8 têtes, ~5,3 M paramètres) est lent sur CPU :
-compte environ 2 s par étape. Avec une carte NVIDIA, c'est beaucoup plus rapide.
+Le modèle (EmbedDim 384, 6 couches, 6 têtes, mémoire de 256 tokens, ~11,5 M paramètres) apprend
+à chaque étape sur 64 extraits, envoyés au GPU par paquets de 16 (accumulation de gradients,
+voir `BatchSize` / `EffectiveBatchSize`). Sur une NVIDIA T400 4 Go : ~2 Go de mémoire GPU,
+~3,5 s par étape. La mémoire GPU utilisée s'affiche à chaque mesure de loss.
 
 Le modèle entraîné est sauvegardé dans `bin/.../model/` : les lancements suivants
 démarrent directement le chat.

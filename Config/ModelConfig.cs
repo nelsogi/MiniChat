@@ -10,13 +10,13 @@ public sealed class ModelConfig
     public int VocabSize { get; init; }
 
     /// <summary>Nombre maximum de tokens que le modèle regarde en arrière (sa "mémoire").</summary>
-    public int BlockSize { get; init; } = 128;
+    public int BlockSize { get; init; } = 256;
 
     /// <summary>Taille du vecteur qui représente chaque token.</summary>
-    public int EmbedDim { get; init; } = 256;
+    public int EmbedDim { get; init; } = 384;
 
     /// <summary>Nombre de têtes d'attention (doit diviser EmbedDim).</summary>
-    public int Heads { get; init; } = 8;
+    public int Heads { get; init; } = 6;
 
     /// <summary>Nombre de blocs Transformer empilés.</summary>
     public int Layers { get; init; } = 6;

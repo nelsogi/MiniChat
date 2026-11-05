@@ -28,8 +28,18 @@ public sealed class TrainingConfig
     /// <summary>Nombre d'étapes d'apprentissage.</summary>
     public int Steps { get; init; } = 10000;
 
-    /// <summary>Nombre d'extraits de texte traités en même temps à chaque étape.</summary>
-    public int BatchSize { get; init; } = 32;
+    /// <summary>
+    /// Nombre d'extraits envoyés au GPU en une fois. Limité par la mémoire du GPU :
+    /// si "out of memory", baisse-le (EffectiveBatchSize doit rester un multiple).
+    /// </summary>
+    public int BatchSize { get; init; } = 16;
+
+    /// <summary>
+    /// Nombre d'extraits dont le modèle apprend à chaque étape (le "vrai" batch).
+    /// Si c'est plus que BatchSize, on accumule les gradients de plusieurs petits batchs avant
+    /// d'ajuster les poids : 64 / 16 = 4 petits batchs par étape, comme un batch de 64 d'un coup.
+    /// </summary>
+    public int EffectiveBatchSize { get; init; } = 64;
 
     /// <summary>Vitesse d'apprentissage : trop haut = instable, trop bas = lent.</summary>
     public double LearningRate { get; init; } = 1e-3;

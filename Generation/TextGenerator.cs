@@ -42,7 +42,9 @@ public sealed class TextGenerator
         _model.eval();
         using var noGrad = no_grad();
         using var scope = NewDisposeScope();
-        using var random = seed is null ? null : new Generator((ulong)seed.Value, _device);
+        // Générateur sur CPU : TorchSharp le crée toujours sur CPU, et le tirage avec graine se fait donc sur CPU
+        // (voir SampleTopKTopP). Même graine = même texte, que le modèle tourne sur GPU ou sur CPU.
+        using var random = seed is null ? null : new Generator((ulong)seed.Value);
 
         // À l'entraînement, l'espace est collé au mot qui le suit (" Coucou"). Un prompt qui finit
         // par un espace ("IA: ") ne ressemble donc à rien de connu : on retire cet espace et on laisse
@@ -61,6 +63,10 @@ public sealed class TextGenerator
 
         for (int i = 0; i < maxNewTokens; i++)
         {
+            // Un scope par token : les activations de ce passage sont libérées dès la fin du tour
+            // (sinon elles s'empilent sur le GPU jusqu'à la fin de la réponse).
+            using var tokenScope = NewDisposeScope();
+
             // Le modèle ne voit que les BlockSize derniers tokens.
             long length = ids.shape[1];
             var context = length <= blockSize ? ids : ids.narrow(1, length - blockSize, blockSize);
@@ -72,7 +78,7 @@ public sealed class TextGenerator
             // Tirage au sort selon les probabilités (pas toujours le plus probable = plus naturel),
             // mais seulement parmi les candidats sérieux : on évite les tokens absurdes.
             var next = SampleTopKTopP(probabilities, topK, topP, random);
-            ids = cat(new[] { ids, next }, 1);
+            ids = tokenScope.MoveToOuter(cat(new[] { ids, next }, 1));   // gardé pour le tour suivant
 
             // Un token peut faire plusieurs caractères : on les donne un par un à onChar.
             foreach (char c in _tokenizer.Decode(next.item<long>()))
@@ -119,7 +125,11 @@ public sealed class TextGenerator
 
         // Les exclus passent à 0 ; multinomial n'a pas besoin que la somme fasse 1.
         var filtered = sorted.masked_fill(keep.logical_not(), 0);
-        var rank = multinomial(filtered, 1, generator: random);
+        // Avec une graine, le tirage se fait sur CPU, là où est son générateur (un vecteur de VocabSize
+        // nombres : le copier ne coûte rien). Sans graine, directement sur le device du modèle.
+        var rank = random is null
+            ? multinomial(filtered, 1)
+            : multinomial(filtered.cpu(), 1, generator: random).to(filtered.device);
         return indices.gather(-1, rank);
     }
 }

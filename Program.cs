@@ -69,6 +69,9 @@ else
     training = "pré-entraînement + fine-tuning";
 }
 
+if (device.type == DeviceType.CUDA && GpuMemory.Read() is var (usedMb, totalMb))
+    Console.WriteLine($"Mémoire GPU utilisée : {usedMb:N0} / {totalMb:N0} Mo (toute la carte).");
+
 // Après chaque entraînement : le même examen, pour comparer les entraînements entre eux.
 if (training is not null)
 {

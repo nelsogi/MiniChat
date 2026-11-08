@@ -13,7 +13,7 @@ Console.OutputEncoding = Encoding.UTF8;
 const string Usage = """
     Utilisation :
       dotnet run --project DataBuilder -- oasst     <sortie.txt> <messages.jsonl[.gz]>... [--lang fr] [--max 300] [--sentences 2]
-      dotnet run --project DataBuilder -- chat      <sortie.txt> <fichier.jsonl[.gz]|.json>... [--field messages] [--max 300] [--sentences 2] [--append oui]
+      dotnet run --project DataBuilder -- chat      <sortie.txt> <fichier.jsonl[.gz]|.json|.parquet>... [--field messages] [--skip "source=a,b;style=c"] [--max 300] [--sentences 2] [--append oui]
       dotnet run --project DataBuilder -- gutenberg <sortie.txt> <livre.txt>...
       dotnet run --project DataBuilder -- parquet   <sortie.txt> <fichier.parquet>... [--column text] [--max-mo 50]
 
@@ -65,12 +65,14 @@ switch (command)
         break;
 
     case "chat":
-        var chat = new ChatConverter(
-            options.GetValueOrDefault("--field"),
-            int.Parse(options.GetValueOrDefault("--max", "300")),
-            int.Parse(options.GetValueOrDefault("--sentences", "2")));
+        ChatConverter chat;
         try
         {
+            chat = new ChatConverter(
+                options.GetValueOrDefault("--field"),
+                options.GetValueOrDefault("--skip"),
+                int.Parse(options.GetValueOrDefault("--max", "300")),
+                int.Parse(options.GetValueOrDefault("--sentences", "2")));
             output = chat.Convert(inputs);
         }
         catch (Exception e) when (e is InvalidDataException or System.Text.Json.JsonException)

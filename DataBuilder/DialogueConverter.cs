@@ -100,7 +100,7 @@ public abstract class DialogueConverter
         if (rawText.Contains("```")) return (null, HasCode);
 
         // Une réplique = une ligne : MiniChat s'arrête au premier retour à la ligne.
-        string text = TextCleaner.SingleLine(TextCleaner.Normalize(rawText));
+        string text = TextCleaner.SingleLine(TextCleaner.Normalize(TextCleaner.FixBrokenOe(rawText)));
 
         if (text.Length == 0) return (null, Empty);
 

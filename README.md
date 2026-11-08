@@ -84,7 +84,7 @@ Pour entraîner plus longtemps, ou après avoir ajouté des données dans `data/
   continuent sa numérotation (`training.json`) : `--continue 2000` sur un modèle arrêté au pas 9000 va de 9000 à 11000.
 - Le tokenizer n'est jamais réentraîné : le modèle garde le sien, les caractères qu'il ne connaît pas sont ignorés.
 - Nouveau warmup court (200 pas, moitié des pas si tu en demandes moins de 400), puis cosinus depuis une vitesse
-  plus basse : 3e-4 en pré-entraînement, 1e-4 en fine-tuning (à 3e-4 il apprend les dialogues par cœur).
+  plus basse : 3e-4 en pré-entraînement, 2e-4 en fine-tuning.
   `--lr` change ce départ ; la fin du cosinus est toujours dix fois plus bas.
 - Le modèle sauvegardé n'est remplacé que si la loss de vérification est meilleure. L'ancienne est mesurée au
   premier pas, sur les données actuelles (comparaison juste même si elles ont changé) ; les deux sont affichées.
@@ -99,7 +99,7 @@ Pendant l'entraînement, l'avancement est sauvegardé tous les 250 pas dans `bin
 (`CheckpointInterval`) : poids, état de l'optimiseur, meilleurs poids. `--resume` repart de là.
 Le dossier est supprimé quand l'entraînement va jusqu'au bout.
 
-Arrêt anticipé : si la loss de vérification ne s'améliore plus pendant 2000 pas (100 en fine-tuning)
+Arrêt anticipé : si la loss de vérification ne s'améliore plus pendant 2000 pas (300 en fine-tuning)
 (`EarlyStoppingPatience`, 0 = jamais), la phase s'arrête et garde le meilleur modèle.
 
 L'entraînement se fait en deux phases (réglages dans `TrainingConfig.Pretraining` / `FineTuning`) :
@@ -107,8 +107,9 @@ L'entraînement se fait en deux phases (réglages dans `TrainingConfig.Pretraini
 1. **Pré-entraînement** sur `data/texte.txt` (beaucoup de texte général) -> sauvegardé dans `model-pretrain/`.
    20 000 étapes. `texte.txt` peut faire plusieurs Go : il est lu ligne par ligne, et ses tokens
    prennent 2 octets chacun en mémoire (1,5 Go de texte -> ~460 M tokens -> ~0,9 Go de RAM, ~1 min de découpage).
-2. **Fine-tuning** sur `data/dialogues.txt` -> sauvegardé dans `model/`. Court (300 étapes, vitesse 1e-4) :
-   les dialogues sont petits et le modèle les apprend vite par cœur.
+2. **Fine-tuning** sur `data/dialogues.txt` -> sauvegardé dans `model/`. 2000 étapes à 2e-4, ~2,5 passages
+   sur les ~135 000 conversations (OpenAssistant, French Alpaca, French Instruct : voir DataBuilder).
+   Avec de petits dialogues, l'arrêt anticipé s'arrête avant qu'il les apprenne par cœur.
 
 Le tokenizer BPE (4000 tokens, `TokenizerVocabSize` dans `Program.cs`) est entraîné au début
 de la phase 1 sur les dialogues et un échantillon de 20 Mo de `texte.txt` réparti dans tout le fichier
@@ -223,11 +224,25 @@ dotnet run --project DataBuilder -- parquet Data/texte.txt train-00000-of-00002.
 - **oasst** suit la réponse la mieux classée de chaque conversation, ignore les messages supprimés,
   refusés, trop longs, avec du code ou des caractères exotiques (emoji...). OASST2 (2023-11-05) contient
   déjà tout OASST1 : inutile de donner les deux. Il n'a que ~300 conversations françaises utilisables.
-- **chat** lit les formats de conversation courants sur Hugging Face : `{"messages": [{"role", "content"}]}`,
+- **chat** lit des `.jsonl`, `.jsonl.gz`, `.json` ou `.parquet` aux formats de conversation courants sur Hugging Face : `{"messages": [{"role", "content"}]}`,
   ShareGPT `{"conversations": [{"from", "value"}]}` et Alpaca `{"instruction", "input", "output"}`.
   Les messages `system` sont ignorés, les conversations en double rejetées, et le nettoyage est celui
   de **oasst**. `--field` choisit le champ des messages s'il a un autre nom (s'il ne reconnaît rien, il
   affiche les champs trouvés). `--append oui` ajoute à la fin du fichier au lieu de l'écraser.
+  `--skip "champ=a,b;champ2=c"` écarte les conversations dont le champ contient une de ces valeurs.
+  Le « œ » mal encodé de certains jeux (`cÅ“ur`, `Åufs`) est réparé.
+
+Le `dialogues.txt` actuel (~135 000 conversations) se refait ainsi :
+
+```bash
+# OpenAssistant 2 : https://huggingface.co/datasets/OpenAssistant/oasst2 (Apache 2.0)
+dotnet run --project DataBuilder -- oasst Data/dialogues.txt 2023-11-05_oasst2_ready.messages.jsonl.gz
+# French Alpaca 110K : https://huggingface.co/datasets/jpacifico/French-Alpaca-dataset-Instruct-110K (Apache 2.0)
+# French Instruct : https://huggingface.co/datasets/angeluriot/french_instruct (MIT), sans la logique formelle,
+#   le code, les problèmes de maths en plusieurs étapes et les réponses Reddit (style "human")
+dotnet run --project DataBuilder -- chat Data/dialogues.txt Acquiesce_data_110k_instructions.json dataset.parquet --append oui \
+    --skip "source=Logic Inference,Evol Instruct,Grade School Math;style=human"
+```
 - **gutenberg** retire l'en-tête et la licence, recolle les paragraphes (un par ligne),
   simplifie la typographie (’ … — -> ' ... -) et lit aussi les vieux fichiers en Latin-1.
 - **parquet** lit la colonne `--column` (par défaut `text`) ; un fichier sans cette colonne mais avec une

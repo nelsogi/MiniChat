@@ -47,6 +47,22 @@ public static partial class TextCleaner
         return builder.ToString();
     }
 
+    /// <summary>
+    /// Répare le « œ » mal encodé de certains jeux de données (son UTF-8 relu en Windows-1252) :
+    /// "cÅ“ur" -> "cœur", "Å’ufs" -> "Œufs". Le 2e caractère est parfois devenu " ou ?, un caractère invisible,
+    /// ou a disparu ("Åufs") : on répare tout "Å" devant un "u" (œuf, cœur, œuvre, sœur, nœud...).
+    /// Seulement pour les dialogues : dans les textes, "Å" existe vraiment ("Ålesund").
+    /// </summary>
+    public static string FixBrokenOe(string text) =>
+        !text.Contains('Å') ? text
+        : BrokenOe().Replace(BrokenCapitalOe().Replace(text, "Œ"), "œ");
+
+    [GeneratedRegex("Å[’'\u0092]")]
+    private static partial Regex BrokenCapitalOe();
+
+    [GeneratedRegex("Å[“\"?«\u0080-\u009F�]?(?=u|il)|Å[“\u0093]")]
+    private static partial Regex BrokenOe();
+
     /// <summary>Met tout sur une ligne et réduit les espaces multiples à un seul.</summary>
     public static string SingleLine(string text) => Spaces().Replace(text, " ").Trim();
 
@@ -94,7 +110,21 @@ public static partial class TextCleaner
     /// </summary>
     // ponytail: "M. Dupont" compte comme une fin de phrase, assez rare pour l'ignorer.
     private static bool IsSentenceEnd(string text, int i) =>
-        text[i] is '.' or '!' or '?' && (i + 1 == text.Length || text[i + 1] == ' ');
+        text[i] is '.' or '!' or '?' && (i + 1 == text.Length || text[i + 1] == ' ') && !IsListNumber(text, i);
+
+    /// <summary>
+    /// Le point de "2. " dans une liste numérotée ("1. Pommes 2. Poires") : un nombre de 1 ou 2 chiffres
+    /// seul devant le point. Ce n'est pas une fin de phrase (sinon la réponse finirait par "2.").
+    /// "en 1950." reste une fin de phrase : 4 chiffres.
+    /// </summary>
+    private static bool IsListNumber(string text, int i)
+    {
+        if (text[i] != '.') return false;
+        int start = i;
+        while (start > 0 && char.IsAsciiDigit(text[start - 1])) start--;
+        int digits = i - start;
+        return digits is 1 or 2 && (start == 0 || text[start - 1] == ' ');
+    }
 
     /// <summary>
     /// Lit un fichier texte. Les livres anciens sont parfois en Latin-1 au lieu d'UTF-8 :

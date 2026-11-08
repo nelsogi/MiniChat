@@ -1,12 +1,15 @@
 using System.IO.Compression;
 using System.Text;
 using System.Text.Json;
+using Parquet;
+using Parquet.Serialization;
 
 namespace DataBuilder;
 
 /// <summary>
 /// Convertit des conversations en JSON au format de MiniChat (voir DialogueConverter).
-/// Fichiers .jsonl (une conversation par ligne), .jsonl.gz, ou .json (un tableau de conversations).
+/// Fichiers .jsonl (une conversation par ligne), .jsonl.gz, .json (un tableau de conversations)
+/// ou .parquet (une conversation par ligne, comme beaucoup de jeux de données de Hugging Face).
 ///
 /// Formats reconnus, les plus courants sur Hugging Face :
 ///     {"messages": [{"role": "user", "content": "..."}, {"role": "assistant", "content": "..."}]}
@@ -29,16 +32,51 @@ public sealed class ChatConverter : DialogueConverter
     private static readonly HashSet<string> SystemRoles = new(StringComparer.OrdinalIgnoreCase) { "system", "tool" };
 
     private readonly string? _field;
+    private readonly List<(string Field, string[] Values)> _skip;
 
     /// <summary>Champs du premier enregistrement au format inconnu, pour aider à choisir --field.</summary>
     public string? UnknownFormatFields { get; private set; }
 
     /// <param name="field">Champ qui contient la liste des messages (null = chercher messages, conversations...).</param>
+    /// <param name="skip">
+    /// Conversations à écarter selon un champ, null = aucune. Exemple : "source=Logic Inference,Evol Instruct;style=human"
+    /// écarte celles dont le champ source contient "Logic Inference" ou "Evol Instruct", et celles dont style contient "human".
+    /// </param>
     /// <param name="maxLength">Longueur max d'un message.</param>
     /// <param name="maxSentences">Nombre max de phrases gardées dans une réponse de l'IA.</param>
-    public ChatConverter(string? field, int maxLength, int maxSentences) : base(maxLength, maxSentences)
+    public ChatConverter(string? field, string? skip, int maxLength, int maxSentences) : base(maxLength, maxSentences)
     {
         _field = field;
+        _skip = ParseSkip(skip);
+    }
+
+    private static List<(string Field, string[] Values)> ParseSkip(string? skip)
+    {
+        var rules = new List<(string, string[])>();
+        foreach (string rule in (skip ?? "").Split(';', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
+        {
+            int equals = rule.IndexOf('=');
+            if (equals <= 0)
+                throw new InvalidDataException($"--skip : « {rule} » n'est pas de la forme champ=valeur1,valeur2.");
+            string[] values = rule[(equals + 1)..].Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+            rules.Add((rule[..equals].Trim(), values));
+        }
+        return rules;
+    }
+
+    /// <summary>La règle de --skip qui écarte cet enregistrement ("source contient Logic Inference"), null si aucune.</summary>
+    private string? SkipReason(JsonElement record)
+    {
+        foreach (var (field, values) in _skip)
+        {
+            if (GetString(record, field) is not { } value) continue;
+            foreach (string skipped in values)
+            {
+                if (value.Contains(skipped, StringComparison.OrdinalIgnoreCase))
+                    return $"--skip : {field} contient « {skipped} »";
+            }
+        }
+        return null;
     }
 
     public override string Convert(IEnumerable<string> inputPaths)
@@ -58,6 +96,12 @@ public sealed class ChatConverter : DialogueConverter
         if (record.ValueKind != JsonValueKind.Object)
         {
             Count(IgnoredMessages, UnknownFormat);
+            return;
+        }
+
+        if (SkipReason(record) is { } reason)
+        {
+            Count(IgnoredMessages, reason);
             return;
         }
 
@@ -140,8 +184,39 @@ public sealed class ChatConverter : DialogueConverter
         Add(lines, stopReason);
     }
 
-    /// <summary>Les conversations du fichier : une par ligne (.jsonl), ou les éléments d'un tableau (.json).</summary>
+    /// <summary>
+    /// Les conversations du fichier : une par ligne (.jsonl), les éléments d'un tableau (.json),
+    /// ou les lignes d'un .parquet.
+    /// </summary>
     private IEnumerable<JsonElement> ReadRecords(string path)
+    {
+        if (path.EndsWith(".parquet", StringComparison.OrdinalIgnoreCase))
+            return ReadParquet(path);
+        return ReadJson(path);
+    }
+
+    /// <summary>
+    /// Chaque ligne du .parquet, convertie en JSON : les listes de messages imbriquées deviennent des
+    /// tableaux d'objets, exactement comme dans un .jsonl. Un groupe de lignes à la fois, pour la mémoire.
+    /// </summary>
+    private static IEnumerable<JsonElement> ReadParquet(string path)
+    {
+        var reader = ParquetReader.CreateAsync(path).GetAwaiter().GetResult();
+        int rowGroups = reader.RowGroupCount;
+        reader.DisposeAsync().AsTask().GetAwaiter().GetResult();
+
+        for (int i = 0; i < rowGroups; i++)
+        {
+            List<Dictionary<string, object>> rows;
+            using (var file = File.OpenRead(path))
+                rows = ParquetSerializer.DeserializeUntypedAsync(file, null, i).GetAwaiter().GetResult().Data.ToList();
+
+            foreach (var row in rows)
+                yield return JsonSerializer.SerializeToElement(row);
+        }
+    }
+
+    private IEnumerable<JsonElement> ReadJson(string path)
     {
         using var file = File.OpenRead(path);
         using Stream stream = path.EndsWith(".gz", StringComparison.OrdinalIgnoreCase)

@@ -19,3 +19,6 @@ publish/
 
 # Texte de pré-entraînement produit par DataBuilder : trop gros pour GitHub (limite 100 Mo par fichier)
 Data/texte.txt
+
+# Dialogues produits par DataBuilder (~36 Mo) : la commande pour les refaire est dans le README
+Data/dialogues.txt

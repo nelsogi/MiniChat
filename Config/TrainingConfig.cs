@@ -14,7 +14,7 @@ public sealed record TrainingConfig
     /// numérotés à partir de firstStep (le pas où il s'était arrêté). Nouveau warmup court, puis
     /// cosinus depuis une vitesse plus basse qu'au premier entraînement : il s'agit d'affiner,
     /// pas de bousculer ce qui est appris. Sans learningRate : ContinueLearningRate, ou la vitesse
-    /// de la phase si elle est déjà plus basse (fine-tuning, 1e-4 : à 3e-4 il apprend les dialogues par cœur).
+    /// de la phase si elle est déjà plus basse (fine-tuning, 2e-4).
     /// Warmup réduit à la moitié des pas pour une petite continuation (sinon il ne finirait jamais).
     /// </summary>
     public TrainingConfig Continuation(int firstStep, int steps, double? learningRate = null)
@@ -37,21 +37,21 @@ public sealed record TrainingConfig
     /// Phase 2 : spécialiser le modèle sur les dialogues (data/dialogues.txt).
     /// Vitesse plus basse et moins d'étapes : on ajuste ce qui est déjà appris, sans tout effacer.
     ///
-    /// dialogues.txt est petit (~30 000 tokens) et chaque étape en lit ~16 000 : le modèle l'apprend
-    /// vite par cœur. Avec 800 étapes à 3e-4, la loss de vérification était au plus bas à l'étape 50
-    /// puis remontait (entraînement 0,06, vérification 3,5). D'où peu d'étapes, une vitesse basse,
-    /// une mesure tous les 25 pas pour attraper le meilleur moment, et un arrêt dès que ça empire.
+    /// dialogues.txt (OpenAssistant + French Alpaca + French Instruct, ~135 000 conversations) fait
+    /// ~10 millions de tokens ; chaque étape en lit ~16 000, dont 80 % de dialogues : un passage complet
+    /// prend ~800 étapes. 2 000 étapes = ~2,5 passages. Avec l'ancien fichier de 30 000 tokens, le modèle
+    /// l'apprenait par cœur en 50 étapes : l'arrêt anticipé garde ce garde-fou si les dialogues sont petits.
     /// </summary>
     public static TrainingConfig FineTuning => new()
     {
-        Steps = 300,
-        LearningRate = 1e-4,
-        MinLearningRate = 1e-5,
-        WarmupSteps = 20,
+        Steps = 2000,
+        LearningRate = 2e-4,
+        MinLearningRate = 2e-5,
+        WarmupSteps = 50,
         GeneralTextRatio = 0.2,
-        EvalInterval = 25,
-        EarlyStoppingPatience = 100,
-        SampleInterval = 100,
+        EvalInterval = 50,
+        EarlyStoppingPatience = 300,
+        SampleInterval = 250,
     };
 
     /// <summary>

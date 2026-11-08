@@ -4,6 +4,7 @@ using DataBuilder;
 
 // Prépare les fichiers de données de MiniChat.
 //   oasst      : OpenAssistant (*.messages.jsonl[.gz]) -> dialogues au format Toi:/IA: (dialogues.txt)
+//   chat       : conversations en JSON (messages, ShareGPT, Alpaca)   -> idem
 //   gutenberg  : livres du Projet Gutenberg (.txt)      -> texte propre pour le pré-entraînement (texte.txt)
 //   parquet    : une colonne de texte de fichiers .parquet (Wikipedia, FineWeb...) -> idem
 
@@ -12,11 +13,13 @@ Console.OutputEncoding = Encoding.UTF8;
 const string Usage = """
     Utilisation :
       dotnet run --project DataBuilder -- oasst     <sortie.txt> <messages.jsonl[.gz]>... [--lang fr] [--max 300] [--sentences 2]
+      dotnet run --project DataBuilder -- chat      <sortie.txt> <fichier.jsonl[.gz]|.json>... [--field messages] [--max 300] [--sentences 2] [--append oui]
       dotnet run --project DataBuilder -- gutenberg <sortie.txt> <livre.txt>...
       dotnet run --project DataBuilder -- parquet   <sortie.txt> <fichier.parquet>... [--column text] [--max-mo 50]
 
     Exemples :
-      dotnet run --project DataBuilder -- oasst     Data/dialogues.txt 2023-04-12_oasst_ready.messages.jsonl.gz
+      dotnet run --project DataBuilder -- oasst     Data/dialogues.txt 2023-11-05_oasst2_ready.messages.jsonl.gz
+      dotnet run --project DataBuilder -- chat      Data/dialogues.txt conversations-fr.jsonl --append oui
       dotnet run --project DataBuilder -- gutenberg Data/texte.txt pg17489.txt pg135.txt
       dotnet run --project DataBuilder -- parquet   Data/texte.txt train-00000-of-00002.parquet --max-mo 50
     """;
@@ -57,7 +60,44 @@ switch (command)
 
         var converter = new OasstConverter(lang, maxLength, maxSentences);
         output = converter.Convert(inputs);
-        PrintOasstReport(converter, lang, maxLength, maxSentences);
+        Console.WriteLine($"Langue '{lang}'.");
+        PrintDialogueReport(converter);
+        break;
+
+    case "chat":
+        var chat = new ChatConverter(
+            options.GetValueOrDefault("--field"),
+            int.Parse(options.GetValueOrDefault("--max", "300")),
+            int.Parse(options.GetValueOrDefault("--sentences", "2")));
+        try
+        {
+            output = chat.Convert(inputs);
+        }
+        catch (Exception e) when (e is InvalidDataException or System.Text.Json.JsonException)
+        {
+            Console.WriteLine(e.Message);
+            return 1;
+        }
+        PrintDialogueReport(chat);
+        if (chat.Kept == 0)
+        {
+            // Rien de gardé : souvent un format que ChatConverter ne connaît pas. On n'écrase pas la sortie.
+            if (chat.UnknownFormatFields is not null)
+                Console.WriteLine($"Champs trouvés : {chat.UnknownFormatFields}. Indique celui des messages avec --field.");
+            Console.WriteLine($"Aucune conversation gardée : {outputPath} n'est pas écrit.");
+            return 1;
+        }
+
+        // --append oui : ajoute à la fin d'un dialogues.txt existant (fait par exemple avec oasst), une ligne vide entre les deux.
+        if (options.GetValueOrDefault("--append") == "oui" && File.Exists(outputPath))
+        {
+            string existing = TextCleaner.ReadFile(outputPath).TrimEnd('\n');
+            if (existing.Length > 0)
+            {
+                Console.WriteLine($"Ajouté à la suite de {outputPath}.");
+                output = existing + "\n\n" + output;
+            }
+        }
         break;
 
     case "gutenberg":
@@ -110,11 +150,12 @@ return 0;
 // ---------------------------------------------------------------------------
 
 // Bilan de la conversion : ce qui est gardé, ce qui est rejeté et pourquoi (raisons les plus fréquentes d'abord).
-static void PrintOasstReport(OasstConverter converter, string lang, int maxLength, int maxSentences)
+static void PrintDialogueReport(DialogueConverter converter)
 {
     int rejected = converter.Rejected.Values.Sum();
+    int maxSentences = converter.MaxSentences;
 
-    Console.WriteLine($"Langue '{lang}', messages <= {maxLength} caractères, réponses <= {maxSentences} phrases.");
+    Console.WriteLine($"Messages <= {converter.MaxLength} caractères, réponses <= {maxSentences} phrases.");
     Console.WriteLine($"Conversations gardées  : {converter.Kept:N0}");
     Console.WriteLine($"  dont arrêtées avant la fin : {converter.Shortened:N0}");
     Console.WriteLine($"  réponses limitées à {maxSentences} phrases : {converter.LimitedReplies:N0}");
@@ -125,7 +166,7 @@ static void PrintOasstReport(OasstConverter converter, string lang, int maxLengt
 
     if (converter.IgnoredMessages.Count > 0)
     {
-        Console.WriteLine("Messages ignorés à la lecture :");
+        Console.WriteLine("Ignorés à la lecture :");
         foreach (var (reason, count) in converter.IgnoredMessages.OrderByDescending(r => r.Value))
             Console.WriteLine($"  {count,6:N0}  {reason}");
     }

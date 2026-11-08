@@ -208,7 +208,10 @@ Un petit projet console à part, dans `DataBuilder/` :
 
 ```bash
 # Dialogues OpenAssistant (fichier *.messages.jsonl ou .jsonl.gz) -> format Toi:/IA:, une ligne vide entre deux conversations
-dotnet run --project DataBuilder -- oasst Data/dialogues.txt 2023-04-12_oasst_ready.messages.jsonl.gz --lang fr --max 300
+dotnet run --project DataBuilder -- oasst Data/dialogues.txt 2023-11-05_oasst2_ready.messages.jsonl.gz --lang fr --max 300
+
+# Conversations en JSON (.jsonl, .jsonl.gz ou .json), ajoutées à la suite du fichier précédent
+dotnet run --project DataBuilder -- chat Data/dialogues.txt conversations-fr.jsonl --append oui
 
 # Livres du Projet Gutenberg (.txt) -> texte propre pour le pré-entraînement
 dotnet run --project DataBuilder -- gutenberg Data/texte.txt pg4650.txt pg17489.txt
@@ -218,7 +221,13 @@ dotnet run --project DataBuilder -- parquet Data/texte.txt train-00000-of-00002.
 ```
 
 - **oasst** suit la réponse la mieux classée de chaque conversation, ignore les messages supprimés,
-  refusés, trop longs, avec du code ou des caractères exotiques (emoji...).
+  refusés, trop longs, avec du code ou des caractères exotiques (emoji...). OASST2 (2023-11-05) contient
+  déjà tout OASST1 : inutile de donner les deux. Il n'a que ~300 conversations françaises utilisables.
+- **chat** lit les formats de conversation courants sur Hugging Face : `{"messages": [{"role", "content"}]}`,
+  ShareGPT `{"conversations": [{"from", "value"}]}` et Alpaca `{"instruction", "input", "output"}`.
+  Les messages `system` sont ignorés, les conversations en double rejetées, et le nettoyage est celui
+  de **oasst**. `--field` choisit le champ des messages s'il a un autre nom (s'il ne reconnaît rien, il
+  affiche les champs trouvés). `--append oui` ajoute à la fin du fichier au lieu de l'écraser.
 - **gutenberg** retire l'en-tête et la licence, recolle les paragraphes (un par ligne),
   simplifie la typographie (’ … — -> ' ... -) et lit aussi les vieux fichiers en Latin-1.
 - **parquet** lit la colonne `--column` (par défaut `text`) ; un fichier sans cette colonne mais avec une
@@ -226,7 +235,7 @@ dotnet run --project DataBuilder -- parquet Data/texte.txt train-00000-of-00002.
   nettoyé comme pour Gutenberg, une ligne du document = un paragraphe. `--max-mo` arrête avant le document qui
   ferait dépasser la taille ; sans cette option, tout est gardé. Affiche le nombre de documents gardés.
 
-Attention : la sortie est **écrasée**. Garde une copie de tes `dialogues.txt` faits à la main.
+Attention : la sortie est **écrasée** (sauf avec `chat --append oui`). Garde une copie de tes `dialogues.txt` faits à la main.
 
 ## Organisation du code
 

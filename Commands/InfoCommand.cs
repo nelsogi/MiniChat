@@ -1,3 +1,4 @@
+using MiniChat.Config;
 using MiniChat.Training;
 using MiniChat.UI;
 using Spectre.Console;
@@ -21,6 +22,11 @@ public sealed class InfoCommand : ICommand
             grid.AddRow(Label("Modèle"), new Text(
                 $"{model.ParameterCount:N0} paramètres | {config.Layers} couches, {config.Heads} têtes, EmbedDim {config.EmbedDim} | " +
                 $"mémoire {config.BlockSize} tokens | vocabulaire {config.VocabSize} tokens | dossier '{workbench.ModelSource}'"));
+            grid.AddRow(Label("Architecture"), new Text(ArchitectureText(config.Architecture)));
+            if (context.Chat?.Generator.LastStats is { } stats)
+                grid.AddRow(Label("Vitesse"), new Text(
+                    $"{stats.TokensPerSecond:0} tokens/s à la dernière réponse ({stats.Tokens} token{(stats.Tokens > 1 ? "s" : "")} en {stats.Elapsed.TotalSeconds:0.00} s, " +
+                    $"prompt de {stats.PromptTokens} tokens, cache KV)"));
         }
         else
         {
@@ -44,4 +50,8 @@ public sealed class InfoCommand : ICommand
     }
 
     private static Markup Label(string text) => new($"[{Theme.Dim}]{text}[/]");
+
+    public static string ArchitectureText(ModelArchitecture architecture) => architecture == ModelArchitecture.Modern
+        ? "moderne : RoPE, RMSNorm, SwiGLU (comme LLaMA)"
+        : "classique : embedding de position, LayerNorm, GELU (comme GPT-2)";
 }

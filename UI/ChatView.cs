@@ -54,9 +54,13 @@ public static class ChatView
         if (cancellation.IsCancellationRequested)
             AnsiConsole.Markup($"[{Theme.Dim}] (interrompu)[/]");
         AnsiConsole.WriteLine();
-        AnsiConsole.WriteLine();
 
         generation.GetAwaiter().GetResult();   // une erreur pendant la génération remonte ici
+
+        // La vitesse compte tout, prompt compris : c'est l'attente réelle.
+        if (chat.Generator.LastStats is { Tokens: > 0 } stats)
+            AnsiConsole.MarkupLine($"[{Theme.Dim}]  {stats.Tokens} token{(stats.Tokens > 1 ? "s" : "")} · {stats.TokensPerSecond:0} tokens/s[/]");
+        AnsiConsole.WriteLine();
     }
 
     private static void Write(char c) => AnsiConsole.Write(new Text(c.ToString(), Theme.Style(Theme.Text)));

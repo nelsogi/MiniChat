@@ -44,7 +44,8 @@ public static class WelcomeBanner
 
         var config = model.Config;
         string size = $"[bold]{model.ParameterCount / 1e6:0.0} M[/] paramètres [{Theme.Dim}]· {config.Layers} couches · " +
-                      $"{config.Heads} têtes · contexte {config.BlockSize} tokens[/]";
+                      $"{config.Heads} têtes · contexte {config.BlockSize} tokens · " +
+                      $"{(config.Architecture == MiniChat.Config.ModelArchitecture.Modern ? "RoPE/SwiGLU" : "classique")}[/]";
         return workbench.ModelSource == Workbench.PretrainedModel
             ? $"{size}\n[{Theme.Warning}]pré-entraîné seulement[/] [{Theme.Dim}]— [/][{Theme.Command}]/finetune[/] " +
               $"[{Theme.Dim}]pour qu'il sache discuter[/]"

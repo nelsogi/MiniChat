@@ -216,7 +216,11 @@ Attention : la sortie est **écrasée**. Garde une copie de tes `dialogues.txt` 
 | `Tokenization/`  | `BpeTokenizer`        | Texte ↔ nombres, par morceaux de mots (BPE appris sur nos textes) |
 | `Data/`          | `TextDataset`         | Découpe le texte en extraits pour l'entraînement |
 | `Model/`         | `CausalSelfAttention` | L'attention : regarder les tokens d'avant |
-|                  | `FeedForward`         | Petit réseau appliqué à chaque position |
+|                  | `FeedForward`         | Petit réseau appliqué à chaque position, GELU (Classic) |
+|                  | `SwiGlu`              | Le même rôle, avec une « vanne » SiLU (Modern) |
+|                  | `RmsNorm`             | Normalisation sans moyenne ni biais (Modern ; Classic : LayerNorm) |
+|                  | `Rope`                | Positions par rotation de Q et K dans l'attention (Modern) |
+|                  | `KvCache`             | Keys/Values déjà calculées, pour générer sans tout recalculer |
 |                  | `TransformerBlock`    | Attention + FeedForward + connexions résiduelles |
 |                  | `MiniGpt`             | Le modèle complet |
 | `Training/`      | `Trainer`             | La boucle d'apprentissage |
@@ -233,6 +237,23 @@ Attention : la sortie est **écrasée**. Garde une copie de tes `dialogues.txt` 
 |                  | `ChatView`            | La conversation : spinner, puis réponse au fur et à mesure |
 |                  | `InputBox`            | La zone de saisie |
 |                  | `TrainingProgressView`| La barre de progression de l'entraînement |
+
+## Architecture (`ModelConfig.Architecture`)
+
+| | `Modern` (par défaut) | `Classic` |
+|---|---|---|
+| Position | RoPE : Q et K tournés selon la position, dans l'attention | Embedding de position appris, ajouté à l'entrée |
+| Normalisation | RMSNorm | LayerNorm |
+| FeedForward | SwiGLU (3 matrices, largeur 8/3 x EmbedDim) | GELU (2 matrices, largeur 4 x EmbedDim) |
+| Biais | aucun | dans la projection de l'attention et le FeedForward |
+
+Les deux ont à peu près le même nombre de paramètres. Pour comparer : `/train`, `/save modern`, passer
+`Architecture` à `ModelArchitecture.Classic` dans `Config/ModelConfig.cs`, `/train`, puis `/compare model modern`
+et `/stats`. Le choix est écrit dans le `config.json` de chaque modèle ; un `config.json` sans ce réglage
+(modèle d'avant) est relu en `Classic`.
+
+La génération utilise un **cache KV** : le prompt passe une fois dans le modèle, puis chaque nouveau token
+n'y fait passer que lui-même. La vitesse (tokens/s) s'affiche sous chaque réponse, et dans `/info`.
 
 ## Ce qu'il faut savoir
 

@@ -9,28 +9,40 @@ namespace MiniChat.Model;
 /// Un bloc Transformer = Attention + FeedForward.
 /// Le "x + ..." s'appelle une connexion résiduelle : chaque bloc ajoute une correction
 /// au lieu de tout recalculer, ce qui rend l'entraînement beaucoup plus stable.
-/// LayerNorm remet les valeurs à une échelle raisonnable avant chaque étape.
+/// La normalisation remet les valeurs à une échelle raisonnable avant chaque étape :
+/// LayerNorm (Classic) ou RMSNorm (Modern). FeedForward : GELU (Classic) ou SwiGLU (Modern).
 /// </summary>
 public sealed class TransformerBlock : Module<Tensor, Tensor>
 {
-    private readonly TorchSharp.Modules.LayerNorm _norm1;
+    // Mêmes noms de champs pour les deux architectures : ce sont les noms des poids dans weights.dat,
+    // un modèle Classic d'avant se recharge tel quel.
+    private readonly Module<Tensor, Tensor> _norm1;
     private readonly CausalSelfAttention _attention;
-    private readonly TorchSharp.Modules.LayerNorm _norm2;
-    private readonly FeedForward _feedForward;
+    private readonly Module<Tensor, Tensor> _norm2;
+    private readonly Module<Tensor, Tensor> _feedForward;
 
-    public TransformerBlock(ModelConfig config) : base(nameof(TransformerBlock))
+    /// <param name="rope">Rotation des positions, partagée par tous les blocs (Modern), null pour Classic.</param>
+    public TransformerBlock(ModelConfig config, Rope? rope) : base(nameof(TransformerBlock))
     {
-        _norm1 = LayerNorm(config.EmbedDim);
-        _attention = new CausalSelfAttention(config);
-        _norm2 = LayerNorm(config.EmbedDim);
-        _feedForward = new FeedForward(config);
+        bool modern = config.Architecture == ModelArchitecture.Modern;
+        _norm1 = Norm(config);
+        _attention = new CausalSelfAttention(config, rope);
+        _norm2 = Norm(config);
+        _feedForward = modern ? new SwiGlu(config) : new FeedForward(config);
 
         RegisterComponents();
     }
 
-    public override Tensor forward(Tensor x)
+    /// <summary>RMSNorm (Modern) ou LayerNorm (Classic).</summary>
+    public static Module<Tensor, Tensor> Norm(ModelConfig config) =>
+        config.Architecture == ModelArchitecture.Modern ? new RmsNorm(config.EmbedDim) : LayerNorm(config.EmbedDim);
+
+    public override Tensor forward(Tensor x) => Forward(x, cache: null, layer: 0);
+
+    /// <param name="cache">Génération avec cache KV (voir CausalSelfAttention.Forward), null à l'entraînement.</param>
+    public Tensor Forward(Tensor x, KvCache? cache, int layer)
     {
-        x = x + _attention.forward(_norm1.forward(x));
+        x = x + _attention.Forward(_norm1.forward(x), cache, layer);
         x = x + _feedForward.forward(_norm2.forward(x));
         return x;
     }

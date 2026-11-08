@@ -53,9 +53,19 @@ public sealed class ModelStore
     /// <summary>Taille des poids sur disque, en octets.</summary>
     public long WeightsBytes => new FileInfo(WeightsPath).Length;
 
-    /// <summary>La forme du réseau, sans charger les poids (rapide : pour lister les modèles).</summary>
-    public ModelConfig ReadConfig() =>
-        JsonSerializer.Deserialize<ModelConfig>(File.ReadAllText(ConfigPath)) ?? throw new InvalidDataException("config.json illisible.");
+    /// <summary>
+    /// La forme du réseau, sans charger les poids (rapide : pour lister les modèles).
+    /// Un config.json d'avant ModelConfig.Architecture n'en parle pas : ces modèles sont Classic
+    /// (la valeur par défaut, Modern, vaut pour les nouveaux modèles).
+    /// </summary>
+    public ModelConfig ReadConfig()
+    {
+        var json = System.Text.Json.Nodes.JsonNode.Parse(File.ReadAllText(ConfigPath))?.AsObject()
+                   ?? throw new InvalidDataException("config.json illisible.");
+        if (!json.ContainsKey(nameof(ModelConfig.Architecture)))
+            json[nameof(ModelConfig.Architecture)] = nameof(ModelArchitecture.Classic);
+        return json.Deserialize<ModelConfig>() ?? throw new InvalidDataException("config.json illisible.");
+    }
 
     /// <param name="optimizerStatePath">Fichier d'état d'AdamW à copier avec le modèle (null = pas d'optimizer.dat).</param>
     /// <param name="info">Avancement à garder avec le modèle (null = pas de training.json).</param>

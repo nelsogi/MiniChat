@@ -1,8 +1,30 @@
+using System.Text.Json.Serialization;
+
 namespace MiniChat.Config;
+
+/// <summary>
+/// Les deux architectures possibles. Écrites en toutes lettres dans config.json ("Modern", "Classic").
+/// </summary>
+[JsonConverter(typeof(JsonStringEnumConverter))]
+public enum ModelArchitecture
+{
+    /// <summary>
+    /// Comme GPT-2 : embedding de position appris, LayerNorm, FeedForward avec GELU.
+    /// Gardée pour comparer, et pour relire les modèles entraînés avant (leur config.json n'a pas ce réglage).
+    /// </summary>
+    Classic,
+
+    /// <summary>
+    /// Comme LLaMA : RoPE (la position est une rotation de Q et K dans l'attention), RMSNorm, FeedForward SwiGLU,
+    /// couches sans biais. Généralement meilleure loss à taille égale.
+    /// </summary>
+    Modern,
+}
 
 /// <summary>
 /// Taille et forme du réseau de neurones.
 /// Plus les valeurs sont grandes, plus le modèle est capable... et lent à entraîner.
+/// Ces réglages valent pour le prochain /train : un modèle sauvegardé garde les siens (config.json).
 /// </summary>
 public sealed class ModelConfig
 {
@@ -27,4 +49,21 @@ public sealed class ModelConfig
     /// à apprendre par cœur, et un dropout fort ne ferait que ralentir l'apprentissage.
     /// </summary>
     public double Dropout { get; init; } = 0.1;
+
+    /// <summary>
+    /// Modern (RoPE + RMSNorm + SwiGLU) ou Classic (comme GPT-2). Pour comparer les deux : /train avec l'une,
+    /// /save, changer ce réglage, /train avec l'autre, puis /compare et /stats.
+    /// </summary>
+    public ModelArchitecture Architecture { get; init; } = ModelArchitecture.Modern;
+
+    /// <summary>Taille d'une tête d'attention.</summary>
+    [JsonIgnore]
+    public int HeadDim => EmbedDim / Heads;
+
+    /// <summary>
+    /// Largeur cachée de SwiGLU. Il a trois matrices au lieu de deux : 2/3 de 4 x EmbedDim garde à peu près
+    /// le même nombre de paramètres que le FeedForward classique. Arrondi au multiple de 64 (plus rapide sur GPU).
+    /// </summary>
+    [JsonIgnore]
+    public int SwiGluHidden => (8 * EmbedDim / 3 + 63) / 64 * 64;
 }

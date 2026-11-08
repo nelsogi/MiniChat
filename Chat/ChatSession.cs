@@ -32,13 +32,19 @@ public sealed class ChatSession
     private readonly List<string> _turns = new();
     private int _turnsInLastPrompt;
 
-    public double Temperature { get; set; } = 0.8;
+    // Réglages de départ. Nel Code les remplace par ceux de settings.json ; les questions de test gardent
+    // ces valeurs fixes (sauf la température), pour que leurs résultats restent comparables.
+    public const double DefaultTemperature = 0.8;
+    public const int DefaultTopK = 20;
+    public const double DefaultTopP = 0.9;
+
+    public double Temperature { get; set; } = DefaultTemperature;
 
     /// <summary>Nombre de tokens candidats à chaque tirage (0 = tous).</summary>
-    public int TopK { get; set; } = 20;
+    public int TopK { get; set; } = DefaultTopK;
 
     /// <summary>Part des chances gardée à chaque tirage (1 = tout).</summary>
-    public double TopP { get; set; } = 0.9;
+    public double TopP { get; set; } = DefaultTopP;
 
     /// <summary>Longueur max d'une réponse, en tokens (~3 caractères chacun).</summary>
     public int MaxReplyTokens { get; set; } = 80;
@@ -79,6 +85,9 @@ public sealed class ChatSession
 
     /// <summary>Nombre de tours de la conversation (commande /info).</summary>
     public int TurnCount => _turns.Count;
+
+    /// <summary>Les tours de la conversation, chacun "Toi: ...\nIA: ...\n" (commande /save-chat).</summary>
+    public IReadOnlyList<string> Turns => _turns;
 
     /// <summary>Combien de ces tours tenaient dans le dernier prompt, en plus de l'identité (commande /info).</summary>
     public int TurnsInLastPrompt => _turnsInLastPrompt;

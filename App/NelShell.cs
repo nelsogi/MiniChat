@@ -14,9 +14,9 @@ public sealed class NelShell
     private readonly CommandContext _context;
     private readonly InputBox _input;
 
-    public NelShell(Workbench workbench)
+    public NelShell(Workbench workbench, Settings settings, string settingsPath)
     {
-        _context = new CommandContext(workbench, _registry);
+        _context = new CommandContext(workbench, _registry, settings, settingsPath);
         _input = new InputBox(_registry.Commands);
     }
 

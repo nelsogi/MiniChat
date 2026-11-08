@@ -9,14 +9,20 @@ public sealed class CommandContext
 {
     private ChatSession? _chat;
 
-    public CommandContext(Workbench workbench, CommandRegistry registry)
+    public CommandContext(Workbench workbench, CommandRegistry registry, Settings settings, string settingsPath)
     {
         Workbench = workbench;
         Registry = registry;
+        Settings = settings;
+        SettingsPath = settingsPath;
     }
 
     public Workbench Workbench { get; }
     public CommandRegistry Registry { get; }
+
+    /// <summary>Les réglages de settings.json (voir /config), et où les sauvegarder.</summary>
+    public Settings Settings { get; }
+    public string SettingsPath { get; }
 
     /// <summary>Mis à true par /quit : Nel Code s'arrête après la commande.</summary>
     public bool QuitRequested { get; set; }
@@ -25,8 +31,9 @@ public sealed class CommandContext
     public CancellationToken Cancellation { get; set; }
 
     /// <summary>
-    /// La conversation avec le modèle chargé, null s'il n'y en a pas. Après un entraînement (nouveau modèle),
-    /// c'est une nouvelle conversation, mais les réglages (/temp, /topk, /topp) sont gardés.
+    /// La conversation avec le modèle chargé, null s'il n'y en a pas. La première part des réglages de
+    /// settings.json. Après un entraînement (nouveau modèle), c'est une nouvelle conversation, mais les
+    /// réglages en cours (/temp, /topk, /topp) sont gardés.
     /// </summary>
     public ChatSession? Chat
     {
@@ -36,9 +43,12 @@ public sealed class CommandContext
                 return null;
 
             if (_chat?.Generator != generator)
-                _chat = _chat is null
-                    ? new ChatSession(generator)
-                    : new ChatSession(generator) { Temperature = _chat.Temperature, TopK = _chat.TopK, TopP = _chat.TopP };
+                _chat = new ChatSession(generator)
+                {
+                    Temperature = _chat?.Temperature ?? Settings.Temperature,
+                    TopK = _chat?.TopK ?? Settings.TopK,
+                    TopP = _chat?.TopP ?? Settings.TopP,
+                };
             return _chat;
         }
     }

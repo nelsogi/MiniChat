@@ -22,7 +22,9 @@ Au lancement, un cadre d'accueil affiche le modèle chargé (taille), GPU ou CPU
 | `/resume`                                   | Reprend un entraînement interrompu |
 | `/test`                                     | Questions de test sur le modèle chargé (réponses dans `results/<date>-test.txt`) |
 | `/stats`                                    | Courbes de loss (entraînement et vérification) du dernier entraînement, meilleur point marqué ★ |
-| `/temp 0.8`, `/topk 20`, `/topp 0.9`        | Réglages de génération (sans nombre : affiche la valeur) |
+| `/temp 0.8`, `/topk 20`, `/topp 0.9`        | Réglages de génération pour la conversation en cours (sans nombre : affiche la valeur) |
+| `/config [réglage valeur]`                  | Affiche ou modifie les réglages enregistrés dans `settings.json` |
+| `/save-chat [fichier]`                      | Sauvegarde la conversation en texte (par défaut `chats/<date>.txt`) |
 | `/info`                                     | Modèle, GPU, réglages, conversation |
 | `/reset`                                    | Oublie la conversation |
 | `/clear`                                    | Efface l'écran et la conversation |
@@ -30,6 +32,26 @@ Au lancement, un cadre d'accueil affiche le modèle chargé (taille), GPU ou CPU
 
 Pendant l'entraînement, une barre de progression montre le pas, les deux loss, la vitesse
 d'apprentissage et le temps restant ; chaque mesure laisse une ligne d'historique au-dessus.
+
+### Réglages (`settings.json`)
+
+Dans le dossier des modèles (à côté de `model/`), créé au premier lancement et lu à chaque démarrage :
+
+```json
+{
+  "temperature": 0.8,
+  "topK": 20,
+  "topP": 0.9,
+  "defaultModel": "model"
+}
+```
+
+`defaultModel` : le modèle chargé au démarrage, `model` (celui qui discute) ou `model-pretrain`
+(pour voir ce que donne le pré-entraînement seul). Modifiable à la main ou avec `/config`, par exemple
+`/config temperature 0.6` (enregistré et appliqué tout de suite). `/temp`, `/topk` et `/topp`, eux,
+ne changent que la conversation en cours. Les questions de test gardent toujours leurs propres réglages fixes.
+
+### Clavier
 
 Dans la zone de saisie :
 - tape `/` : la liste des commandes qui correspondent s'affiche dessous. `↑` `↓` pour choisir,

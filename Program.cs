@@ -31,10 +31,17 @@ if (!Directory.Exists(dataFolder))
 var device = cuda.is_available() ? CUDA : CPU;
 var workbench = new Workbench(dataFolder, modelsFolder, device);
 
-// Le modèle final s'il existe. Sinon, pas d'entraînement automatique : le cadre d'accueil propose /train.
+// Les réglages (température, top-k, top-p, modèle par défaut) : settings.json, à côté des modèles.
+string settingsPath = Path.Combine(modelsFolder, Settings.FileName);
+var warnings = new List<string>();
+var settings = Settings.Load(settingsPath, warnings);
+warnings.ForEach(Messages.Warning);
+workbench.DefaultModel = settings.DefaultModel;
+
+// Le modèle par défaut s'il existe. Sinon, pas d'entraînement automatique : le cadre d'accueil propose /train.
 Messages.Spin("Chargement du modèle...", () => { workbench.LoadSaved(); return 0; });
 
-new NelShell(workbench).Run(StartupCommand(args));
+new NelShell(workbench, settings, settingsPath).Run(StartupCommand(args));
 
 // ---------------------------------------------------------------------------
 

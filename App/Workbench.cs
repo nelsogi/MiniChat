@@ -84,12 +84,21 @@ public sealed class Workbench
 
     public bool HasInterruptedTraining => Checkpoint.ExistsIn(_checkpointFolder);
 
-    /// <summary>Charge le modèle final s'il existe. Sinon, pas de modèle : Nel Code propose /train.</summary>
+    /// <summary>Charge le modèle par défaut (DefaultModel) s'il existe. Sinon, pas de modèle : Nel Code propose /train.</summary>
     public void LoadSaved()
     {
-        if (_store.Exists)
-            SetModel(_store.Load(Device), ChatModel);
+        var (store, name) = DefaultModel == PretrainedModel && _pretrainStore.Exists
+            ? (_pretrainStore, PretrainedModel)
+            : (_store, ChatModel);
+        if (store.Exists)
+            SetModel(store.Load(Device), name);
     }
+
+    /// <summary>
+    /// Le modèle que LoadSaved charge : ChatModel, ou PretrainedModel (pour voir ce que donne le pré-entraînement seul).
+    /// Vient de settings.json. PretrainedModel absent : on charge ChatModel.
+    /// </summary>
+    public string DefaultModel { get; set; } = ChatModel;
 
     // Les méthodes qui entraînent prennent un CancellationToken (Échap dans Nel Code) : la phase en cours
     // s'arrête proprement (meilleurs poids sauvegardés, avancement gardé pour /resume) et la suivante n'est pas lancée.

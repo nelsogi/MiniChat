@@ -208,6 +208,15 @@ public sealed class Workbench
         ShowReport(report, path);
     }
 
+    /// <summary>
+    /// Le CSV des loss du dernier entraînement : le dernier écrit (une continuation ou une reprise
+    /// écrit dans le CSV de l'entraînement d'origine). null s'il n'y en a pas encore.
+    /// </summary>
+    public string? LatestLossCsv() =>
+        Directory.Exists(_resultsFolder)
+            ? Directory.EnumerateFiles(_resultsFolder, "*-loss.csv").MaxBy(File.GetLastWriteTimeUtc)
+            : null;
+
     // ---------------------------------------------------------------------------
 
     /// <summary>

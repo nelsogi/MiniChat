@@ -21,6 +21,7 @@ Au lancement, un cadre d'accueil affiche le modèle chargé (taille), GPU ou CPU
 | `/continue <étapes> [finetune] [--lr 3e-4]` | Entraîne plus longtemps un modèle existant (voir plus bas) |
 | `/resume`                                   | Reprend un entraînement interrompu |
 | `/test`                                     | Questions de test sur le modèle chargé (réponses dans `results/<date>-test.txt`) |
+| `/stats`                                    | Courbes de loss (entraînement et vérification) du dernier entraînement, meilleur point marqué ★ |
 | `/temp 0.8`, `/topk 20`, `/topp 0.9`        | Réglages de génération (sans nombre : affiche la valeur) |
 | `/info`                                     | Modèle, GPU, réglages, conversation |
 | `/reset`                                    | Oublie la conversation |

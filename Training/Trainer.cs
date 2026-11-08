@@ -103,7 +103,12 @@ public sealed class Trainer
     /// Sans reprise : état d'AdamW sauvegardé avec le modèle, à recharger (continuation, --continue).
     /// null ou fichier absent = AdamW repart de zéro.
     /// </param>
-    public TrainingResult Train(CheckpointState? resume = null, string? optimizerPath = null)
+    /// <param name="cancellation">
+    /// Arrêt demandé (Échap dans Nel Code) : on mesure les loss au pas atteint, on sauvegarde l'avancement
+    /// (pour --resume), puis on finit comme d'habitude, avec les meilleurs poids remis dans le modèle.
+    /// </param>
+    public TrainingResult Train(CheckpointState? resume = null, string? optimizerPath = null,
+        CancellationToken cancellation = default)
     {
         var optimizer = CreateOptimizer();
         var clock = Stopwatch.StartNew();
@@ -144,7 +149,8 @@ public sealed class Trainer
             // Mesure aussi au premier pas (la loss du modèle de départ, à battre) et au dernier,
             // même s'ils ne tombent pas sur EvalInterval (une continuation peut commencer au pas 9 137).
             bool last = step == _config.Steps;
-            if (step % _config.EvalInterval == 0 || step == _config.FirstStep || last)
+            bool measured = step % _config.EvalInterval == 0 || step == _config.FirstStep || last;
+            if (measured)
             {
                 Report(step, clock.Elapsed);
 
@@ -159,6 +165,17 @@ public sealed class Trainer
 
             // Dernier pas mesuré : un pas de plus ne serait jamais vérifié, donc jamais gardé.
             if (last) break;
+
+            // Arrêt demandé : les poids actuels sont peut-être les meilleurs, on les mesure avant de sortir.
+            // L'avancement est sauvegardé à ce pas exact : une reprise ne refait aucun pas.
+            if (cancellation.IsCancellationRequested)
+            {
+                _progress.Log($"Arrêt demandé au pas {step} : mesure des loss et sauvegarde...");
+                if (!measured)
+                    Report(step, clock.Elapsed);
+                _checkpoint.SaveProgress(_model, optimizer, new CheckpointState(_phase, step, _checkpoint.RunId, _startValLoss));
+                break;
+            }
 
             if (step % _config.CheckpointInterval == 0)
                 _checkpoint.SaveProgress(_model, optimizer, new CheckpointState(_phase, step, _checkpoint.RunId, _startValLoss));

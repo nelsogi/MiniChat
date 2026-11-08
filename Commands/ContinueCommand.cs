@@ -45,6 +45,6 @@ public sealed class ContinueCommand : ICommand
             }
         }
 
-        context.Workbench.Continue(phase, (int)steps, learningRate);
+        context.Workbench.Continue(phase, (int)steps, learningRate, context.Cancellation);
     }
 }

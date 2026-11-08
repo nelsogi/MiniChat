@@ -21,6 +21,9 @@ public sealed class CommandContext
     /// <summary>Mis à true par /quit : Nel Code s'arrête après la commande.</summary>
     public bool QuitRequested { get; set; }
 
+    /// <summary>Annulé quand l'utilisateur appuie sur Échap pendant la commande en cours (entraînement, /test).</summary>
+    public CancellationToken Cancellation { get; set; }
+
     /// <summary>
     /// La conversation avec le modèle chargé, null s'il n'y en a pas. Après un entraînement (nouveau modèle),
     /// c'est une nouvelle conversation, mais les réglages (/temp, /topk, /topp) sont gardés.

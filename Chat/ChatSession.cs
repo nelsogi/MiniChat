@@ -48,14 +48,17 @@ public sealed class ChatSession
 
     public ChatSession(TextGenerator generator) => _generator = generator;
 
-    /// <summary>Envoie un message et renvoie la réponse, caractère par caractère via onChar.</summary>
-    public string Send(string userMessage, Action<char> onChar)
+    /// <summary>
+    /// Envoie un message et renvoie la réponse, caractère par caractère via onChar.
+    /// cancellation : arrête la réponse au caractère suivant ; le début de réponse reste dans la conversation.
+    /// </summary>
+    public string Send(string userMessage, Action<char> onChar, CancellationToken cancellation = default)
     {
         string question = $"{UserPrefix}{userMessage.Trim()}\n{BotPrefix}";
 
         string reply = _generator.Generate(BuildPrompt(question), MaxReplyTokens, Temperature, TopK, TopP, c =>
         {
-            if (c == '\n') return false;   // fin de la réponse de l'IA
+            if (c == '\n' || cancellation.IsCancellationRequested) return false;   // fin de la réponse de l'IA
             onChar(c);
             return true;
         }, Seed);

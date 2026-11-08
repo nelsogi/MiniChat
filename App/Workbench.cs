@@ -49,6 +49,9 @@ public sealed class Workbench
     private readonly ModelStore _pretrainStore;
     private readonly ModelStore _store;
 
+    // L'arrêt demandé pour l'entraînement en cours (voir Training), vide le reste du temps.
+    private CancellationToken _cancellation;
+
     public Workbench(string dataFolder, string modelsFolder, Device device)
     {
         DataFolder = dataFolder;
@@ -88,8 +91,11 @@ public sealed class Workbench
             SetModel(_store.Load(Device), ChatModel);
     }
 
+    // Les méthodes qui entraînent prennent un CancellationToken (Échap dans Nel Code) : la phase en cours
+    // s'arrête proprement (meilleurs poids sauvegardés, avancement gardé pour /resume) et la suivante n'est pas lancée.
+
     /// <summary>Nouveau modèle : pré-entraînement puis fine-tuning.</summary>
-    public void Train() => Training(() =>
+    public void Train(CancellationToken cancellation = default) => Training(cancellation, () =>
     {
         WarnIfInterrupted();
         string now = Now();
@@ -98,12 +104,13 @@ public sealed class Workbench
         var (model, tokenizer) = CreateModel();
         checkpoint.Start(model, tokenizer);
         Pretrain(model, tokenizer, _pretrainStore, TrainingConfig.Pretraining, log, checkpoint, resume: null);
+        if (Stopped(model, tokenizer, pretrainOnly: true)) return;
         FineTune(model, tokenizer, _store, TrainingConfig.FineTuning, log, checkpoint, resume: null);
         Finish(model, tokenizer, "pré-entraînement + fine-tuning", log, checkpoint, answersPath, pretrainOnly: false);
     });
 
     /// <summary>Refait seulement la phase 2, en repartant du modèle pré-entraîné (pas du modèle final).</summary>
-    public void FineTuneOnly() => Training(() =>
+    public void FineTuneOnly(CancellationToken cancellation = default) => Training(cancellation, () =>
     {
         if (!_pretrainStore.Exists)
             throw new UserException($"Pas de modèle pré-entraîné dans '{PretrainedModel}' : lance d'abord /train.");
@@ -124,7 +131,8 @@ public sealed class Workbench
     /// phase "pretrain" : depuis model-pretrain/ ; "finetune" : depuis model/.
     /// learningRate null : vitesse par défaut (voir TrainingConfig.Continuation).
     /// </summary>
-    public void Continue(string phase, int steps, double? learningRate) => Training(() =>
+    public void Continue(string phase, int steps, double? learningRate, CancellationToken cancellation = default) =>
+        Training(cancellation, () =>
     {
         var store = StoreFor(phase);
         if (!store.Exists)
@@ -155,7 +163,7 @@ public sealed class Workbench
     });
 
     /// <summary>Reprend la phase en cours là où elle s'est arrêtée (poids, optimiseur, pas, meilleure loss).</summary>
-    public void Resume() => Training(() =>
+    public void Resume(CancellationToken cancellation = default) => Training(cancellation, () =>
     {
         if (!Checkpoint.ExistsIn(_checkpointFolder))
             throw new UserException("Rien à reprendre : pas d'entraînement interrompu dans 'checkpoint'.");
@@ -177,6 +185,7 @@ public sealed class Workbench
         else if (state.Phase == "pretrain")
         {
             Pretrain(model, tokenizer, _pretrainStore, TrainingConfig.Pretraining, log, checkpoint, state);
+            if (Stopped(model, tokenizer, pretrainOnly: true)) return;
             FineTune(model, tokenizer, _store, TrainingConfig.FineTuning, log, checkpoint, resume: null);
         }
         else
@@ -188,14 +197,14 @@ public sealed class Workbench
     });
 
     /// <summary>Les questions de test sur le modèle chargé, sans rien entraîner. Réponses dans results/&lt;date&gt;-test.txt.</summary>
-    public void RunTest()
+    public void RunTest(CancellationToken cancellation = default)
     {
         if (Model is not { } model || Generator is not { } generator)
             throw new UserException("Aucun modèle chargé : lance /train d'abord.");
 
         string path = Path.Combine(_resultsFolder, $"{Now()}-test.txt");
-        string report = Messages.Spin("Questions de test...", () => QuestionTest.Run(generator, _questionsPath, path,
-            $"Test (/test) | modèle '{ModelSource}' | {model.ParameterCount:N0} paramètres"));
+        string report = Messages.Spin("Questions de test... (Échap pour arrêter)", () => QuestionTest.Run(generator,
+            _questionsPath, path, $"Test (/test) | modèle '{ModelSource}' | {model.ParameterCount:N0} paramètres", cancellation));
         ShowReport(report, path);
     }
 
@@ -205,18 +214,49 @@ public sealed class Workbench
     /// Entraîne avec la mémoire (GPU surtout) libérée du modèle d'avant. Si l'entraînement échoue,
     /// on recharge le modèle sauvegardé : le chat a de nouveau quelqu'un pour répondre.
     /// </summary>
-    private void Training(Action train)
+    private void Training(CancellationToken cancellation, Action train)
     {
         SetModel(null, null);
+        _cancellation = cancellation;
         try
         {
             train();
         }
         finally
         {
+            _cancellation = default;
             if (Model is null)
                 LoadSaved();
         }
+    }
+
+    /// <summary>
+    /// Arrêt demandé : la phase arrêtée a déjà sauvegardé ses meilleurs poids (ou gardé l'ancien modèle s'ils
+    /// n'étaient pas meilleurs). Le checkpoint reste pour /resume ; pas de questions de test.
+    /// </summary>
+    private bool Stopped(MiniGpt model, BpeTokenizer tokenizer, bool pretrainOnly)
+    {
+        if (!_cancellation.IsCancellationRequested)
+            return false;
+
+        Messages.Warning("Entraînement arrêté (Échap). /resume pour le reprendre là où il s'est arrêté.");
+        Adopt(model, tokenizer, pretrainOnly);
+        return true;
+    }
+
+    /// <summary>
+    /// Le modèle qui vient d'être entraîné devient celui du chat. Sauf un modèle seulement pré-entraîné :
+    /// il ne sait pas encore discuter, donc on garde le modèle final s'il y en a un.
+    /// </summary>
+    private void Adopt(MiniGpt model, BpeTokenizer tokenizer, bool pretrainOnly)
+    {
+        if (pretrainOnly && _store.Exists)
+        {
+            model.Dispose();
+            SetModel(_store.Load(Device), ChatModel);
+            return;
+        }
+        SetModel((model, tokenizer), pretrainOnly ? PretrainedModel : ChatModel);
     }
 
     private void SetModel((MiniGpt Model, BpeTokenizer Tokenizer)? loaded, string? source)
@@ -250,6 +290,9 @@ public sealed class Workbench
     private void Finish(MiniGpt model, BpeTokenizer tokenizer, string training, TrainingLog log, Checkpoint checkpoint,
         string answersPath, bool pretrainOnly)
     {
+        if (Stopped(model, tokenizer, pretrainOnly))
+            return;
+
         checkpoint.Delete();
 
         if (OnGpu && GpuMemory.Read() is var (usedMb, totalMb))
@@ -262,17 +305,9 @@ public sealed class Workbench
 
         // Après un --continue du pré-entraînement, le modèle en mémoire ne sait pas encore discuter.
         if (pretrainOnly)
-        {
             Messages.Info("Pour que le chat profite de ce pré-entraînement : /finetune (refait le fine-tuning depuis 'model-pretrain').");
-            if (_store.Exists)
-            {
-                model.Dispose();
-                SetModel(_store.Load(Device), ChatModel);
-                return;
-            }
-        }
-        SetModel((model, tokenizer), pretrainOnly ? PretrainedModel : ChatModel);
-        Messages.Success("Entraînement terminé : le chat utilise le nouveau modèle.");
+        Adopt(model, tokenizer, pretrainOnly);
+        Messages.Success("Entraînement terminé.");
     }
 
     private static void ShowReport(string report, string path)
@@ -395,7 +430,7 @@ public sealed class Workbench
         return TrainingProgressView.Run(config.FirstStep, config.Steps, progress =>
             new Trainer(model, dataset, config, Device, checkpoint, progress, generalText, phase, log.LossCsvPath,
                 showSample: step => progress.Log(QuestionTest.Sample(generator, sampleQuestion, step)))
-                .Train(resume, optimizerPath));
+                .Train(resume, optimizerPath, _cancellation));
     }
 
     private ModelStore StoreFor(string phase) => phase == "pretrain" ? _pretrainStore : _store;

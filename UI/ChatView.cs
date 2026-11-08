@@ -17,15 +17,18 @@ public static class ChatView
         AnsiConsole.MarkupLine($"[{Theme.Dim}]{Theme.Prompt}[/] [{Theme.User}]{Markup.Escape(message)}[/]");
     }
 
-    /// <summary>Envoie message au modèle et affiche sa réponse caractère par caractère.</summary>
-    public static void Reply(ChatSession chat, string message)
+    /// <summary>
+    /// Envoie message au modèle et affiche sa réponse caractère par caractère.
+    /// cancellation (Échap) : la réponse s'arrête là, "(interrompu)" est ajouté.
+    /// </summary>
+    public static void Reply(ChatSession chat, string message, CancellationToken cancellation = default)
     {
         // La génération tourne à part et pousse ses caractères ici ; l'affichage les reprend dans l'ordre.
         // Comme ça le spinner (sur ce thread) peut tourner jusqu'au premier caractère, puis laisser la place.
         using var characters = new BlockingCollection<char>();
         var generation = Task.Run(() =>
         {
-            try { chat.Send(message, characters.Add); }
+            try { chat.Send(message, characters.Add, cancellation); }
             finally { characters.CompleteAdding(); }
         });
 
@@ -34,7 +37,8 @@ public static class ChatView
         AnsiConsole.Status()
             .Spinner(Spinner.Known.Dots)
             .SpinnerStyle(Theme.Style(Theme.Accent))
-            .Start($"[{Theme.Dim}]Réflexion...[/]", _ => any = characters.TryTake(out first, Timeout.Infinite));
+            .Start($"[{Theme.Dim}]Réflexion... (Échap pour arrêter)[/]",
+                _ => any = characters.TryTake(out first, Timeout.Infinite));
 
         AnsiConsole.Markup($"[{Theme.Accent}]{Theme.ReplyBullet}[/] ");
         if (any)
@@ -43,10 +47,12 @@ public static class ChatView
             foreach (char c in characters.GetConsumingEnumerable())
                 Write(c);
         }
-        else
+        else if (!cancellation.IsCancellationRequested)
         {
             AnsiConsole.Markup($"[{Theme.Dim}](pas de réponse)[/]");
         }
+        if (cancellation.IsCancellationRequested)
+            AnsiConsole.Markup($"[{Theme.Dim}] (interrompu)[/]");
         AnsiConsole.WriteLine();
         AnsiConsole.WriteLine();
 

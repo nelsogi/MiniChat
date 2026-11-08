@@ -24,8 +24,12 @@ public sealed class TrainingProgressView : ITrainingProgress
     }
 
     /// <summary>Lance work avec une barre qui va de firstStep à lastStep, et renvoie son résultat.</summary>
-    public static T Run<T>(int firstStep, int lastStep, Func<ITrainingProgress, T> work) =>
-        AnsiConsole.Progress()
+    public static T Run<T>(int firstStep, int lastStep, Func<ITrainingProgress, T> work)
+    {
+        if (!Console.IsInputRedirected)
+            Messages.Dim("Échap pour arrêter proprement : le meilleur modèle est sauvegardé, /resume reprend.");
+
+        return AnsiConsole.Progress()
             .AutoClear(false)
             .HideCompleted(false)
             .Columns(
@@ -47,6 +51,7 @@ public sealed class TrainingProgressView : ITrainingProgress
                 task.StopTask();
                 return result;
             });
+    }
 
     public void Advance(int step, double learningRate, TimeSpan? remaining)
     {

@@ -46,8 +46,12 @@ public static class QuestionTest
         $"  {ChatSession.UserPrefix}{question}\n" +
         $"  {ChatSession.BotPrefix}{Answer(generator, question)}";
 
-    /// <summary>Pose toutes les questions, écrit les réponses dans outputPath et renvoie le rapport (pour l'afficher).</summary>
-    public static string Run(TextGenerator generator, string questionsPath, string outputPath, string description)
+    /// <summary>
+    /// Pose toutes les questions, écrit les réponses dans outputPath et renvoie le rapport (pour l'afficher).
+    /// cancellation : s'arrête avant la question suivante, le rapport garde les réponses déjà données.
+    /// </summary>
+    public static string Run(TextGenerator generator, string questionsPath, string outputPath, string description,
+        CancellationToken cancellation = default)
     {
         var defaults = new ChatSession(generator);
         var report = new StringBuilder();
@@ -59,6 +63,11 @@ public static class QuestionTest
         var questions = ReadQuestions(questionsPath);
         for (int i = 0; i < questions.Length; i++)
         {
+            if (cancellation.IsCancellationRequested)
+            {
+                report.AppendLine($"(interrompu : {questions.Length - i} question(s) sans réponse)");
+                break;
+            }
             report.AppendLine($"{i + 1,2}. {ChatSession.UserPrefix}{questions[i]}");
             report.AppendLine($"    {ChatSession.BotPrefix}{Answer(generator, questions[i])}");
         }

@@ -30,6 +30,14 @@ Au lancement, un cadre d'accueil affiche le modèle chargé (taille), GPU ou CPU
 Pendant l'entraînement, une barre de progression montre le pas, les deux loss, la vitesse
 d'apprentissage et le temps restant ; chaque mesure laisse une ligne d'historique au-dessus.
 
+Dans la zone de saisie :
+- tape `/` : la liste des commandes qui correspondent s'affiche dessous. `↑` `↓` pour choisir,
+  `Tab` pour compléter, `Entrée` pour lancer, `Échap` pour fermer la liste ;
+- liste fermée, `↑` `↓` rappellent les messages et commandes déjà envoyés ;
+- `Échap` pendant une réponse l'arrête. Pendant un entraînement (ou `/test`), il l'arrête proprement :
+  les loss sont mesurées au pas atteint, le meilleur modèle est sauvegardé, et `/resume` reprend
+  exactement à ce pas.
+
 Les options en ligne de commande marchent toujours : elles lancent la commande qui va avec au démarrage.
 
 ```bash

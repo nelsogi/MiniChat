@@ -45,6 +45,18 @@ public sealed class ModelStore
 
     public bool Exists => File.Exists(ConfigPath) && File.Exists(TokenizerPath) && File.Exists(WeightsPath);
 
+    public string Folder => _folder;
+
+    /// <summary>Quand les poids ont été écrits (fin de l'entraînement, ou /save).</summary>
+    public DateTime SavedAt => File.GetLastWriteTime(WeightsPath);
+
+    /// <summary>Taille des poids sur disque, en octets.</summary>
+    public long WeightsBytes => new FileInfo(WeightsPath).Length;
+
+    /// <summary>La forme du réseau, sans charger les poids (rapide : pour lister les modèles).</summary>
+    public ModelConfig ReadConfig() =>
+        JsonSerializer.Deserialize<ModelConfig>(File.ReadAllText(ConfigPath)) ?? throw new InvalidDataException("config.json illisible.");
+
     /// <param name="optimizerStatePath">Fichier d'état d'AdamW à copier avec le modèle (null = pas d'optimizer.dat).</param>
     /// <param name="info">Avancement à garder avec le modèle (null = pas de training.json).</param>
     public void Save(MiniGpt model, BpeTokenizer tokenizer, string? optimizerStatePath = null, TrainingInfo? info = null)
@@ -69,8 +81,7 @@ public sealed class ModelStore
 
     public (MiniGpt Model, BpeTokenizer Tokenizer) Load(Device device)
     {
-        var config = JsonSerializer.Deserialize<ModelConfig>(File.ReadAllText(ConfigPath))
-                     ?? throw new InvalidDataException("config.json illisible.");
+        var config = ReadConfig();
 
         var file = JsonSerializer.Deserialize<TokenizerFile>(File.ReadAllText(TokenizerPath))
                    ?? throw new InvalidDataException("tokenizer.json illisible.");

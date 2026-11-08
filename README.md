@@ -21,6 +21,10 @@ Au lancement, un cadre d'accueil affiche le modèle chargé (taille), GPU ou CPU
 | `/continue <étapes> [finetune] [--lr 3e-4]` | Entraîne plus longtemps un modèle existant (voir plus bas) |
 | `/resume`                                   | Reprend un entraînement interrompu |
 | `/test`                                     | Questions de test sur le modèle chargé (réponses dans `results/<date>-test.txt`) |
+| `/models`                                   | Les modèles sauvegardés : taille, loss de vérification, pas, dates |
+| `/save <nom>`                               | Garde le modèle chargé sous un nom (`saved/<nom>/`), avant un `/train` ou un `/continue` par exemple |
+| `/load <nom>`                               | Charge un modèle (`model`, `model-pretrain` ou un nom de `/save`) pour le chat |
+| `/compare <nom1> <nom2>`                    | Les questions de test posées aux deux modèles, réponses côte à côte |
 | `/stats`                                    | Courbes de loss (entraînement et vérification) du dernier entraînement, meilleur point marqué ★ |
 | `/temp 0.8`, `/topk 20`, `/topp 0.9`        | Réglages de génération pour la conversation en cours (sans nombre : affiche la valeur) |
 | `/config [réglage valeur]`                  | Affiche ou modifie les réglages enregistrés dans `settings.json` |

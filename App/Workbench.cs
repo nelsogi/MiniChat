@@ -52,6 +52,12 @@ public sealed class Workbench
     // L'arrêt demandé pour l'entraînement en cours (voir Training), vide le reste du temps.
     private CancellationToken _cancellation;
 
+    // Le tokenizer de Model (pour /save).
+    private BpeTokenizer? _tokenizer;
+
+    // Les modèles gardés avec /save : models/saved/<nom>/, même contenu que model/.
+    private string SavedFolder => Path.Combine(ModelsFolder, "saved");
+
     public Workbench(string dataFolder, string modelsFolder, Device device)
     {
         DataFolder = dataFolder;
@@ -226,6 +232,127 @@ public sealed class Workbench
             ? Directory.EnumerateFiles(_resultsFolder, "*-loss.csv").MaxBy(File.GetLastWriteTimeUtc)
             : null;
 
+    /// <summary>
+    /// Tous les modèles sauvegardés : model/, model-pretrain/, puis ceux gardés avec /save (saved/&lt;nom&gt;/),
+    /// par ordre alphabétique.
+    /// </summary>
+    public IReadOnlyList<SavedModel> ListModels()
+    {
+        var stores = new List<(string Name, ModelStore Store)> { (ChatModel, _store), (PretrainedModel, _pretrainStore) };
+        if (Directory.Exists(SavedFolder))
+            stores.AddRange(Directory.EnumerateDirectories(SavedFolder)
+                .Select(folder => (Path.GetFileName(folder), new ModelStore(folder)))
+                .OrderBy(s => s.Item1, StringComparer.OrdinalIgnoreCase));
+
+        return stores
+            .Where(s => s.Store.Exists)
+            // Les poids sont en float32 : 4 octets par paramètre (plus un en-tête de quelques octets).
+            .Select(s => new SavedModel(s.Name, s.Store.ReadConfig(), s.Store.WeightsBytes / 4, s.Store.WeightsBytes,
+                s.Store.SavedAt, s.Store.ReadInfo()))
+            .ToList();
+    }
+
+    /// <summary>
+    /// Garde le modèle chargé sous un nom (saved/&lt;nom&gt;/), pour le recharger ou le comparer plus tard,
+    /// même après un nouvel entraînement. Un modèle du même nom est remplacé ; renvoie true dans ce cas.
+    /// </summary>
+    public bool SaveAs(string name)
+    {
+        if (Model is not { } model || _tokenizer is not { } tokenizer)
+            throw new UserException("Aucun modèle chargé : rien à sauvegarder.");
+        CheckSavedName(name);
+
+        // L'avancement (pas, loss, date de l'entraînement) suit le modèle ; l'état d'AdamW (deux fois la taille
+        // du modèle) non : un modèle gardé sert à discuter et à comparer, pas à être continué.
+        var info = ModelSource is { } source && TryStore(source) is { Exists: true } from ? from.ReadInfo() : null;
+        string folder = Path.Combine(SavedFolder, name);
+        bool replaced = Directory.Exists(folder);
+        if (replaced)
+            Directory.Delete(folder, recursive: true);
+        new ModelStore(folder).Save(model, tokenizer, info: info);
+        return replaced;
+    }
+
+    /// <summary>Charge un modèle sauvegardé (model, model-pretrain, ou un nom de /save) : il devient celui du chat.</summary>
+    public void Load(string name)
+    {
+        var store = RequireStore(name);
+        SetModel(null, null);   // libère la mémoire (GPU) de l'ancien avant de charger le nouveau
+        try
+        {
+            SetModel(store.Load(Device), NameOf(name));
+        }
+        finally
+        {
+            if (Model is null)
+                LoadSaved();
+        }
+    }
+
+    /// <summary>
+    /// Les questions de test posées à deux modèles sauvegardés, dans les conditions de /test (température
+    /// et graine fixes) : seule la différence entre les modèles compte. cancellation : s'arrête avant la question suivante.
+    /// </summary>
+    public IReadOnlyList<(string Question, string First, string Second)> Compare(string first, string second,
+        CancellationToken cancellation = default)
+    {
+        var (firstStore, secondStore) = (RequireStore(first), RequireStore(second));
+        var questions = QuestionTest.ReadQuestions(_questionsPath);
+        var answers = new List<(string, string, string)>();
+
+        var (modelA, tokenizerA) = Messages.Spin($"Chargement de '{first}'...", () => firstStore.Load(Device));
+        try
+        {
+            var (modelB, tokenizerB) = Messages.Spin($"Chargement de '{second}'...", () => secondStore.Load(Device));
+            try
+            {
+                var (a, b) = (new TextGenerator(modelA, tokenizerA, Device), new TextGenerator(modelB, tokenizerB, Device));
+                for (int i = 0; i < questions.Length && !cancellation.IsCancellationRequested; i++)
+                {
+                    string question = questions[i];
+                    answers.Add(Messages.Spin($"Question {i + 1}/{questions.Length}... (Échap pour arrêter)",
+                        () => (question, QuestionTest.Answer(a, question), QuestionTest.Answer(b, question))));
+                }
+            }
+            finally
+            {
+                modelB.Dispose();
+            }
+        }
+        finally
+        {
+            modelA.Dispose();
+        }
+        return answers;
+    }
+
+    private ModelStore? TryStore(string name) =>
+        name.Equals(ChatModel, StringComparison.OrdinalIgnoreCase) ? _store
+        : name.Equals(PretrainedModel, StringComparison.OrdinalIgnoreCase) ? _pretrainStore
+        : IsValidName(name) ? new ModelStore(Path.Combine(SavedFolder, name))
+        : null;
+
+    private ModelStore RequireStore(string name) =>
+        TryStore(name) is { Exists: true } store
+            ? store
+            : throw new UserException($"Pas de modèle « {name} ». Modèles : {string.Join(", ", ListModels().Select(m => m.Name))}" +
+                                      " (/models pour le détail).");
+
+    // Le nom tel qu'il est écrit sur le disque : "/load MODEL" charge "model".
+    private string NameOf(string name) =>
+        ListModels().FirstOrDefault(m => m.Name.Equals(name, StringComparison.OrdinalIgnoreCase))?.Name ?? name;
+
+    private static bool IsValidName(string name) =>
+        name.Length is > 0 and <= 64 && name.All(c => char.IsLetterOrDigit(c) || c is '-' or '_' or '.') && name[0] != '.';
+
+    private static void CheckSavedName(string name)
+    {
+        if (!IsValidName(name))
+            throw new UserException($"Nom invalide : « {name} ». Lettres, chiffres, - _ . (64 caractères au plus).");
+        if (name.Equals(ChatModel, StringComparison.OrdinalIgnoreCase) || name.Equals(PretrainedModel, StringComparison.OrdinalIgnoreCase))
+            throw new UserException($"« {name} » est réservé à l'entraînement : choisis un autre nom.");
+    }
+
     // ---------------------------------------------------------------------------
 
     /// <summary>
@@ -283,6 +410,7 @@ public sealed class Workbench
             Model.Dispose();
 
         Model = loaded?.Model;
+        _tokenizer = loaded?.Tokenizer;
         Generator = loaded is var (model, tokenizer) ? new TextGenerator(model, tokenizer, Device) : null;
         ModelSource = loaded is null ? null : source;
     }
@@ -493,6 +621,13 @@ public sealed class Workbench
         return sample.Replace("\r\n", "\n").ToString();
     }
 }
+
+/// <summary>
+/// Un modèle sauvegardé, pour /models. ParameterCount est déduit de la taille des poids (sans les charger).
+/// Info = pas, loss de vérification et date de l'entraînement ; null pour un modèle d'avant --continue.
+/// </summary>
+public sealed record SavedModel(string Name, ModelConfig Config, long ParameterCount, long WeightsBytes,
+    DateTime SavedAt, TrainingInfo? Info);
 
 /// <summary>Où un entraînement écrit son suivi : le CSV des loss, et les questions pour les exemples.</summary>
 public sealed record TrainingLog(string LossCsvPath, string QuestionsPath);

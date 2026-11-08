@@ -1,5 +1,6 @@
 using System.Text;
 using MiniChat.App;
+using MiniChat.Chat;
 using MiniChat.UI;
 
 namespace MiniChat.Commands;
@@ -34,10 +35,12 @@ public sealed class SaveChatCommand : ICommand
         text.AppendLine($"Nel Code - conversation du {DateTime.Now:yyyy-MM-dd HH:mm:ss}");
         text.AppendLine($"Modèle : '{context.Workbench.ModelSource}' | {model.ParameterCount:N0} paramètres");
         text.AppendLine($"Réglages : température {chat.Temperature}, top-k {chat.TopK}, top-p {chat.TopP}");
-        foreach (string turn in chat.Turns)
+        // Le même format que dialogues.txt : un fichier sauvegardé peut y être ajouté pour le fine-tuning.
+        foreach (var (user, reply) in chat.Turns)
         {
             text.AppendLine();
-            text.Append(turn);
+            text.AppendLine($"{ChatSession.UserPrefix}{user}");
+            text.AppendLine($"{ChatSession.BotPrefix}{reply}");
         }
 
         Directory.CreateDirectory(Path.GetDirectoryName(path)!);

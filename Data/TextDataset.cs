@@ -51,9 +51,10 @@ public sealed class TextDataset
     // Pour tirer un début d'extrait au hasard parmi tous les débuts possibles (voir StartsIndex).
     private (int BlockSize, long[] Train, long[] Validation)? _starts;
 
+    /// <param name="text">Avec onlyReplies : des dialogues au format du modèle (ChatFormat.FromDialogueFile).</param>
     /// <param name="onlyReplies">
-    /// true pour les dialogues : le modèle n'est noté que sur les réponses "IA: ..." (et le retour
-    /// à la ligne qui les termine, pour qu'il apprenne à s'arrêter). Les lignes "Toi: ..." restent
+    /// true pour les dialogues : le modèle n'est noté que sur les réponses de l'IA et le &lt;|end|&gt; qui
+    /// les termine, pour qu'il apprenne à s'arrêter (voir ChatFormat.ReplyWeights). Les questions restent
     /// lues comme contexte, mais il n'a pas à apprendre à les écrire : c'est l'humain qui les tape.
     /// false : le modèle est noté sur tout le texte.
     /// </param>
@@ -61,10 +62,10 @@ public sealed class TextDataset
     public TextDataset(string text, BpeTokenizer tokenizer, int seed, bool onlyReplies = false, int validationEvery = 10)
     {
         CheckVocabulary(tokenizer);
-        var weights = onlyReplies ? ReplyWeights(text) : null;
+        var weights = onlyReplies ? ChatFormat.ReplyWeights(text) : null;
 
-        // Un token prend le poids du dernier caractère de son mot. Un mot ne traverse jamais une ligne,
-        // donc " Coucou" (après "IA:") compte, alors que "IA" et ":" ne comptent pas.
+        // Un token prend le poids du dernier caractère de son mot (ou de son token spécial). Un mot ne
+        // traverse jamais un token spécial, donc "Coucou" (après <|assistant|>) compte, <|assistant|> non.
         var tokens = tokenizer.EncodeWithPositions(text).ToArray();
         _ids = tokens.Select(t => (ushort)t.Id).ToArray();
         _mask = weights is null ? null : tokens.Select(t => weights[t.Position]).ToArray();
@@ -239,30 +240,5 @@ public sealed class TextDataset
     {
         if (tokenizer.VocabSize > ushort.MaxValue + 1)
             throw new InvalidOperationException($"Vocabulaire de {tokenizer.VocabSize} tokens : TextDataset en garde au plus 65 536 (ushort).");
-    }
-
-    /// <summary>
-    /// 1 pour chaque caractère d'une réponse, 0 ailleurs.
-    ///   "Toi: Salut\nIA: Coucou\n"
-    ///    0000000000 0000111111 1      <- le "IA: " est donné au modèle, la réponse et le \n sont notés
-    /// </summary>
-    private static float[] ReplyWeights(string text)
-    {
-        var weights = new float[text.Length];
-        int lineStart = 0;
-
-        while (lineStart < text.Length)
-        {
-            int lineEnd = text.IndexOf('\n', lineStart);
-            if (lineEnd < 0) lineEnd = text.Length - 1;   // dernière ligne sans retour à la ligne
-
-            if (text.AsSpan(lineStart).StartsWith(ChatSession.BotPrefix))
-                for (int i = lineStart + ChatSession.BotPrefix.Length; i <= lineEnd; i++)
-                    weights[i] = 1;
-
-            lineStart = lineEnd + 1;
-        }
-
-        return weights;
     }
 }

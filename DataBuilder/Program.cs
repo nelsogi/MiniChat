@@ -66,7 +66,7 @@ switch (command)
         {
             string cleaned = GutenbergCleaner.Clean(TextCleaner.ReadFile(input), Path.GetFileName(input));
             Console.WriteLine($"  {Path.GetFileName(input)} : {cleaned.Length:N0} caractères.");
-            books.Append(cleaned);
+            books.Append(TextCleaner.DocToken).Append(cleaned);   // un livre = un document
         }
         output = books.ToString();
         break;

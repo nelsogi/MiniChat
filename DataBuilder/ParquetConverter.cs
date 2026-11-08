@@ -83,8 +83,7 @@ public sealed class ParquetConverter
                         Empty++;
                         continue;
                     }
-
-                    long size = Encoding.UTF8.GetByteCount(cleaned);
+                    long size = TextCleaner.DocToken.Length + Encoding.UTF8.GetByteCount(cleaned);
                     if (bytes + size > _maxBytes)
                     {
                         ReachedMaxSize = true;
@@ -92,6 +91,8 @@ public sealed class ParquetConverter
                         return;
                     }
 
+                    // <|doc|> devant chaque document : le modèle voit où commence un nouveau texte.
+                    await output.WriteAsync(TextCleaner.DocToken);
                     await output.WriteAsync(cleaned);
                     _vocabulary.UnionWith(cleaned);
                     bytes += size;

@@ -1,35 +1,42 @@
 using MiniChat.Generation;
+using MiniChat.Tokenization;
 
 namespace MiniChat.Chat;
 
 /// <summary>
 /// Transforme le générateur de texte en chat.
 ///
-/// Astuce : le modèle ne sait pas ce qu'est une "conversation". Il a juste appris
-/// des textes au format :
-///     Toi: ...
-///     IA: ...
-/// Donc on écrit "Toi: {ton message}\nIA: " et on le laisse continuer
-/// jusqu'au retour à la ligne. C'est le même principe que les vrais chatbots.
+/// Astuce : le modèle ne sait pas ce qu'est une "conversation". Il a juste appris des textes où
+/// les messages sont balisés par des tokens spéciaux (voir ChatFormat) :
+///     &lt;|user|&gt;...&lt;|end|&gt;&lt;|assistant|&gt;...&lt;|end|&gt;
+/// Donc on écrit "&lt;|user|&gt;{ton message}&lt;|end|&gt;&lt;|assistant|&gt;" et on le laisse continuer
+/// jusqu'à ce qu'il écrive &lt;|end|&gt;. C'est le même principe que les vrais chatbots.
 ///
 /// Le prompt envoyé au modèle :
-///     IA: Je suis MiniChat, ...        <- l'identité, toujours en premier
-///     Toi: ... / IA: ...               <- les derniers tours COMPLETS qui tiennent en mémoire
-///     Toi: {message}                   <- la question
-///     IA:                              <- le modèle continue ici
+///     &lt;|doc|&gt;                                     <- une conversation commence
+///     &lt;|assistant|&gt;Je suis MiniChat, ...&lt;|end|&gt;    <- l'identité, toujours en premier
+///     &lt;|user|&gt;...&lt;|end|&gt;&lt;|assistant|&gt;...&lt;|end|&gt;    <- les derniers tours COMPLETS qui tiennent en mémoire
+///     &lt;|user|&gt;{message}&lt;|end|&gt;                    <- la question
+///     &lt;|assistant|&gt;                               <- le modèle continue ici
+///
+/// À l'écran et dans les fichiers (questions de test, /save-chat), les messages gardent les noms Toi et IA.
 /// </summary>
 public sealed class ChatSession
 {
+    /// <summary>Noms affichés devant les messages (et préfixes des lignes de dialogues.txt).</summary>
     public const string UserPrefix = "Toi: ";
     public const string BotPrefix = "IA: ";
 
     /// <summary>Phrase d'identité placée au début de chaque conversation : le modèle "sait" qui il est.</summary>
-    public const string Identity = BotPrefix + "Je suis MiniChat, un assistant qui répond en français.\n";
+    public const string IdentityText = "Je suis MiniChat, un assistant qui répond en français.";
+
+    private static readonly string Identity = BpeTokenizer.DocToken + ChatFormat.Assistant(IdentityText);
 
     private readonly TextGenerator _generator;
+    private readonly HashSet<long> _stopTokens;   // tous les tokens spéciaux : <|end|>, et les autres par sécurité
 
-    // Un élément = un tour complet "Toi: ...\nIA: ...\n". On ne coupe jamais au milieu.
-    private readonly List<string> _turns = new();
+    // Les tours complets (question, réponse). On ne coupe jamais au milieu.
+    private readonly List<(string User, string Reply)> _turns = new();
     private int _turnsInLastPrompt;
 
     // Réglages de départ. Nel Code les remplace par ceux de settings.json ; les questions de test gardent
@@ -52,24 +59,30 @@ public sealed class ChatSession
     /// <summary>Graine du tirage au sort : même graine = même réponse. null = hasard différent à chaque fois.</summary>
     public long? Seed { get; set; }
 
-    public ChatSession(TextGenerator generator) => _generator = generator;
+    public ChatSession(TextGenerator generator)
+    {
+        _generator = generator;
+        _stopTokens = generator.Tokenizer.SpecialIds.Select(id => (long)id).ToHashSet();
+    }
 
     /// <summary>
     /// Envoie un message et renvoie la réponse, caractère par caractère via onChar.
+    /// La réponse s'arrête quand le modèle écrit &lt;|end|&gt; (ou un autre token spécial : &lt;|user|&gt;
+    /// voudrait dire qu'il écrit la question suivante à notre place).
     /// cancellation : arrête la réponse au caractère suivant ; le début de réponse reste dans la conversation.
     /// </summary>
     public string Send(string userMessage, Action<char> onChar, CancellationToken cancellation = default)
     {
-        string question = $"{UserPrefix}{userMessage.Trim()}\n{BotPrefix}";
+        string question = ChatFormat.User(userMessage) + BpeTokenizer.AssistantToken;
 
         string reply = _generator.Generate(BuildPrompt(question), MaxReplyTokens, Temperature, TopK, TopP, c =>
         {
-            if (c == '\n' || cancellation.IsCancellationRequested) return false;   // fin de la réponse de l'IA
+            if (cancellation.IsCancellationRequested) return false;
             onChar(c);
             return true;
-        }, Seed);
+        }, Seed, stopTokens: _stopTokens);
 
-        _turns.Add($"{question}{reply}\n");
+        _turns.Add((userMessage.Trim(), reply.Trim()));
         return reply;
     }
 
@@ -86,8 +99,8 @@ public sealed class ChatSession
     /// <summary>Nombre de tours de la conversation (commande /info).</summary>
     public int TurnCount => _turns.Count;
 
-    /// <summary>Les tours de la conversation, chacun "Toi: ...\nIA: ...\n" (commande /save-chat).</summary>
-    public IReadOnlyList<string> Turns => _turns;
+    /// <summary>Les tours de la conversation, en texte simple (commande /save-chat).</summary>
+    public IReadOnlyList<(string User, string Reply)> Turns => _turns;
 
     /// <summary>Combien de ces tours tenaient dans le dernier prompt, en plus de l'identité (commande /info).</summary>
     public int TurnsInLastPrompt => _turnsInLastPrompt;
@@ -96,7 +109,8 @@ public sealed class ChatSession
     /// Identité + les tours les plus récents qui tiennent + la question.
     /// Le modèle ne voit que BlockSize tokens, et il faut laisser MaxReplyTokens pour sa réponse :
     /// on remonte les tours du plus récent au plus ancien, et on s'arrête au premier qui ne tient plus.
-    /// Le BPE coupe toujours sur "\n" et chaque morceau finit par "\n" : les tokens s'additionnent exactement.
+    /// Chaque morceau commence et finit par un token spécial, jamais fusionné avec ses voisins :
+    /// les tokens des morceaux s'additionnent exactement.
     /// </summary>
     private string BuildPrompt(string question)
     {
@@ -106,13 +120,14 @@ public sealed class ChatSession
         int first = _turns.Count;
         while (first > 0)
         {
-            int cost = _generator.CountTokens(_turns[first - 1]);
+            var (user, reply) = _turns[first - 1];
+            int cost = _generator.CountTokens(ChatFormat.Turn(user, reply));
             if (cost > budget) break;
             budget -= cost;
             first--;
         }
 
         _turnsInLastPrompt = _turns.Count - first;
-        return Identity + string.Concat(_turns.Skip(first)) + question;
+        return Identity + string.Concat(_turns.Skip(first).Select(t => ChatFormat.Turn(t.User, t.Reply))) + question;
     }
 }

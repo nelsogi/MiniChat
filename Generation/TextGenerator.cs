@@ -37,6 +37,7 @@ public sealed class TextGenerator
 
     public MiniGpt Model => _model;
     public Device Device => _device;
+    public BpeTokenizer Tokenizer => _tokenizer;
 
     /// <summary>Nombre de tokens d'un texte (pour savoir ce qui tient dans la mémoire du modèle).</summary>
     public int CountTokens(string text) => _tokenizer.Encode(text).Length;
@@ -60,8 +61,9 @@ public sealed class TextGenerator
     /// Avec une graine, le tirage a son propre générateur : il ne touche pas au hasard de l'entraînement.
     /// </param>
     /// <param name="useCache">false : sans cache KV (plus lent ; pour comparer, même texte à l'arrondi près).</param>
+    /// <param name="stopTokens">Tokens qui terminent le texte (&lt;|end|&gt;...) : la génération s'arrête, sans les écrire.</param>
     public string Generate(string prompt, int maxNewTokens, double temperature, int topK, double topP, Func<char, bool> onChar,
-        long? seed = null, bool useCache = true)
+        long? seed = null, bool useCache = true, IReadOnlySet<long>? stopTokens = null)
     {
         var clock = System.Diagnostics.Stopwatch.StartNew();
         _model.eval();
@@ -104,9 +106,11 @@ public sealed class TextGenerator
                 // Tirage au sort selon les probabilités (pas toujours le plus probable = plus naturel),
                 // mais seulement parmi les candidats sérieux : on évite les tokens absurdes.
                 long next = SampleTopKTopP(probabilities, topK, topP, random).item<long>();
+                written++;
+                if (stopTokens?.Contains(next) == true)
+                    return result.ToString();
                 ids.Add(next);
                 pending = 1;
-                written++;
 
                 // Un token peut faire plusieurs caractères : on les donne un par un à onChar.
                 foreach (char c in _tokenizer.Decode(next))

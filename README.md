@@ -116,6 +116,27 @@ de la phase 1 sur les dialogues et un échantillon de 20 Mo de `texte.txt` répa
 Si tu changes beaucoup les dialogues, refais un `--train` complet : `--finetune` garde
 l'ancien tokenizer (les caractères nouveaux seront ignorés).
 
+### Tokens spéciaux
+
+Le tokenizer a quatre tokens spéciaux, jamais découpés ni fusionnés : `<|doc|>`, `<|user|>`,
+`<|assistant|>` et `<|end|>`. Le modèle voit les conversations ainsi (format dans `Chat/ChatFormat.cs`) :
+
+```
+<|doc|><|user|>Bonjour !<|end|><|assistant|>Bonjour, comment vas-tu ?<|end|><|user|>...
+```
+
+- Le fine-tuning convertit `dialogues.txt`, qui reste au format lisible `Toi:` / `IA:`. **Une ligne vide
+  sépare deux conversations** (chacune commence par `<|doc|>`). Une ligne qui ne commence ni par `Toi:`
+  ni par `IA:` continue le message d'avant.
+- La loss ne compte que les réponses de l'IA et le `<|end|>` qui les termine : le modèle apprend à répondre
+  et à s'arrêter. La génération s'arrête quand il écrit `<|end|>`.
+- Dans `texte.txt`, `<|doc|>` devant chaque document dit au modèle qu'un nouveau texte commence.
+  DataBuilder l'écrit (un livre Gutenberg, une valeur Parquet = un document). Un `texte.txt` fait avant
+  n'en a pas : il marche, mais refais-le avec DataBuilder pour en profiter.
+- À l'écran, dans les questions de test et `/save-chat`, les messages gardent les noms Toi et IA.
+- Un modèle entraîné avant les tokens spéciaux ne peut plus être chargé (son vocabulaire n'a pas de place
+  pour eux) : réentraîne-le avec `/train`.
+
 Le modèle (EmbedDim 512, 8 couches, 8 têtes, mémoire de 256 tokens, dropout 0,1, ~27 M paramètres) apprend
 à chaque étape sur 64 extraits, envoyés au GPU par paquets de 16 (accumulation de gradients,
 voir `BatchSize` / `EffectiveBatchSize`). Sur une RTX 3060 Ti 8 Go : ~3,2 Go de mémoire GPU (toute la carte),
@@ -186,7 +207,7 @@ Pendant l'entraînement, une réponse d'exemple à la première question s'affic
 Un petit projet console à part, dans `DataBuilder/` :
 
 ```bash
-# Dialogues OpenAssistant (fichier *.messages.jsonl ou .jsonl.gz) -> format Toi:/IA:
+# Dialogues OpenAssistant (fichier *.messages.jsonl ou .jsonl.gz) -> format Toi:/IA:, une ligne vide entre deux conversations
 dotnet run --project DataBuilder -- oasst Data/dialogues.txt 2023-04-12_oasst_ready.messages.jsonl.gz --lang fr --max 300
 
 # Livres du Projet Gutenberg (.txt) -> texte propre pour le pré-entraînement

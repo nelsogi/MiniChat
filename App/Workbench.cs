@@ -1,4 +1,5 @@
 using System.Text;
+using MiniChat.Chat;
 using MiniChat.Config;
 using MiniChat.Data;
 using MiniChat.Evaluation;
@@ -96,8 +97,18 @@ public sealed class Workbench
         var (store, name) = DefaultModel == PretrainedModel && _pretrainStore.Exists
             ? (_pretrainStore, PretrainedModel)
             : (_store, ChatModel);
-        if (store.Exists)
+        if (!store.Exists)
+            return;
+
+        // Un modèle qu'on ne peut plus lire (format d'avant) ne doit pas empêcher Nel Code de démarrer.
+        try
+        {
             SetModel(store.Load(Device), name);
+        }
+        catch (InvalidDataException e)
+        {
+            Messages.Warning(e.Message);
+        }
     }
 
     /// <summary>
@@ -471,10 +482,11 @@ public sealed class Workbench
         // Le tokenizer apprend sur les DEUX fichiers : il connaît les mots des dialogues,
         // et le modèle garde le même vocabulaire (donc la même taille de sortie) entre les deux phases.
         var tokenizer = Messages.Spin($"Entraînement du tokenizer BPE ({TokenizerVocabSize} tokens, sur {TokenizerSampleMb} Mo de texte.txt au plus)...",
-            () => BpeTokenizer.Train(ReadSample(_pretrainPath, TokenizerSampleMb) + "\n" + ReadText(_dialoguesPath), TokenizerVocabSize));
+            () => BpeTokenizer.Train(ReadSample(_pretrainPath, TokenizerSampleMb) + "\n" + ReadDialogues(), TokenizerVocabSize));
         var model = new MiniGpt(new ModelConfig { VocabSize = tokenizer.VocabSize }).to(Device);
 
-        Messages.Info($"Vocabulaire : {tokenizer.VocabSize} tokens ({tokenizer.Alphabet.Length} caractères de base + {tokenizer.Merges.Count} fusions).");
+        Messages.Info($"Vocabulaire : {tokenizer.VocabSize} tokens ({tokenizer.Alphabet.Length} caractères de base + {tokenizer.Merges.Count} fusions " +
+                      $"+ {tokenizer.SpecialTokens.Count} tokens spéciaux : {string.Join(" ", tokenizer.SpecialTokens)}).");
         Messages.Info($"Modèle : {model.ParameterCount:N0} paramètres.");
         return (model, tokenizer);
     }
@@ -510,7 +522,7 @@ public sealed class Workbench
         manual_seed(seed);
 
         var (dialogues, generalText) = Messages.Spin("Lecture des dialogues et de texte.txt...", () => (
-            new TextDataset(ReadText(_dialoguesPath), tokenizer, seed, onlyReplies: true),
+            new TextDataset(ReadDialogues(), tokenizer, seed, onlyReplies: true),
             // Autre graine : les extraits de texte général ne suivent pas le même tirage que les dialogues.
             TextDataset.FromFile(CheckExists(_pretrainPath), tokenizer, seed + 1)));
 
@@ -590,6 +602,9 @@ public sealed class Workbench
 
     // Lit un fichier de données. Sur Windows les fins de ligne sont "\r\n" : on garde seulement "\n".
     private static string ReadText(string path) => File.ReadAllText(CheckExists(path)).Replace("\r\n", "\n");
+
+    // dialogues.txt (Toi:/IA:) au format du modèle, avec ses tokens spéciaux (voir ChatFormat).
+    private string ReadDialogues() => ChatFormat.FromDialogueFile(ReadText(_dialoguesPath));
 
     private static string CheckExists(string path) =>
         File.Exists(path) ? path : throw new UserException($"Fichier de données introuvable : {path}");

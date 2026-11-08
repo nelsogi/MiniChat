@@ -9,6 +9,8 @@ namespace DataBuilder;
 /// au format de MiniChat :
 ///     Toi: question
 ///     IA: réponse
+///                          <- une ligne vide entre deux conversations
+///     Toi: question
 ///
 /// Dans OpenAssistant, les conversations sont des arbres : chaque message peut avoir plusieurs
 /// réponses, classées par des humains ("rank", 0 = la meilleure). On part de chaque question
@@ -78,6 +80,8 @@ public sealed class OasstConverter
                 continue;
             }
 
+            // Une ligne vide entre deux conversations : MiniChat y met un <|doc|> (une nouvelle conversation commence).
+            if (output.Length > 0) output.Append('\n');
             foreach (var line in lines) output.Append(line).Append('\n');
             Kept++;
             if (stopReason is not null) Shortened++;

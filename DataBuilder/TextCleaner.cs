@@ -12,6 +12,13 @@ namespace DataBuilder;
 /// </summary>
 public static partial class TextCleaner
 {
+    /// <summary>
+    /// Écrit devant chaque document de texte.txt (un livre, un article) : le tokenizer de MiniChat en fait
+    /// un token spécial, et le modèle apprend qu'un nouveau texte commence là. Même texte que
+    /// BpeTokenizer.DocToken dans MiniChat (DataBuilder est un projet à part, il ne le voit pas).
+    /// </summary>
+    public const string DocToken = "<|doc|>";
+
     private static readonly Dictionary<char, string> Replacements = new()
     {
         ['’'] = "'", ['‘'] = "'", ['ʼ'] = "'",     // apostrophes typographiques

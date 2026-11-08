@@ -13,40 +13,75 @@ namespace MiniChat.Tokenization;
 /// Le modèle voit donc beaucoup plus de texte dans ses BlockSize tokens qu'avec un caractère par token.
 ///
 /// Le texte est d'abord coupé en "mots" (lettres avec leur espace devant, chiffres, ponctuation,
-/// retour à la ligne) : une fusion ne traverse jamais deux mots, et "\n" reste toujours un token seul
-/// (le chat s'en sert pour savoir où s'arrête une réponse).
+/// retour à la ligne) : une fusion ne traverse jamais deux mots, et "\n" reste toujours un token seul.
+///
+/// Tokens spéciaux : des marqueurs écrits en toutes lettres dans le texte, qui donnent chacun UN token,
+/// jamais découpé ni fusionné avec ses voisins (ids après les fusions, à la fin du vocabulaire) :
+///   &lt;|doc|&gt;        un nouveau document commence (entre les textes de texte.txt, entre les conversations)
+///   &lt;|user|&gt;       début d'un message de l'utilisateur
+///   &lt;|assistant|&gt;  début d'une réponse de l'IA
+///   &lt;|end|&gt;        fin d'un message : la génération s'arrête là
+/// Le format des conversations avec ces tokens est dans ChatFormat.
 /// </summary>
 public sealed partial class BpeTokenizer
 {
+    public const string DocToken = "<|doc|>";
+    public const string UserToken = "<|user|>";
+    public const string AssistantToken = "<|assistant|>";
+    public const string EndToken = "<|end|>";
+
+    /// <summary>Les tokens spéciaux d'un nouveau tokenizer, dans l'ordre de leurs ids.</summary>
+    public static readonly string[] DefaultSpecialTokens = { DocToken, UserToken, AssistantToken, EndToken };
+
     private readonly string[] _tokens;                          // id -> texte du token
     private readonly Dictionary<char, int> _charToId;
     private readonly (int Left, int Right)[] _merges;           // fusion n° i -> crée le token Alphabet.Length + i
     private readonly Dictionary<(int, int), int> _mergeRank;    // paire -> n° de la fusion (petit = appris tôt)
     private readonly Dictionary<string, int[]> _cache = new();  // mots déjà découpés
+    private readonly Dictionary<string, int> _specialIds;       // "<|end|>" -> son id
+    private readonly Regex _specialPattern;                     // trouve les tokens spéciaux dans un texte
 
     /// <param name="alphabet">Les caractères de base (ids 0 .. alphabet.Length - 1).</param>
     /// <param name="merges">Les fusions, dans l'ordre où elles ont été apprises.</param>
-    public BpeTokenizer(string alphabet, IEnumerable<(int Left, int Right)> merges)
+    /// <param name="specialTokens">Les tokens spéciaux, ids juste après les fusions.</param>
+    public BpeTokenizer(string alphabet, IEnumerable<(int Left, int Right)> merges, IEnumerable<string> specialTokens)
     {
         Alphabet = alphabet;
         _merges = merges.ToArray();
+        SpecialTokens = specialTokens.ToArray();
 
         var tokens = alphabet.Select(c => c.ToString()).ToList();
         foreach (var (left, right) in _merges)
             tokens.Add(tokens[left] + tokens[right]);
+        _specialIds = SpecialTokens.Select((s, i) => (s, tokens.Count + i)).ToDictionary(p => p.s, p => p.Item2);
+        tokens.AddRange(SpecialTokens);
         _tokens = tokens.ToArray();
 
         _charToId = alphabet.Select((c, i) => (c, i)).ToDictionary(p => p.c, p => p.i);
         _mergeRank = _merges.Select((m, i) => (m, i)).ToDictionary(p => p.m, p => p.i);
+        _specialPattern = SpecialPattern(SpecialTokens);
     }
 
     public string Alphabet { get; }
     public IReadOnlyList<(int Left, int Right)> Merges => _merges;
+    public IReadOnlyList<string> SpecialTokens { get; }
     public int VocabSize => _tokens.Length;
 
-    /// <summary>Apprend les fusions sur un texte jusqu'à avoir vocabSize tokens.</summary>
+    /// <summary>L'id d'un token spécial, ex. SpecialId(EndToken).</summary>
+    public int SpecialId(string token) => _specialIds[token];
+
+    /// <summary>Les ids de tous les tokens spéciaux.</summary>
+    public IReadOnlyCollection<int> SpecialIds => _specialIds.Values;
+
+    /// <summary>
+    /// Apprend les fusions sur un texte jusqu'à avoir vocabSize tokens, tokens spéciaux compris.
+    /// Les tokens spéciaux du texte sont ignorés : ils ne prêtent pas leurs caractères aux fusions.
+    /// </summary>
     public static BpeTokenizer Train(string text, int vocabSize)
     {
+        var specialTokens = DefaultSpecialTokens;
+        text = SpecialPattern(specialTokens).Replace(text, "\n");
+        vocabSize -= specialTokens.Length;
         string alphabet = new(text.Distinct().OrderBy(c => c).ToArray());
         var charToId = alphabet.Select((c, i) => (c, i)).ToDictionary(p => p.c, p => p.i);
 
@@ -86,25 +121,49 @@ public sealed partial class BpeTokenizer
             merges.Add(best);
         }
 
-        return new BpeTokenizer(alphabet, merges);
+        return new BpeTokenizer(alphabet, merges, specialTokens);
     }
 
-    /// <summary>Texte -> ids. Les caractères inconnus sont ignorés.</summary>
+    /// <summary>Texte -> ids. Les tokens spéciaux écrits dans le texte donnent leur id ; les caractères inconnus sont ignorés.</summary>
     public long[] Encode(string text) => EncodeWithPositions(text).Select(t => t.Id).ToArray();
 
     /// <summary>
     /// Comme Encode, mais donne aussi, pour chaque token, la position dans le texte du dernier
-    /// caractère de son mot. Sert à savoir si un token fait partie d'une réponse "IA:" (voir TextDataset).
+    /// caractère de son mot (ou de son token spécial). Sert à savoir si un token fait partie
+    /// d'une réponse de l'IA (voir ChatFormat.ReplyWeights).
     /// </summary>
     public IEnumerable<(long Id, int Position)> EncodeWithPositions(string text)
     {
-        foreach (Match m in PreTokenizer().Matches(text))
+        // Le texte entre deux tokens spéciaux est découpé en mots ; un token spécial est pris d'un bloc.
+        int start = 0;
+        foreach (Match special in _specialPattern.Matches(text))
         {
-            int lastChar = m.Index + m.Length - 1;
+            foreach (var token in EncodePlain(text, start, special.Index))
+                yield return token;
+            yield return (_specialIds[special.Value], special.Index + special.Length - 1);
+            start = special.Index + special.Length;
+        }
+        foreach (var token in EncodePlain(text, start, text.Length))
+            yield return token;
+    }
+
+    /// <summary>Les mots de text[start..end], sans token spécial dedans.</summary>
+    private IEnumerable<(long Id, int Position)> EncodePlain(string text, int start, int end)
+    {
+        if (end <= start)
+            yield break;
+
+        foreach (Match m in PreTokenizer().Matches(text[start..end]))
+        {
+            int lastChar = start + m.Index + m.Length - 1;
             foreach (int id in EncodeWord(m.Value))
                 yield return (id, lastChar);
         }
     }
+
+    // "<|doc|>|<\|user\|>|..." : les plus longs d'abord, au cas où l'un commencerait comme un autre.
+    private static Regex SpecialPattern(IEnumerable<string> specialTokens) =>
+        new(string.Join('|', specialTokens.OrderByDescending(s => s.Length).Select(Regex.Escape)), RegexOptions.Compiled);
 
     public string Decode(long id) => _tokens[id];
 

@@ -16,7 +16,7 @@ public sealed record TrainingInfo(int Step, float ValLoss, string RunId);
 /// <summary>
 /// Sauvegarde et recharge un modèle entraîné dans un dossier :
 ///   config.json     -> la forme du réseau
-///   tokenizer.json  -> le tokenizer BPE (caractères de base + fusions apprises)
+///   tokenizer.json  -> le tokenizer BPE (caractères de base + fusions apprises + tokens spéciaux)
 ///   weights.dat     -> les poids appris
 ///   optimizer.dat   -> l'état d'AdamW à la fin de l'entraînement (pour --continue)
 ///   training.json   -> pas atteint, loss de vérification, date de l'entraînement (voir TrainingInfo)
@@ -30,8 +30,11 @@ public sealed class ModelStore
 {
     private static readonly JsonSerializerOptions JsonOptions = new() { WriteIndented = true };
 
-    /// <summary>Forme du fichier tokenizer.json. Merges[i] = [gauche, droite] de la fusion n° i.</summary>
-    private sealed record TokenizerFile(string Alphabet, int[][] Merges);
+    /// <summary>
+    /// Forme du fichier tokenizer.json. Merges[i] = [gauche, droite] de la fusion n° i.
+    /// Special = les tokens spéciaux (&lt;|end|&gt;...), null dans les fichiers d'avant eux.
+    /// </summary>
+    private sealed record TokenizerFile(string Alphabet, int[][] Merges, string[]? Special = null);
 
     private readonly string _folder;
 
@@ -75,7 +78,7 @@ public sealed class ModelStore
         File.WriteAllText(ConfigPath, JsonSerializer.Serialize(model.Config, JsonOptions));
 
         var merges = tokenizer.Merges.Select(m => new[] { m.Left, m.Right }).ToArray();
-        File.WriteAllText(TokenizerPath, JsonSerializer.Serialize(new TokenizerFile(tokenizer.Alphabet, merges)));
+        File.WriteAllText(TokenizerPath, JsonSerializer.Serialize(new TokenizerFile(tokenizer.Alphabet, merges, tokenizer.SpecialTokens.ToArray())));
 
         model.save(WeightsPath);
 
@@ -95,7 +98,13 @@ public sealed class ModelStore
 
         var file = JsonSerializer.Deserialize<TokenizerFile>(File.ReadAllText(TokenizerPath))
                    ?? throw new InvalidDataException("tokenizer.json illisible.");
-        var tokenizer = new BpeTokenizer(file.Alphabet, file.Merges.Select(m => (m[0], m[1])));
+        // Sans tokens spéciaux, le modèle a appris l'ancien format Toi:/IA: et son vocabulaire n'a pas de place
+        // pour eux : il ne peut pas servir avec le format actuel (voir ChatFormat).
+        if (file.Special is null)
+            throw new InvalidDataException(
+                $"Le modèle de '{Path.GetFileName(_folder)}' date d'avant les tokens spéciaux (<|user|>, <|assistant|>, <|end|>) : " +
+                "il ne sait pas lire le format de conversation actuel. Réentraîne-le avec /train.");
+        var tokenizer = new BpeTokenizer(file.Alphabet, file.Merges.Select(m => (m[0], m[1])), file.Special);
 
         var model = new MiniGpt(config);
         model.load(WeightsPath);

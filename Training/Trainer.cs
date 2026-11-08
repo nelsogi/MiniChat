@@ -49,6 +49,7 @@ public sealed class Trainer
     private readonly string? _lossCsvPath;
     private readonly Action<int>? _showSample;
     private readonly Checkpoint _checkpoint;
+    private readonly ITrainingProgress _progress;
 
     // Meilleure loss de vérification vue (les poids correspondants sont dans le checkpoint).
     private float _bestValLoss = float.MaxValue;
@@ -73,10 +74,13 @@ public sealed class Trainer
     /// <param name="lossCsvPath">Fichier CSV où ajouter une ligne à chaque mesure de loss. null = pas de CSV.</param>
     /// <param name="showSample">Affiche une réponse d'exemple, appelé tous les config.SampleInterval pas.</param>
     /// <param name="checkpoint">Où sauvegarder l'avancement et les meilleurs poids.</param>
+    /// <param name="progress">Où montrer l'avancement, les loss et les messages.</param>
     public Trainer(MiniGpt model, TextDataset dataset, TrainingConfig config, Device device, Checkpoint checkpoint,
-        TextDataset? generalText = null, string phase = "", string? lossCsvPath = null, Action<int>? showSample = null)
+        ITrainingProgress progress, TextDataset? generalText = null, string phase = "", string? lossCsvPath = null,
+        Action<int>? showSample = null)
     {
         _checkpoint = checkpoint;
+        _progress = progress;
         _model = model;
         _dataset = dataset;
         _generalText = generalText;
@@ -113,28 +117,29 @@ public sealed class Trainer
             _startValLoss = resume.StartValLoss;
             if (_checkpoint.ReadBest() is { } best)
                 (_bestValLoss, _bestStep) = (best.ValLoss, best.Step);
-            Console.WriteLine($"  Reprise au pas {_startStep} (meilleure loss de vérification : {_bestValLoss:F3}, au pas {_bestStep}).");
+            _progress.Log($"Reprise au pas {_startStep} (meilleure loss de vérification : {_bestValLoss:F3}, au pas {_bestStep}).");
         }
         else if (optimizerPath is not null)
         {
             if (File.Exists(optimizerPath))
             {
                 optimizer.load_state_dict(optimizerPath);
-                Console.WriteLine("  État de l'optimiseur (AdamW) rechargé.");
+                _progress.Log("État de l'optimiseur (AdamW) rechargé.");
             }
             else
             {
-                Console.WriteLine("  Pas d'état d'optimiseur sauvegardé avec ce modèle : AdamW repart de zéro.");
+                _progress.Log("Pas d'état d'optimiseur sauvegardé avec ce modèle : AdamW repart de zéro.");
             }
         }
 
-        Console.WriteLine($"  Batch : {_config.BatchSize} x {_accumulation} = {_config.EffectiveBatchSize} extraits " +
-                          $"de {_model.Config.BlockSize} tokens par étape.");
+        _progress.Log($"Batch : {_config.BatchSize} x {_accumulation} = {_config.EffectiveBatchSize} extraits " +
+                      $"de {_model.Config.BlockSize} tokens par étape.");
 
         int lastStep = _startStep;
         for (int step = _startStep; step <= _config.Steps; step++)
         {
             lastStep = step;
+            _progress.Advance(step, LearningRateAt(step), Remaining(step, clock.Elapsed));
 
             // Mesure aussi au premier pas (la loss du modèle de départ, à battre) et au dernier,
             // même s'ils ne tombent pas sur EvalInterval (une continuation peut commencer au pas 9 137).
@@ -146,8 +151,8 @@ public sealed class Trainer
                 // Arrêt anticipé : plus de progrès depuis trop longtemps, continuer ne sert à rien.
                 if (_config.EarlyStoppingPatience > 0 && step - _bestStep >= _config.EarlyStoppingPatience)
                 {
-                    Console.WriteLine($"  Arrêt anticipé au pas {step} : pas d'amélioration de la loss de vérification " +
-                                      $"depuis {step - _bestStep} pas (meilleure au pas {_bestStep}).");
+                    _progress.Log($"Arrêt anticipé au pas {step} : pas d'amélioration de la loss de vérification " +
+                                  $"depuis {step - _bestStep} pas (meilleure au pas {_bestStep}).");
                     break;
                 }
             }
@@ -189,10 +194,10 @@ public sealed class Trainer
         // On remet les poids qui avaient la meilleure loss de vérification (optimiseur sauvegardé avant, voir SaveFinalOptimizer).
         string optimizerState = _checkpoint.SaveFinalOptimizer(optimizer);
         _checkpoint.LoadBest(_model);
-        Console.WriteLine($"Meilleur modèle gardé : étape {_bestStep}, loss vérification {_bestValLoss:F3}.");
+        _progress.Log($"Meilleur modèle gardé : étape {_bestStep}, loss vérification {_bestValLoss:F3}.");
 
         if (_peakGpuMb > 0)
-            Console.WriteLine($"Mémoire GPU utilisée au maximum : {_peakGpuMb:N0} Mo.");
+            _progress.Log($"Mémoire GPU utilisée au maximum : {_peakGpuMb:N0} Mo.");
 
         return new TrainingResult(_startValLoss ?? _bestValLoss, _bestValLoss, _bestStep, lastStep, optimizerState);
     }
@@ -274,28 +279,27 @@ public sealed class Trainer
         float val = EstimateLoss(validation: true);
         _startValLoss ??= val;
 
-        string best = "";
-        if (val < _bestValLoss)
+        bool best = val < _bestValLoss;
+        if (best)
         {
             (_bestValLoss, _bestStep) = (val, step);
             _checkpoint.SaveBest(_model, new BestScore(val, step));
-            best = "  <- meilleur";
         }
 
-        Console.WriteLine($"  Étape {step,5}/{_config.Steps}  |  loss entraînement {train:F3}  |  loss vérification {val:F3}" +
-                          $"  |  lr {LearningRateAt(step):0.0e0}{GpuMemoryText()}  |  {Format(elapsed)}  |  reste {Remaining(step, elapsed)}{best}");
+        _progress.Report(new TrainingReport(step, _config.Steps, train, val, LearningRateAt(step), elapsed,
+            Remaining(step, elapsed), best, GpuMemoryNow()));
 
         WriteCsvLine(step, train, val, elapsed);
     }
 
-    /// <summary>"  |  GPU 2 345/4 096 Mo" sur GPU, rien sur CPU. Retient aussi le pic.</summary>
-    private string GpuMemoryText()
+    /// <summary>Mémoire GPU utilisée / totale en Mo, null sur CPU. Retient aussi le pic.</summary>
+    private (long UsedMb, long TotalMb)? GpuMemoryNow()
     {
-        if (_device.type != DeviceType.CUDA || GpuMemory.Read() is not var (used, total))
-            return "";
+        if (_device.type != DeviceType.CUDA || GpuMemory.Read() is not { } memory)
+            return null;
 
-        _peakGpuMb = Math.Max(_peakGpuMb, used);
-        return $"  |  GPU {used:N0}/{total:N0} Mo";
+        _peakGpuMb = Math.Max(_peakGpuMb, memory.UsedMb);
+        return memory;
     }
 
     /// <summary>
@@ -337,15 +341,6 @@ public sealed class Trainer
     }
 
     /// <summary>Temps restant estimé : durée moyenne d'une étape depuis le lancement x étapes restantes.</summary>
-    private string Remaining(int step, TimeSpan elapsed)
-    {
-        if (step == _startStep) return "--:--";
-        return Format(elapsed / (step - _startStep) * (_config.Steps - step));
-    }
-
-    /// <summary>"mm:ss", ou "h:mm:ss" à partir d'une heure (un entraînement long peut durer des heures).</summary>
-    private static string Format(TimeSpan time) =>
-        time.TotalHours >= 1
-            ? $"{(int)time.TotalHours}:{time:mm\\:ss}"
-            : time.ToString(@"mm\:ss");
+    private TimeSpan? Remaining(int step, TimeSpan elapsed) =>
+        step == _startStep ? null : elapsed / (step - _startStep) * (_config.Steps - step);
 }

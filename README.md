@@ -1,12 +1,38 @@
 # MiniChat — une petite IA générative en C#
 
 Un mini-GPT (Transformer) écrit de zéro avec **TorchSharp**, qui apprend à discuter
-à partir de `data/dialogues.txt`, puis tourne en chat dans la console.
+à partir de `data/dialogues.txt`, puis tourne en chat dans **Nel Code**, une interface console
+faite avec [Spectre.Console](https://spectreconsole.net/).
 
 ## Lancer
 
 ```bash
-dotnet run                 # entraîne (la 1re fois) puis ouvre le chat
+dotnet run                 # ouvre Nel Code (sans modèle entraîné : il propose /train)
+```
+
+Au lancement, un cadre d'accueil affiche le modèle chargé (taille), GPU ou CPU et les dossiers.
+Écris un message pour discuter, ou une commande :
+
+| Commande                                    | Ce qu'elle fait |
+|---------------------------------------------|-----------------|
+| `/help`                                     | La liste des commandes |
+| `/train`                                    | Nouveau modèle : pré-entraînement + fine-tuning |
+| `/finetune`                                 | Refait seulement le fine-tuning, depuis `model-pretrain/` |
+| `/continue <étapes> [finetune] [--lr 3e-4]` | Entraîne plus longtemps un modèle existant (voir plus bas) |
+| `/resume`                                   | Reprend un entraînement interrompu |
+| `/test`                                     | Questions de test sur le modèle chargé (réponses dans `results/<date>-test.txt`) |
+| `/temp 0.8`, `/topk 20`, `/topp 0.9`        | Réglages de génération (sans nombre : affiche la valeur) |
+| `/info`                                     | Modèle, GPU, réglages, conversation |
+| `/reset`                                    | Oublie la conversation |
+| `/clear`                                    | Efface l'écran et la conversation |
+| `/quit`                                     | Quitte |
+
+Pendant l'entraînement, une barre de progression montre le pas, les deux loss, la vitesse
+d'apprentissage et le temps restant ; chaque mesure laisse une ligne d'historique au-dessus.
+
+Les options en ligne de commande marchent toujours : elles lancent la commande qui va avec au démarrage.
+
+```bash
 dotnet run -- --train      # refait tout : pré-entraînement + fine-tuning
 dotnet run -- --finetune   # refait seulement le fine-tuning, depuis model-pretrain/
 dotnet run -- --resume     # reprend un entraînement interrompu (coupure, plantage, Ctrl+C)
@@ -163,6 +189,15 @@ Attention : la sortie est **écrasée**. Garde une copie de tes `dialogues.txt` 
 | `Chat/`          | `ChatSession`         | Transforme la génération en conversation |
 | `Evaluation/`    | `QuestionTest`        | Questions de test après l'entraînement, exemples pendant |
 | `Storage/`       | `ModelStore`          | Sauvegarde / chargement du modèle |
+| `App/`           | `Workbench`           | Le modèle chargé et ce qui le change : entraîner, continuer, reprendre, tester |
+|                  | `NelShell`            | La boucle de Nel Code : commandes ou messages pour le modèle |
+| `Commands/`      | `ICommand`            | Une commande (`Name`, `Description`, `Usage`, `Execute`) ; une classe par commande |
+|                  | `CommandRegistry`     | Trouve toutes les commandes toute seule (ajouter une classe suffit) |
+| `UI/`            | `Theme`               | Les couleurs et symboles, à un seul endroit |
+|                  | `WelcomeBanner`       | Le cadre d'accueil |
+|                  | `ChatView`            | La conversation : spinner, puis réponse au fur et à mesure |
+|                  | `InputBox`            | La zone de saisie |
+|                  | `TrainingProgressView`| La barre de progression de l'entraînement |
 
 ## Ce qu'il faut savoir
 

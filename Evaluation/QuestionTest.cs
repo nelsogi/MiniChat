@@ -41,15 +41,13 @@ public static class QuestionTest
     }
 
     /// <summary>Pendant l'entraînement : une réponse d'exemple, pour voir le modèle progresser.</summary>
-    public static void PrintSample(TextGenerator generator, string question, int step)
-    {
-        Console.WriteLine($"    Exemple (étape {step}) :");
-        Console.WriteLine($"      {ChatSession.UserPrefix}{question}");
-        Console.WriteLine($"      {ChatSession.BotPrefix}{Answer(generator, question)}");
-    }
+    public static string Sample(TextGenerator generator, string question, int step) =>
+        $"Exemple (étape {step}) :\n" +
+        $"  {ChatSession.UserPrefix}{question}\n" +
+        $"  {ChatSession.BotPrefix}{Answer(generator, question)}";
 
-    /// <summary>Pose toutes les questions, écrit les réponses dans outputPath et les affiche.</summary>
-    public static void Run(TextGenerator generator, string questionsPath, string outputPath, string description)
+    /// <summary>Pose toutes les questions, écrit les réponses dans outputPath et renvoie le rapport (pour l'afficher).</summary>
+    public static string Run(TextGenerator generator, string questionsPath, string outputPath, string description)
     {
         var defaults = new ChatSession(generator);
         var report = new StringBuilder();
@@ -67,9 +65,6 @@ public static class QuestionTest
 
         Directory.CreateDirectory(Path.GetDirectoryName(outputPath)!);
         File.WriteAllText(outputPath, report.ToString(), new UTF8Encoding(false));
-
-        Console.WriteLine();
-        Console.Write(report);
-        Console.WriteLine($"(réponses écrites dans {outputPath})");
+        return report.ToString().TrimEnd();
     }
 }

@@ -18,6 +18,7 @@
   <ItemGroup>
     <!-- Version CUDA : utilise le GPU NVIDIA s'il y en a un (pilote récent requis), sinon le CPU.
          Le choix se fait tout seul au démarrage, voir cuda.is_available() dans Program.cs. -->
+    <PackageReference Include="Spectre.Console" Version="0.49.1" />
     <PackageReference Include="TorchSharp-cuda-windows" Version="0.105.*" />
   </ItemGroup>
 
@@ -26,8 +27,7 @@
        la DLL reste tronquée, torch_cuda.dll ne se charge pas et cuda.is_available() répond false.
        On fait donc le recollage ici, dans le cache NuGet, avant la copie vers bin/. Les morceaux sont
        supprimés une fois recollés : les builds suivants n'ont plus rien à faire. -->
-  <UsingTask TaskName="RestitchTorchFragments" TaskFactory="RoslynCodeTaskFactory"
-             AssemblyFile="$(MSBuildToolsPath)\Microsoft.Build.Tasks.Core.dll">
+  <UsingTask TaskName="RestitchTorchFragments" TaskFactory="RoslynCodeTaskFactory" AssemblyFile="$(MSBuildToolsPath)\Microsoft.Build.Tasks.Core.dll">
     <ParameterGroup>
       <Fragments ParameterType="Microsoft.Build.Framework.ITaskItem[]" Required="true" />
     </ParameterGroup>
@@ -92,12 +92,9 @@
       <TrainedModelFile Include="$(ModelsSource)\model\**" Folder="model" />
       <TrainedModelFile Include="$(ModelsSource)\model-pretrain\**" Folder="model-pretrain" />
     </ItemGroup>
-    <Copy SourceFiles="@(TrainedModelFile)"
-          DestinationFiles="@(TrainedModelFile->'$(PublishDir)%(Folder)\%(RecursiveDir)%(Filename)%(Extension)')" />
-    <Message Importance="high" Condition="'@(TrainedModelFile)' != ''"
-             Text="Modèles entraînés copiés depuis $(ModelsSource) : @(TrainedModelFile->'%(Folder)'->Distinct())" />
-    <Message Importance="high" Condition="'@(TrainedModelFile)' == ''"
-             Text="Aucun modèle entraîné dans $(ModelsSource) : le dossier publié entraînera au premier lancement." />
+    <Copy SourceFiles="@(TrainedModelFile)" DestinationFiles="@(TrainedModelFile->'$(PublishDir)%(Folder)\%(RecursiveDir)%(Filename)%(Extension)')" />
+    <Message Importance="high" Condition="'@(TrainedModelFile)' != ''" Text="Modèles entraînés copiés depuis $(ModelsSource) : @(TrainedModelFile-&gt;'%(Folder)'-&gt;Distinct())" />
+    <Message Importance="high" Condition="'@(TrainedModelFile)' == ''" Text="Aucun modèle entraîné dans $(ModelsSource) : le dossier publié entraînera au premier lancement." />
   </Target>
 
 </Project>

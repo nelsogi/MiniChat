@@ -1,7 +1,4 @@
-using System.Text;
 using MiniChat.Generation;
-using MiniChat.Training;
-using TorchSharp;
 
 namespace MiniChat.Chat;
 
@@ -74,26 +71,14 @@ public sealed class ChatSession
         _turnsInLastPrompt = 0;
     }
 
-    /// <summary>Taille du modèle, device et réglages de génération (commande /info).</summary>
-    public string Info()
-    {
-        var model = _generator.Model;
-        var config = model.Config;
-        bool gpu = _generator.Device.type == DeviceType.CUDA;
+    /// <summary>Le générateur (donc le modèle) qui répond.</summary>
+    public TextGenerator Generator => _generator;
 
-        var info = new StringBuilder();
-        info.AppendLine($"Modèle      : {model.ParameterCount:N0} paramètres | {config.Layers} couches, {config.Heads} têtes, " +
-                        $"EmbedDim {config.EmbedDim} | mémoire {config.BlockSize} tokens | vocabulaire {config.VocabSize} tokens");
+    /// <summary>Nombre de tours de la conversation (commande /info).</summary>
+    public int TurnCount => _turns.Count;
 
-        string memory = gpu && GpuMemory.Read() is var (used, total) ? $" | mémoire GPU {used:N0} / {total:N0} Mo" : "";
-        info.AppendLine($"Calcul      : {(gpu ? "GPU NVIDIA (CUDA)" : "CPU")}{memory}");
-
-        info.AppendLine($"Génération  : température {Temperature} | top-k {(TopK == 0 ? "désactivé" : TopK)} | " +
-                        $"top-p {(TopP >= 1 ? "désactivé" : TopP)} | réponse max {MaxReplyTokens} tokens | " +
-                        $"graine {(Seed is null ? "aléatoire" : Seed)}");
-        info.Append($"Conversation : {_turns.Count} tour(s), dont {_turnsInLastPrompt} dans le dernier prompt (+ l'identité)");
-        return info.ToString();
-    }
+    /// <summary>Combien de ces tours tenaient dans le dernier prompt, en plus de l'identité (commande /info).</summary>
+    public int TurnsInLastPrompt => _turnsInLastPrompt;
 
     /// <summary>
     /// Identité + les tours les plus récents qui tiennent + la question.

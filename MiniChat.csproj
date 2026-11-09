@@ -2,7 +2,7 @@
 
   <PropertyGroup>
     <OutputType>Exe</OutputType>
-    <TargetFramework>net8.0</TargetFramework>
+    <TargetFramework>net10.0</TargetFramework>
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
     <RootNamespace>MiniChat</RootNamespace>
@@ -13,6 +13,7 @@
     <!-- Où chercher les modèles entraînés à mettre dans le dossier publié : là où "dotnet run" les crée.
          Autre dossier : dotnet publish ... -p:ModelsSource=D:\MesModeles -->
     <ModelsSource Condition="'$(ModelsSource)' == ''">$(MSBuildProjectDirectory)\bin\Debug\$(TargetFramework)</ModelsSource>
+    <LangVersion>14</LangVersion>
   </PropertyGroup>
 
   <ItemGroup>

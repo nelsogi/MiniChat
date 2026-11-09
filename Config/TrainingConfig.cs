@@ -108,8 +108,12 @@ public sealed record TrainingConfig
     /// <summary>Étapes de "chauffe" : la vitesse monte de 0 à LearningRate pour éviter un départ brutal.</summary>
     public int WarmupSteps { get; init; } = 100;
 
-    /// <summary>Tous les combien de pas on sauvegarde l'avancement dans checkpoint/ (pour --resume).</summary>
-    public int CheckpointInterval { get; init; } = 250;
+    /// <summary>
+    /// Tous les combien de pas on sauvegarde l'avancement dans checkpoint/ (pour --resume).
+    /// Une sauvegarde écrit ~330 Mo (poids + AdamW) : 1000 pas, c'est au plus ~7 min à refaire après une coupure.
+    /// Un arrêt avec Échap sauvegarde de toute façon au pas atteint.
+    /// </summary>
+    public int CheckpointInterval { get; init; } = 1000;
 
     /// <summary>
     /// Arrêt anticipé : on s'arrête si la loss de vérification ne s'est pas améliorée depuis ce nombre de pas.

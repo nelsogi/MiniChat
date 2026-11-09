@@ -29,6 +29,12 @@ if (!Directory.Exists(dataFolder))
 // GPU NVIDIA s'il y en a un d'utilisable, sinon CPU. Tout le reste suit ce device :
 // le modèle (.to(device)), les batchs (GetBatch) et les tenseurs créés pendant les calculs.
 var device = cuda.is_available() ? CUDA : CPU;
+
+// TF32 : les multiplications de matrices float32 passent par les Tensor Cores (GPU RTX 30xx et plus récents),
+// avec une mantisse de 10 bits au lieu de 23. Mesuré : 0,53 -> 0,42 s par étape, loss identique à 0,001 près.
+// Les poids, les gradients et AdamW restent en float32. TorchSharp 0.105 n'a pas d'autocast (bfloat16).
+backends.cuda.matmul.allow_tf32 = true;
+backends.cudnn.allow_tf32 = true;
 var workbench = new Workbench(dataFolder, modelsFolder, device);
 
 // Les réglages (température, top-k, top-p, modèle par défaut) : settings.json, à côté des modèles.

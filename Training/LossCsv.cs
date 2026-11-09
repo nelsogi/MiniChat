@@ -7,7 +7,8 @@ public sealed record LossPoint(string Phase, int Step, float TrainLoss, float Va
 
 /// <summary>
 /// Relit le CSV des loss écrit par le Trainer (results/&lt;date&gt;-loss.csv) :
-///   phase,etape,loss_entrainement,loss_verification,learning_rate,secondes
+///   phase,etape,loss_entrainement,loss_verification,learning_rate,secondes,tokens_par_seconde,memoire_gpu_mo
+/// (les CSV d'avant n'ont pas les deux dernières colonnes ; seules les cinq premières sont relues ici).
 /// Les deux phases sont dans le même fichier, et leurs pas repartent chacun de 0.
 /// </summary>
 public static class LossCsv

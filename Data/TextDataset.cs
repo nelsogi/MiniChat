@@ -1,8 +1,16 @@
 using MiniChat.Chat;
 using MiniChat.Tokenization;
+using TorchSharp;
 using static TorchSharp.torch;
 
 namespace MiniChat.Data;
+
+/// <summary>
+/// Un texte découpé en tokens, avant d'être envoyé sur le GPU : ce que TokenCache garde sur le disque.
+/// Ids sur 2 octets (short, vocabulaire &lt;= 32 768). Mask : le poids (0 ou 1) de chaque token dans la loss,
+/// null = le modèle est noté sur tous les tokens. Characters = nombre de caractères du texte de départ.
+/// </summary>
+public sealed record TokenizedText(short[] Ids, byte[]? Mask, long Characters);
 
 /// <summary>
 /// Le texte d'entraînement, découpé en ~90 % pour apprendre et ~10 % pour vérifier.
@@ -18,13 +26,13 @@ namespace MiniChat.Data;
 /// Un extrait tiré pour un batch reste toujours d'un seul côté : jamais à cheval sur les deux.
 ///
 /// Chaque token a aussi un poids (le "masque") : 1 = le modèle est noté sur ce token,
-/// 0 = il le lit mais n'est pas noté dessus. Voir onlyReplies.
+/// 0 = il le lit mais n'est pas noté dessus. Voir Tokenize (onlyReplies).
 ///
-/// Les tokens sont gardés en mémoire normale sur 2 octets chacun (ushort, vocabulaire &lt;= 65 536) :
-/// un texte.txt de 1,5 Go donne ~460 millions de tokens, soit ~0,9 Go. Seuls les petits batchs
-/// tirés au hasard deviennent des tenseurs (sur le GPU).
+/// Les tokens sont gardés directement sur le device (GPU), en int16 : un texte.txt de 1,5 Go donne
+/// ~460 millions de tokens, soit ~0,9 Go de mémoire GPU. Un batch y est découpé par des index :
+/// seuls les débuts d'extrait (un nombre par extrait) passent du CPU au GPU. À libérer (Dispose) après la phase.
 /// </summary>
-public sealed class TextDataset
+public sealed class TextDataset : IDisposable
 {
     /// <summary>Taille d'un morceau, en tokens.</summary>
     public const int ChunkTokens = 10_000;
@@ -42,8 +50,9 @@ public sealed class TextDataset
     /// <summary>Une suite de morceaux voisins du même côté (entraînement ou vérification).</summary>
     private readonly record struct Segment(int Start, int Length);
 
-    private readonly ushort[] _ids;
-    private readonly float[]? _mask;   // null = le modèle est noté sur tous les tokens
+    private readonly Tensor _ids;      // int16, forme (tokens), sur le device
+    private readonly Tensor? _mask;    // uint8, forme (tokens), sur le device ; null = noté sur tous les tokens
+    private readonly Device _device;
     private readonly Segment[] _train;
     private readonly Segment[] _validation;
     private readonly Random _random;
@@ -51,15 +60,26 @@ public sealed class TextDataset
     // Pour tirer un début d'extrait au hasard parmi tous les débuts possibles (voir StartsIndex).
     private (int BlockSize, long[] Train, long[] Validation)? _starts;
 
-    /// <param name="text">Avec onlyReplies : des dialogues au format du modèle (ChatFormat.FromDialogueFile).</param>
-    /// <param name="onlyReplies">
-    /// true pour les dialogues : le modèle n'est noté que sur les réponses de l'IA et le &lt;|end|&gt; qui
-    /// les termine, pour qu'il apprenne à s'arrêter (voir ChatFormat.ReplyWeights). Les questions restent
-    /// lues comme contexte, mais il n'a pas à apprendre à les écrire : c'est l'humain qui les tape.
-    /// false : le modèle est noté sur tout le texte.
-    /// </param>
+    /// <param name="text">Les tokens (Tokenize, TokenizeFile ou TokenCache), copiés sur le device.</param>
     /// <param name="validationEvery">Un morceau sur combien va en vérification (10 = ~10 %).</param>
-    public TextDataset(string text, BpeTokenizer tokenizer, int seed, bool onlyReplies = false, int validationEvery = 10)
+    public TextDataset(TokenizedText text, int seed, Device device, int validationEvery = 10)
+    {
+        _device = device;
+        _ids = ToDevice(tensor(text.Ids), device);
+        _mask = text.Mask is null ? null : ToDevice(tensor(text.Mask), device);
+        (_train, _validation) = Split(text.Ids.Length, validationEvery);
+        _random = new Random(seed);
+        Characters = text.Characters;
+    }
+
+    /// <summary>
+    /// Découpe un texte en tokens.
+    /// onlyReplies : true pour les dialogues (au format du modèle, ChatFormat.FromDialogueFile) : le modèle
+    /// n'est noté que sur les réponses de l'IA et le &lt;|end|&gt; qui les termine, pour qu'il apprenne à
+    /// s'arrêter (voir ChatFormat.ReplyWeights). Les questions restent lues comme contexte, mais il n'a pas
+    /// à apprendre à les écrire : c'est l'humain qui les tape. false : le modèle est noté sur tout le texte.
+    /// </summary>
+    public static TokenizedText Tokenize(string text, BpeTokenizer tokenizer, bool onlyReplies)
     {
         CheckVocabulary(tokenizer);
         var weights = onlyReplies ? ChatFormat.ReplyWeights(text) : null;
@@ -67,32 +87,22 @@ public sealed class TextDataset
         // Un token prend le poids du dernier caractère de son mot (ou de son token spécial). Un mot ne
         // traverse jamais un token spécial, donc "Coucou" (après <|assistant|>) compte, <|assistant|> non.
         var tokens = tokenizer.EncodeWithPositions(text).ToArray();
-        _ids = tokens.Select(t => (ushort)t.Id).ToArray();
-        _mask = weights is null ? null : tokens.Select(t => weights[t.Position]).ToArray();
-        (_train, _validation) = Split(_ids.Length, validationEvery);
-        _random = new Random(seed);
-        Characters = text.Length;
-    }
-
-    private TextDataset(ushort[] ids, long characters, int seed, int validationEvery)
-    {
-        _ids = ids;
-        (_train, _validation) = Split(ids.Length, validationEvery);
-        _random = new Random(seed);
-        Characters = characters;
+        var ids = tokens.Select(t => (short)t.Id).ToArray();
+        var mask = weights is null ? null : tokens.Select(t => (byte)weights[t.Position]).ToArray();
+        return new TokenizedText(ids, mask, text.Length);
     }
 
     /// <summary>
     /// Lit un gros fichier ligne par ligne, sans jamais le charger en entier : au-delà d'environ
     /// 1 milliard de caractères, il ne tient même pas dans une chaîne .NET. Le modèle est noté sur tout le texte.
-    /// Même résultat que le constructeur : un mot ne traverse jamais une ligne, on peut donc encoder ligne par ligne.
+    /// Même résultat que Tokenize : un mot ne traverse jamais une ligne, on peut donc encoder ligne par ligne.
     /// </summary>
-    public static TextDataset FromFile(string path, BpeTokenizer tokenizer, int seed, int validationEvery = 10)
+    public static TokenizedText TokenizeFile(string path, BpeTokenizer tokenizer)
     {
         CheckVocabulary(tokenizer);
 
         // Taille de départ : ~1 token pour 3 octets en français (mesuré). Agrandi si besoin.
-        var ids = new ushort[Math.Clamp(new FileInfo(path).Length / 3, 1024, Array.MaxLength)];
+        var ids = new short[Math.Clamp(new FileInfo(path).Length / 3, 1024, Array.MaxLength)];
         int count = 0;
         long characters = 0;
 
@@ -109,12 +119,12 @@ public sealed class TextDataset
                         throw new InvalidDataException($"{Path.GetFileName(path)} : plus de {Array.MaxLength:N0} tokens, réduis le fichier (DataBuilder --max-mo).");
                     Array.Resize(ref ids, (int)Math.Min(2L * ids.Length, Array.MaxLength));
                 }
-                ids[count++] = (ushort)id;
+                ids[count++] = (short)id;
             }
         }
 
         Array.Resize(ref ids, count);
-        return new TextDataset(ids, characters, seed, validationEvery);
+        return new TokenizedText(ids, null, characters);
     }
 
     public long TrainLength => _train.Sum(s => (long)s.Length);
@@ -128,6 +138,9 @@ public sealed class TextDataset
     /// x = l'extrait, y = le même extrait décalé d'un token (= "la bonne réponse").
     /// mask = le poids de chaque token de y dans la loss.
     /// Exemple : x = [" Bon", "jour", " à"], y = ["jour", " à", " toi"].
+    ///
+    /// Les débuts sont tirés sur le CPU (même tirage qu'avant, donc les mêmes extraits), puis le GPU découpe :
+    /// index[b, t] = début[b] + t, pour t de 0 à BlockSize, et les tokens sont lus d'un coup à ces index.
     /// </summary>
     public (Tensor X, Tensor Y, Tensor Mask) GetBatch(bool validation, int batchSize, int blockSize, Device device)
     {
@@ -137,24 +150,40 @@ public sealed class TextDataset
         if (possibleStarts <= 0)
             throw new InvalidOperationException("Pas assez de texte pour ce BlockSize : ajoute des données.");
 
-        var x = new long[batchSize * blockSize];
-        var y = new long[batchSize * blockSize];
-        var mask = new float[batchSize * blockSize];
-
+        var starts = new long[batchSize];
         for (int b = 0; b < batchSize; b++)
-        {
-            int start = PickStart(segments, ends, _random.NextInt64(possibleStarts));
-            for (int t = 0; t < blockSize; t++)
-            {
-                int i = b * blockSize + t;
-                x[i] = _ids[start + t];
-                y[i] = _ids[start + t + 1];
-                mask[i] = _mask?[start + t + 1] ?? 1f;
-            }
-        }
+            starts[b] = PickStart(segments, ends, _random.NextInt64(possibleStarts));
 
-        long[] shape = [batchSize, blockSize];
-        return (tensor(x, shape).to(device), tensor(y, shape).to(device), tensor(mask, shape).to(device));
+        // (batch, BlockSize + 1) : chaque extrait et le token qui le suit.
+        var index = tensor(starts, device: _device).unsqueeze(1)
+                    + arange(blockSize + 1, ScalarType.Int64, _device).unsqueeze(0);
+        var flat = index.view(-1);
+        var tokens = _ids.index_select(0, flat).view(batchSize, blockSize + 1).to(ScalarType.Int64);
+
+        var x = tokens.narrow(1, 0, blockSize).contiguous();
+        var y = tokens.narrow(1, 1, blockSize).contiguous();
+        var mask = _mask is null
+            ? ones(batchSize, blockSize, ScalarType.Float32, _device)
+            : _mask.index_select(0, index.narrow(1, 1, blockSize).reshape(-1)).view(batchSize, blockSize).to(ScalarType.Float32);
+
+        return (x.to(device), y.to(device), mask.to(device));
+    }
+
+    public void Dispose()
+    {
+        _ids.Dispose();
+        _mask?.Dispose();
+    }
+
+    // Gardé hors des DisposeScope : le tenseur vit aussi longtemps que le dataset. La copie CPU est libérée.
+    private static Tensor ToDevice(Tensor cpu, Device device)
+    {
+        if (device.type == DeviceType.CPU)
+            return cpu.DetachFromDisposeScope();
+
+        var moved = cpu.to(device).DetachFromDisposeScope();
+        cpu.Dispose();
+        return moved;
     }
 
     /// <summary>
@@ -238,7 +267,7 @@ public sealed class TextDataset
 
     private static void CheckVocabulary(BpeTokenizer tokenizer)
     {
-        if (tokenizer.VocabSize > ushort.MaxValue + 1)
-            throw new InvalidOperationException($"Vocabulaire de {tokenizer.VocabSize} tokens : TextDataset en garde au plus 65 536 (ushort).");
+        if (tokenizer.VocabSize > short.MaxValue + 1)
+            throw new InvalidOperationException($"Vocabulaire de {tokenizer.VocabSize} tokens : TextDataset en garde au plus 32 768 (int16).");
     }
 }

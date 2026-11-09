@@ -95,7 +95,7 @@ Pour entraîner plus longtemps, ou après avoir ajouté des données dans `data/
 - Un modèle sauvegardé avant cette option n'a ni `optimizer.dat` ni `training.json` : AdamW repart de zéro
   et les pas sont comptés depuis 0. Son CSV d'origine n'est pas connu : un nouveau est créé.
 
-Pendant l'entraînement, l'avancement est sauvegardé tous les 250 pas dans `bin/.../checkpoint/`
+Pendant l'entraînement, l'avancement est sauvegardé tous les 1000 pas dans `bin/.../checkpoint/`
 (`CheckpointInterval`) : poids, état de l'optimiseur, meilleurs poids. `--resume` repart de là.
 Le dossier est supprimé quand l'entraînement va jusqu'au bout.
 
@@ -105,8 +105,10 @@ Arrêt anticipé : si la loss de vérification ne s'améliore plus pendant 2000 
 L'entraînement se fait en deux phases (réglages dans `TrainingConfig.Pretraining` / `FineTuning`) :
 
 1. **Pré-entraînement** sur `data/texte.txt` (beaucoup de texte général) -> sauvegardé dans `model-pretrain/`.
-   20 000 étapes. `texte.txt` peut faire plusieurs Go : il est lu ligne par ligne, et ses tokens
-   prennent 2 octets chacun en mémoire (1,5 Go de texte -> ~460 M tokens -> ~0,9 Go de RAM, ~1 min de découpage).
+   5000 étapes. `texte.txt` peut faire plusieurs Go : il est lu ligne par ligne, et ses tokens
+   restent sur le GPU, 2 octets chacun (1,5 Go de texte -> ~460 M tokens -> ~0,9 Go de mémoire GPU).
+   Le découpage en tokens (~1 min) n'est fait qu'une fois : il est gardé dans `bin/.../cache/` et relu
+   en ~1 s tant que `texte.txt` et le tokenizer ne changent pas (même chose pour `dialogues.txt`).
 2. **Fine-tuning** sur `data/dialogues.txt` -> sauvegardé dans `model/`. 2000 étapes à 2e-4, ~2,5 passages
    sur les ~135 000 conversations (OpenAssistant, French Alpaca, French Instruct : voir DataBuilder).
    Avec de petits dialogues, l'arrêt anticipé s'arrête avant qu'il les apprenne par cœur.
@@ -140,8 +142,9 @@ Le tokenizer a quatre tokens spéciaux, jamais découpés ni fusionnés : `<|doc
 
 Le modèle (EmbedDim 512, 8 couches, 8 têtes, mémoire de 256 tokens, dropout 0,1, ~27 M paramètres) apprend
 à chaque étape sur 64 extraits, envoyés au GPU par paquets de 16 (accumulation de gradients,
-voir `BatchSize` / `EffectiveBatchSize`). Sur une RTX 3060 Ti 8 Go : ~3,2 Go de mémoire GPU (toute la carte),
-0,46 s par étape, soit ~2 h 35 de pré-entraînement. Des paquets de 32 ne vont pas plus vite.
+voir `BatchSize` / `EffectiveBatchSize`). Sur une RTX 3060 Ti 8 Go : ~3,2 Go de mémoire GPU (toute la carte)
+plus ~0,9 Go pour les tokens de `texte.txt`, 0,42 s par étape avec TF32 (~39 000 tokens/s, 0,53 s sans),
+soit ~35 min de pré-entraînement. Des paquets de 32 ne vont pas plus vite.
 La mémoire GPU utilisée s'affiche à chaque mesure de loss.
 Les modèles déjà entraînés gardent leur taille (`config.json`) : ces réglages valent pour le prochain `--train`.
 
@@ -198,7 +201,8 @@ Chaque entraînement (`--train` ou `--finetune`) laisse deux fichiers avec la m�
 
 - `<date>.txt` : les réponses aux questions de `data/questions-test.txt`, posées à la fin avec
   une température (0.7) et une graine (1234) fixes. Seul le modèle change : compare les fichiers entre eux.
-- `<date>-loss.csv` : les loss mesurées pendant l'entraînement (s'ouvre dans Excel pour tracer les courbes).
+- `<date>-loss.csv` : les loss mesurées pendant l'entraînement (s'ouvre dans Excel pour tracer les courbes),
+  avec la vitesse (`tokens_par_seconde`, entre deux mesures) et la mémoire GPU utilisée (`memoire_gpu_mo`, toute la carte).
 
 Pendant l'entraînement, une réponse d'exemple à la première question s'affiche tous les 1000 pas
 (`SampleInterval` dans `TrainingConfig`).

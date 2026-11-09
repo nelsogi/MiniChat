@@ -65,6 +65,9 @@ public sealed class Trainer
     private readonly int _accumulation;
     private long _peakGpuMb;
 
+    // Pas et temps de la mesure précédente : la vitesse (tokens/s) se calcule entre deux mesures.
+    private (int Step, TimeSpan Elapsed)? _previousReport;
+
     /// <param name="dataset">Le texte principal. La loss de vérification (et donc le meilleur modèle) se mesure dessus.</param>
     /// <param name="generalText">
     /// Texte général mélangé dans les batchs d'entraînement (part = config.GeneralTextRatio),
@@ -303,10 +306,25 @@ public sealed class Trainer
             _checkpoint.SaveBest(_model, new BestScore(val, step));
         }
 
+        var gpu = GpuMemoryNow();
         _progress.Report(new TrainingReport(step, _config.Steps, train, val, LearningRateAt(step), elapsed,
-            Remaining(step, elapsed), best, GpuMemoryNow()));
+            Remaining(step, elapsed), best, gpu));
 
-        WriteCsvLine(step, train, val, elapsed);
+        WriteCsvLine(step, train, val, elapsed, TokensPerSecond(step, elapsed), gpu?.UsedMb);
+        _previousReport = (step, elapsed);
+    }
+
+    /// <summary>
+    /// Tokens appris par seconde depuis la mesure précédente, mesures des loss et sauvegardes comprises :
+    /// la vraie vitesse de l'entraînement. null à la première mesure d'un lancement.
+    /// </summary>
+    private double? TokensPerSecond(int step, TimeSpan elapsed)
+    {
+        if (_previousReport is not { } previous || step <= previous.Step || elapsed <= previous.Elapsed)
+            return null;
+
+        long tokens = (long)(step - previous.Step) * _config.EffectiveBatchSize * _model.Config.BlockSize;
+        return tokens / (elapsed - previous.Elapsed).TotalSeconds;
     }
 
     /// <summary>Mémoire GPU utilisée / totale en Mo, null sur CPU. Retient aussi le pic.</summary>
@@ -322,19 +340,21 @@ public sealed class Trainer
     /// <summary>
     /// Ajoute une ligne au CSV des loss (s'ouvre dans Excel, ou se trace en courbe).
     /// Nombres avec un point (format international), sinon la virgule française casserait les colonnes.
+    /// tokens_par_seconde et memoire_gpu_mo (toute la carte, voir GpuMemory) : vides s'ils ne sont pas connus.
     /// </summary>
-    private void WriteCsvLine(int step, float train, float val, TimeSpan elapsed)
+    private void WriteCsvLine(int step, float train, float val, TimeSpan elapsed, double? tokensPerSecond, long? gpuMb)
     {
         if (_lossCsvPath is null) return;
 
         if (!File.Exists(_lossCsvPath))
         {
             Directory.CreateDirectory(Path.GetDirectoryName(_lossCsvPath)!);
-            File.WriteAllText(_lossCsvPath, "phase,etape,loss_entrainement,loss_verification,learning_rate,secondes\n");
+            File.WriteAllText(_lossCsvPath,
+                "phase,etape,loss_entrainement,loss_verification,learning_rate,secondes,tokens_par_seconde,memoire_gpu_mo\n");
         }
 
         File.AppendAllText(_lossCsvPath, string.Create(System.Globalization.CultureInfo.InvariantCulture,
-            $"{_phase},{step},{train:F4},{val:F4},{LearningRateAt(step):G4},{elapsed.TotalSeconds:F0}\n"));
+            $"{_phase},{step},{train:F4},{val:F4},{LearningRateAt(step):G4},{elapsed.TotalSeconds:F0},{tokensPerSecond:F0},{gpuMb}\n"));
     }
 
     /// <summary>Moyenne de la loss sur plusieurs batchs, sans apprendre (mode évaluation).</summary>

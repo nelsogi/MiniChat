@@ -45,6 +45,7 @@ public sealed class Workbench
     private readonly string _questionsPath;
     private readonly string _checkpointFolder;   // sauvegarde régulière de l'entraînement en cours (pour /resume)
     private readonly string _resultsFolder;
+    private readonly string _cacheFolder;        // tokens de texte.txt et dialogues.txt déjà découpés (voir TokenCache)
 
     // Deux sauvegardes : le modèle pré-entraîné (base pour refaire le fine-tuning) et le modèle final.
     private readonly ModelStore _pretrainStore;
@@ -69,6 +70,7 @@ public sealed class Workbench
         _questionsPath = Path.Combine(dataFolder, "questions-test.txt");
         _checkpointFolder = Path.Combine(modelsFolder, "checkpoint");
         _resultsFolder = Path.Combine(modelsFolder, "results");
+        _cacheFolder = Path.Combine(modelsFolder, "cache");
         _pretrainStore = new ModelStore(Path.Combine(modelsFolder, PretrainedModel));
         _store = new ModelStore(Path.Combine(modelsFolder, ChatModel));
     }
@@ -502,8 +504,8 @@ public sealed class Workbench
         int seed = config.Seed + (resume?.Step ?? config.FirstStep);
         manual_seed(seed);
 
-        var dataset = Messages.Spin("Lecture et découpage en tokens de texte.txt...",
-            () => TextDataset.FromFile(CheckExists(_pretrainPath), tokenizer, seed));
+        // using : les tokens sont sur le GPU (~0,9 Go), libérés à la fin de la phase.
+        using var dataset = GeneralText(tokenizer, seed);
         Messages.Info($"texte.txt : {dataset.Characters:N0} caractères -> {dataset.TrainLength + dataset.ValidationLength:N0} tokens.");
         var result = TrainPhase("Phase 1 - pré-entraînement", "pretrain", dataset, model, tokenizer, config, log,
             checkpoint, resume, optimizerPath: continuation is null ? null : store.OptimizerPath);
@@ -521,10 +523,9 @@ public sealed class Workbench
         int seed = config.Seed + (resume?.Step ?? config.FirstStep);
         manual_seed(seed);
 
-        var (dialogues, generalText) = Messages.Spin("Lecture des dialogues et de texte.txt...", () => (
-            new TextDataset(ReadDialogues(), tokenizer, seed, onlyReplies: true),
-            // Autre graine : les extraits de texte général ne suivent pas le même tirage que les dialogues.
-            TextDataset.FromFile(CheckExists(_pretrainPath), tokenizer, seed + 1)));
+        using var dialogues = Dialogues(tokenizer, seed);
+        // Autre graine : les extraits de texte général ne suivent pas le même tirage que les dialogues.
+        using var generalText = GeneralText(tokenizer, seed + 1);
 
         var result = TrainPhase($"Phase 2 - fine-tuning (loss sur les réponses IA, {config.GeneralTextRatio:P0} de texte général)",
             "finetune", dialogues, model, tokenizer, config, log, checkpoint, resume,
@@ -573,6 +574,25 @@ public sealed class Workbench
         Messages.Success(continuation is null
             ? $"Modèle sauvegardé dans '{name}'."
             : $"Meilleure : modèle remplacé dans '{name}'.");
+    }
+
+    // Les tokens de texte.txt et de dialogues.txt, relus depuis cache/ s'ils y sont pour ce fichier et ce tokenizer
+    // (voir TokenCache) : texte.txt n'est découpé qu'une fois, pas à chaque phase ni à chaque lancement.
+    private TextDataset GeneralText(BpeTokenizer tokenizer, int seed) =>
+        Dataset("texte.txt", _pretrainPath, tokenizer, seed, onlyReplies: false,
+            () => TextDataset.TokenizeFile(_pretrainPath, tokenizer));
+
+    private TextDataset Dialogues(BpeTokenizer tokenizer, int seed) =>
+        Dataset("dialogues.txt", _dialoguesPath, tokenizer, seed, onlyReplies: true,
+            () => TextDataset.Tokenize(ReadDialogues(), tokenizer, onlyReplies: true));
+
+    private TextDataset Dataset(string name, string path, BpeTokenizer tokenizer, int seed, bool onlyReplies,
+        Func<TokenizedText> tokenize)
+    {
+        var (text, fromCache) = Messages.Spin($"Lecture de {name}...",
+            () => TokenCache.Load(_cacheFolder, CheckExists(path), tokenizer, onlyReplies, tokenize));
+        Messages.Dim(fromCache ? $"{name} : tokens relus depuis cache/." : $"{name} : découpé en tokens, gardé dans cache/.");
+        return new TextDataset(text, seed, Device);
     }
 
     private TrainingResult TrainPhase(string name, string phase, TextDataset dataset, MiniGpt model, BpeTokenizer tokenizer,

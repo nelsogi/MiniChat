@@ -22,16 +22,21 @@ public sealed class TransformerBlock : Module<Tensor, Tensor>
     private readonly Module<Tensor, Tensor> _feedForward;
 
     /// <param name="rope">Rotation des positions, partagée par tous les blocs (Modern), null pour Classic.</param>
-    public TransformerBlock(ModelConfig config, Rope? rope) : base(nameof(TransformerBlock))
+    /// <param name="dropout">Taux de dropout, partagé par tout le modèle.</param>
+    public TransformerBlock(ModelConfig config, Rope? rope, DropoutRate dropout) : base(nameof(TransformerBlock))
     {
         bool modern = config.Architecture == ModelArchitecture.Modern;
         _norm1 = Norm(config);
-        _attention = new CausalSelfAttention(config, rope);
+        _attention = new CausalSelfAttention(config, rope, dropout);
         _norm2 = Norm(config);
-        _feedForward = modern ? new SwiGlu(config) : new FeedForward(config);
+        _feedForward = modern ? new SwiGlu(config, dropout) : new FeedForward(config, dropout);
 
         RegisterComponents();
     }
+
+    /// <summary>Les deux couches qui écrivent dans la connexion résiduelle : sortie de l'attention et du FeedForward.</summary>
+    public IEnumerable<TorchSharp.Modules.Linear> OutputProjections =>
+        [_attention.Output, _feedForward is SwiGlu swiGlu ? swiGlu.Output : ((FeedForward)_feedForward).Output];
 
     /// <summary>RMSNorm (Modern) ou LayerNorm (Classic).</summary>
     public static Module<Tensor, Tensor> Norm(ModelConfig config) =>

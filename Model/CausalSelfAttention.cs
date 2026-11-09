@@ -27,14 +27,13 @@ namespace MiniChat.Model
     {
         private readonly TorchSharp.Modules.Linear _qkv;
         private readonly TorchSharp.Modules.Linear _projection;
-        private readonly TorchSharp.Modules.Dropout _outputDropout;
-        private readonly double _attentionDropout;
+        private readonly DropoutRate _dropout;   // le même pour tout le modèle (voir DropoutRate)
         private readonly int _heads;
         private readonly int _headDim;
         private readonly Rope? _rope;   // Modern seulement ; la même pour toutes les couches
 
         /// <param name="rope">Rotation des positions (Modern), null pour Classic.</param>
-        public CausalSelfAttention(ModelConfig config, Rope? rope) : base(nameof(CausalSelfAttention))
+        public CausalSelfAttention(ModelConfig config, Rope? rope, DropoutRate dropout) : base(nameof(CausalSelfAttention))
         {
             if (config.EmbedDim % config.Heads != 0)
                 throw new ArgumentException("EmbedDim doit être divisible par Heads.");
@@ -46,11 +45,13 @@ namespace MiniChat.Model
             // Une seule couche calcule Q, K et V d'un coup (plus rapide que trois couches).
             _qkv = Linear(config.EmbedDim, 3 * config.EmbedDim, hasBias: false);
             _projection = Linear(config.EmbedDim, config.EmbedDim, hasBias: rope is null);
-            _attentionDropout = config.Dropout;
-            _outputDropout = Dropout(config.Dropout);
+            _dropout = dropout;
 
             RegisterComponents();
         }
+
+        /// <summary>La projection de sortie : elle écrit dans la connexion résiduelle (voir MiniGpt, initialisation).</summary>
+        public TorchSharp.Modules.Linear Output => _projection;
 
         /// <param name="x">Forme (batch, temps, EmbedDim).</param>
         public override Tensor forward(Tensor x) => Forward(x, cache: null, layer: 0);
@@ -100,7 +101,7 @@ namespace MiniChat.Model
             //   poids   = dropout(softmax(scores))          des pourcentages qui somment à 1
             //   sortie  = poids · V                         moyenne pondérée des Values
             // Arguments par position : dans TorchSharp, le paramètre "causal" s'appelle is_casual (faute de frappe).
-            double dropout = training ? _attentionDropout : 0.0;   // pas de dropout en génération
+            double dropout = training ? _dropout.Value : 0.0;   // pas de dropout en génération
             var attention = functional.scaled_dot_product_attention(q, k, v, mask, dropout, causal);
 
             // On recolle les têtes ensemble.
@@ -108,7 +109,7 @@ namespace MiniChat.Model
                 .transpose(1, 2).contiguous()             // (batch, temps, têtes, headDim)
                 .view(batch, time, channels);             // (batch, temps, EmbedDim)
 
-            return _outputDropout.forward(_projection.forward(output));
+            return _dropout.Apply(_projection.forward(output), training);
         }
 
         private Tensor SplitHeads(Tensor t, long batch, long time) =>

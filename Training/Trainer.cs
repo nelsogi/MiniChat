@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using System.Globalization;
 using MiniChat.Config;
 using MiniChat.Data;
 using MiniChat.Model;
@@ -22,19 +23,22 @@ public sealed record TrainingResult(float StartValLoss, float BestValLoss, int B
 
 /// <summary>
 /// La boucle d'apprentissage. À chaque étape :
-///   1. le modèle prédit le caractère suivant pour chaque position,
+///   1. le modèle prédit le token suivant pour chaque position,
 ///   2. on mesure son erreur (la "loss", cross-entropy),
 ///   3. backward() calcule comment chaque poids a contribué à l'erreur,
 ///   4. l'optimiseur AdamW ajuste un peu chaque poids pour réduire l'erreur.
 ///
 /// En plus :
-///   - la vitesse d'apprentissage suit un warmup puis une descente en cosinus,
+///   - la vitesse d'apprentissage suit un warmup puis une descente en cosinus jusqu'au dernier pas prévu,
+///   - la loss de vérification se mesure toujours sur les mêmes extraits (voir TextDataset.FixedValidation),
 ///   - on garde une copie des poids quand la loss de vérification est la plus basse (sur disque,
 ///     checkpoint/best.dat), et on la remet dans le modèle à la fin (le modèle sauvegardé = le meilleur vu),
 ///   - l'avancement est sauvegardé régulièrement pour pouvoir reprendre (voir Checkpoint, --resume),
 ///   - arrêt anticipé si la loss de vérification ne s'améliore plus (voir EarlyStoppingPatience),
-///   - la loss ne compte que les caractères dont le masque vaut 1 (voir TextDataset),
+///     mais jamais avant EarlyStoppingMinEpochs passages sur les données,
+///   - la loss ne compte que les tokens dont le masque vaut 1 (voir TextDataset),
 ///   - on peut mélanger un peu de texte général dans chaque batch (voir GeneralTextRatio),
+///   - dropout et betas d'AdamW propres à la phase (voir TrainingConfig.Dropout, Beta1, Beta2),
 ///   - weight decay sur les matrices, et gradient clipping (voir WeightDecay, GradClip),
 ///   - accumulation de gradients : plusieurs petits batchs par étape (voir EffectiveBatchSize).
 /// </summary>
@@ -113,6 +117,7 @@ public sealed class Trainer
     public TrainingResult Train(CheckpointState? resume = null, string? optimizerPath = null,
         CancellationToken cancellation = default)
     {
+        _model.DropoutRate.Value = _config.Dropout ?? _model.Config.Dropout;
         var optimizer = CreateOptimizer();
         var clock = Stopwatch.StartNew();
         _model.train();
@@ -120,7 +125,7 @@ public sealed class Trainer
 
         if (resume is not null)
         {
-            _checkpoint.LoadOptimizer(optimizer);
+            optimizer = LoadOptimizer(optimizer, _checkpoint.LoadOptimizer);
             _startStep = resume.Step;
             _startValLoss = resume.StartValLoss;
             if (_checkpoint.ReadBest() is { } best)
@@ -130,18 +135,17 @@ public sealed class Trainer
         else if (optimizerPath is not null)
         {
             if (File.Exists(optimizerPath))
-            {
-                optimizer.load_state_dict(optimizerPath);
-                _progress.Log("État de l'optimiseur (AdamW) rechargé.");
-            }
+                optimizer = LoadOptimizer(optimizer, o => o.load_state_dict(optimizerPath));
             else
-            {
                 _progress.Log("Pas d'état d'optimiseur sauvegardé avec ce modèle : AdamW repart de zéro.");
-            }
         }
 
         _progress.Log($"Batch : {_config.BatchSize} x {_accumulation} = {_config.EffectiveBatchSize} extraits " +
                       $"de {_model.Config.BlockSize} tokens par étape.");
+        _progress.Log(string.Create(CultureInfo.CurrentCulture,
+            $"{_config.Steps - _config.FirstStep:N0} étapes = {EpochsAt(_config.Steps) - EpochsAt(_config.FirstStep):F2} passage(s) " +
+            $"sur {_dataset.TrainLength:N0} tokens d'entraînement · dropout {_model.DropoutRate.Value:0.##} · " +
+            $"AdamW betas ({_config.Beta1:0.###} ; {_config.Beta2:0.###}) · vérification : {_config.ValidationExtracts} extraits fixes."));
 
         int lastStep = _startStep;
         for (int step = _startStep; step <= _config.Steps; step++)
@@ -158,10 +162,12 @@ public sealed class Trainer
                 Report(step, clock.Elapsed);
 
                 // Arrêt anticipé : plus de progrès depuis trop longtemps, continuer ne sert à rien.
-                if (_config.EarlyStoppingPatience > 0 && step - _bestStep >= _config.EarlyStoppingPatience)
+                // Pas avant EarlyStoppingMinEpochs passages : jusque-là, chaque extrait est du texte neuf.
+                if (_config.EarlyStoppingPatience > 0 && step - _bestStep >= _config.EarlyStoppingPatience
+                    && EpochsAt(step) >= _config.EarlyStoppingMinEpochs)
                 {
-                    _progress.Log($"Arrêt anticipé au pas {step} : pas d'amélioration de la loss de vérification " +
-                                  $"depuis {step - _bestStep} pas (meilleure au pas {_bestStep}).");
+                    _progress.Log($"Arrêt anticipé au pas {step} ({EpochsAt(step):F2} passages) : pas d'amélioration " +
+                                  $"de la loss de vérification depuis {step - _bestStep} pas (meilleure au pas {_bestStep}).");
                     break;
                 }
             }
@@ -176,12 +182,12 @@ public sealed class Trainer
                 _progress.Log($"Arrêt demandé au pas {step} : mesure des loss et sauvegarde...");
                 if (!measured)
                     Report(step, clock.Elapsed);
-                _checkpoint.SaveProgress(_model, optimizer, new CheckpointState(_phase, step, _checkpoint.RunId, _startValLoss));
+                _checkpoint.SaveProgress(_model, optimizer, State(step));
                 break;
             }
 
             if (step % _config.CheckpointInterval == 0)
-                _checkpoint.SaveProgress(_model, optimizer, new CheckpointState(_phase, step, _checkpoint.RunId, _startValLoss));
+                _checkpoint.SaveProgress(_model, optimizer, State(step));
 
             if (_showSample is not null && step > 0 && step % _config.SampleInterval == 0)
             {
@@ -222,28 +228,62 @@ public sealed class Trainer
         return new TrainingResult(_startValLoss ?? _bestValLoss, _bestValLoss, _bestStep, lastStep, optimizerState);
     }
 
+    // Steps est gardé : une reprise finit la phase là où elle était prévue (même cosinus), même si les données ont changé.
+    private CheckpointState State(int step) => new(_phase, step, _checkpoint.RunId, _startValLoss, _config.Steps);
+
     /// <summary>
-    /// AdamW avec weight decay seulement sur les matrices (poids des couches, embeddings).
-    /// Les biais et les LayerNorm (vecteurs, 1 dimension) n'en ont pas : les tirer vers 0 n'aide pas,
-    /// et un LayerNorm à 0 éteindrait sa couche. C'est le réglage de GPT-2 / nanoGPT.
+    /// AdamW, deux groupes :
+    ///   1. avec weight decay : les matrices des couches, et l'embedding si EmbeddingWeightDecay,
+    ///   2. sans : les vecteurs (poids des normalisations, biais) et, au pré-entraînement, l'embedding.
+    /// Un RMSNorm/LayerNorm tiré vers 0 éteindrait sa couche ; l'embedding, voir EmbeddingWeightDecay.
     /// </summary>
     private TorchSharp.Modules.AdamW CreateOptimizer()
     {
-        var parameters = _model.parameters().ToList();
-        var matrices = parameters.Where(p => p.dim() >= 2);
-        var vectors = parameters.Where(p => p.dim() < 2);
+        var parameters = _model.named_parameters().ToList();
+        bool Decayed(string name, Tensor p) =>
+            p.dim() >= 2 && (_config.EmbeddingWeightDecay || !name.Contains("Embedding", StringComparison.Ordinal));
+
+        var decayed = parameters.Where(p => Decayed(p.name, p.parameter)).Select(p => p.parameter);
+        var others = parameters.Where(p => !Decayed(p.name, p.parameter)).Select(p => p.parameter);
 
         return optim.AdamW(new[]
         {
-            new TorchSharp.Modules.AdamW.ParamGroup(matrices, weight_decay: _config.WeightDecay),
-            new TorchSharp.Modules.AdamW.ParamGroup(vectors, weight_decay: 0),
+            new TorchSharp.Modules.AdamW.ParamGroup(decayed, _config.LearningRate, _config.Beta1, _config.Beta2, weight_decay: _config.WeightDecay),
+            new TorchSharp.Modules.AdamW.ParamGroup(others, _config.LearningRate, _config.Beta1, _config.Beta2, weight_decay: 0),
         }, lr: _config.LearningRate);
     }
 
     /// <summary>
-    /// Warmup puis cosinus :
+    /// Recharge un état d'AdamW sauvegardé (moyennes des gradients), puis remet les réglages de cette phase :
+    /// load_state_dict remet aussi les betas et le weight decay du fichier. Un état fait avec d'autres groupes
+    /// (avant EmbeddingWeightDecay, ou par l'autre phase) ne correspond pas aux paramètres : AdamW repart de zéro.
+    /// </summary>
+    private TorchSharp.Modules.AdamW LoadOptimizer(TorchSharp.Modules.AdamW optimizer, Action<TorchSharp.Modules.AdamW> load)
+    {
+        try
+        {
+            load(optimizer);
+        }
+        catch (ArgumentException)
+        {
+            _progress.Log("État d'AdamW sauvegardé avec d'autres groupes de paramètres (format d'avant) : AdamW repart de zéro.");
+            return CreateOptimizer();   // celui-ci a pu être rechargé à moitié
+        }
+
+        var groups = optimizer.ParamGroups.Cast<TorchSharp.Modules.AdamW.ParamGroup>().ToArray();
+        for (int i = 0; i < groups.Length; i++)
+        {
+            groups[i].Betas = (_config.Beta1, _config.Beta2);
+            ((TorchSharp.Modules.AdamW.Options)groups[i].Options).weight_decay = i == 0 ? _config.WeightDecay : 0;
+        }
+        _progress.Log("État de l'optimiseur (AdamW) rechargé.");
+        return optimizer;
+    }
+
+    /// <summary>
+    /// Warmup puis cosinus, de FirstStep à Steps (le dernier pas prévu) :
     ///   - pendant WarmupSteps, la vitesse monte en ligne droite de 0 à LearningRate,
-    ///   - ensuite elle descend doucement en suivant une demi-courbe cosinus jusqu'à MinLearningRate.
+    ///   - ensuite elle descend doucement en suivant une demi-courbe cosinus, jusqu'à MinLearningRate au pas Steps.
     /// Grands pas au début pour avancer vite, petits pas à la fin pour affiner.
     /// </summary>
     private double LearningRateAt(int step)
@@ -260,13 +300,20 @@ public sealed class Trainer
     }
 
     /// <summary>
+    /// Passages faits sur le texte principal au pas step, comptés depuis le pas 0 (une continuation garde ceux d'avant) :
+    /// tokens lus / tokens d'entraînement. 1 = chaque token vu une fois en moyenne.
+    /// </summary>
+    private double EpochsAt(int step) =>
+        (double)step * _config.MainTokensPerStep(_model.Config.BlockSize) / Math.Max(1, _dataset.TrainLength);
+
+    /// <summary>
     /// Un (petit) batch d'entraînement. Exemple avec BatchSize 16 et GeneralTextRatio 0.2 :
     /// 13 extraits du texte principal + 3 extraits du texte général, empilés ensemble.
     /// </summary>
     private (Tensor X, Tensor Y, Tensor Mask) GetTrainingBatch()
     {
         int blockSize = _model.Config.BlockSize;
-        int general = _generalText is null ? 0 : (int)Math.Round(_config.BatchSize * _config.GeneralTextRatio);
+        int general = _generalText is null ? 0 : _config.GeneralExtracts;
 
         var main = _dataset.GetBatch(validation: false, _config.BatchSize - general, blockSize, _device);
         if (general == 0)
@@ -277,26 +324,33 @@ public sealed class Trainer
     }
 
     /// <summary>
-    /// Cross-entropy moyenne, mais seulement sur les caractères dont le masque vaut 1.
+    /// Cross-entropy moyenne, mais seulement sur les tokens dont le masque vaut 1.
     /// Masque partout à 1 = la cross-entropy classique.
     /// </summary>
     private Tensor ComputeLoss(Tensor x, Tensor y, Tensor mask)
     {
+        var (sum, weight) = LossSum(x, y, mask);
+
+        // clamp : un extrait peut tomber entièrement dans des questions (aucun token noté).
+        return sum / weight.clamp_min(1);
+    }
+
+    /// <summary>Somme des erreurs des tokens notés, et nombre de tokens notés (somme du masque).</summary>
+    private (Tensor Sum, Tensor Weight) LossSum(Tensor x, Tensor y, Tensor mask)
+    {
         var logits = _model.forward(x);                       // (batch, temps, vocab)
         int vocab = _model.Config.VocabSize;
 
-        // Une erreur par caractère (pas encore de moyenne), puis on éteint ceux qui ne comptent pas.
-        var perChar = functional.cross_entropy(logits.view(-1, vocab), y.view(-1), reduction: Reduction.None);
+        // Une erreur par token (pas encore de moyenne), puis on éteint ceux qui ne comptent pas.
+        var perToken = functional.cross_entropy(logits.view(-1, vocab), y.view(-1), reduction: Reduction.None);
         var weights = mask.view(-1);
-
-        // clamp : un extrait peut tomber entièrement dans des lignes "Toi:" (aucun caractère noté).
-        return (perChar * weights).sum() / weights.sum().clamp_min(1);
+        return ((perToken * weights).sum(), weights.sum());
     }
 
     private void Report(int step, TimeSpan elapsed)
     {
-        float train = EstimateLoss(validation: false);
-        float val = EstimateLoss(validation: true);
+        float train = TrainLossEstimate();
+        float val = ValidationLoss();
         _startValLoss ??= val;
 
         bool best = val < _bestValLoss;
@@ -307,10 +361,11 @@ public sealed class Trainer
         }
 
         var gpu = GpuMemoryNow();
+        double epochs = EpochsAt(step);
         _progress.Report(new TrainingReport(step, _config.Steps, train, val, LearningRateAt(step), elapsed,
-            Remaining(step, elapsed), best, gpu));
+            Remaining(step, elapsed), best, gpu, epochs));
 
-        WriteCsvLine(step, train, val, elapsed, TokensPerSecond(step, elapsed), gpu?.UsedMb);
+        WriteCsvLine(step, train, val, elapsed, TokensPerSecond(step, elapsed), gpu?.UsedMb, epochs);
         _previousReport = (step, elapsed);
     }
 
@@ -342,7 +397,8 @@ public sealed class Trainer
     /// Nombres avec un point (format international), sinon la virgule française casserait les colonnes.
     /// tokens_par_seconde et memoire_gpu_mo (toute la carte, voir GpuMemory) : vides s'ils ne sont pas connus.
     /// </summary>
-    private void WriteCsvLine(int step, float train, float val, TimeSpan elapsed, double? tokensPerSecond, long? gpuMb)
+    private void WriteCsvLine(int step, float train, float val, TimeSpan elapsed, double? tokensPerSecond, long? gpuMb,
+        double epochs)
     {
         if (_lossCsvPath is null) return;
 
@@ -350,15 +406,18 @@ public sealed class Trainer
         {
             Directory.CreateDirectory(Path.GetDirectoryName(_lossCsvPath)!);
             File.WriteAllText(_lossCsvPath,
-                "phase,etape,loss_entrainement,loss_verification,learning_rate,secondes,tokens_par_seconde,memoire_gpu_mo\n");
+                "phase,etape,loss_entrainement,loss_verification,learning_rate,secondes,tokens_par_seconde,memoire_gpu_mo,passages\n");
         }
 
-        File.AppendAllText(_lossCsvPath, string.Create(System.Globalization.CultureInfo.InvariantCulture,
-            $"{_phase},{step},{train:F4},{val:F4},{LearningRateAt(step):G4},{elapsed.TotalSeconds:F0},{tokensPerSecond:F0},{gpuMb}\n"));
+        File.AppendAllText(_lossCsvPath, string.Create(CultureInfo.InvariantCulture,
+            $"{_phase},{step},{train:F4},{val:F4},{LearningRateAt(step):G4},{elapsed.TotalSeconds:F0},{tokensPerSecond:F0},{gpuMb},{epochs:F3}\n"));
     }
 
-    /// <summary>Moyenne de la loss sur plusieurs batchs, sans apprendre (mode évaluation).</summary>
-    private float EstimateLoss(bool validation)
+    /// <summary>
+    /// Loss d'entraînement affichée : moyenne sur EvalBatches batchs tirés au hasard, sans apprendre (mode évaluation).
+    /// Sans le texte général du fine-tuning : comparable à la loss de vérification.
+    /// </summary>
+    private float TrainLossEstimate()
     {
         _model.eval();
         using var noGrad = no_grad();
@@ -369,12 +428,36 @@ public sealed class Trainer
             // Un scope par batch : TorchSharp ne libère un tenseur qu'à la fin de son scope. Avec un seul
             // scope pour toute la boucle, les activations des EvalBatches passes s'empilaient sur le GPU.
             using var scope = NewDisposeScope();
-            var (x, y, mask) = _dataset.GetBatch(validation, _config.BatchSize, _model.Config.BlockSize, _device);
+            var (x, y, mask) = _dataset.GetBatch(validation: false, _config.BatchSize, _model.Config.BlockSize, _device);
             total += ComputeLoss(x, y, mask).item<float>();
         }
 
         _model.train();
         return total / _config.EvalBatches;
+    }
+
+    /// <summary>
+    /// Loss de vérification : sur les ValidationExtracts extraits fixes (toujours les mêmes), passés par paquets
+    /// de BatchSize. Moyenne sur tous les tokens notés de l'ensemble, pas moyenne des moyennes des paquets.
+    /// </summary>
+    private float ValidationLoss()
+    {
+        _model.eval();
+        using var noGrad = no_grad();
+
+        var (x, y, mask) = _dataset.FixedValidation(_config.ValidationExtracts, _model.Config.BlockSize);
+        double sum = 0, weight = 0;
+        for (int start = 0; start < _config.ValidationExtracts; start += _config.BatchSize)
+        {
+            using var scope = NewDisposeScope();
+            int count = Math.Min(_config.BatchSize, _config.ValidationExtracts - start);
+            var (batchSum, batchWeight) = LossSum(x.narrow(0, start, count), y.narrow(0, start, count), mask.narrow(0, start, count));
+            sum += batchSum.item<float>();
+            weight += batchWeight.item<float>();
+        }
+
+        _model.train();
+        return (float)(sum / Math.Max(1, weight));
     }
 
     /// <summary>Temps restant estimé : durée moyenne d'une étape depuis le lancement x étapes restantes.</summary>

@@ -4,9 +4,10 @@ namespace MiniChat.Training;
 /// Une mesure de loss pendant l'entraînement (tous les EvalInterval pas).
 /// Remaining = temps restant estimé, null au premier pas (rien pour l'estimer encore).
 /// IsBest = meilleure loss de vérification vue jusqu'ici : ces poids sont gardés.
+/// Epochs = passages faits sur les données d'entraînement (1 = chaque token vu une fois en moyenne).
 /// </summary>
 public sealed record TrainingReport(int Step, int LastStep, float TrainLoss, float ValLoss, double LearningRate,
-    TimeSpan Elapsed, TimeSpan? Remaining, bool IsBest, (long UsedMb, long TotalMb)? Gpu);
+    TimeSpan Elapsed, TimeSpan? Remaining, bool IsBest, (long UsedMb, long TotalMb)? Gpu, double Epochs);
 
 /// <summary>
 /// Ce que le Trainer montre pendant qu'il tourne. Il ne sait pas comment c'est affiché :

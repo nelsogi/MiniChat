@@ -73,7 +73,7 @@ public sealed class TrainingProgressView : ITrainingProgress
             $"[{Theme.Dim}]  pas {report.Step,6:N0}/{report.LastStep:N0} │[/] " +
             $"entraînement [{Theme.TrainLoss}]{report.TrainLoss:F3}[/] [{Theme.Dim}]│[/] " +
             $"vérification [{Theme.ValLoss}]{report.ValLoss:F3}[/] " +
-            $"[{Theme.Dim}]│ lr {Number(report.LearningRate)}{gpu} │ {Messages.Duration(report.Elapsed)}[/]{best}");
+            $"[{Theme.Dim}]│ passages {report.Epochs:0.00} │ lr {Number(report.LearningRate)}{gpu} │ {Messages.Duration(report.Elapsed)}[/]{best}");
         Advance(report.Step, report.LearningRate, report.Remaining);
     }
 

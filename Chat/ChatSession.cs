@@ -14,10 +14,12 @@ namespace MiniChat.Chat;
 ///
 /// Le prompt envoyé au modèle :
 ///     &lt;|doc|&gt;                                     <- une conversation commence
-///     &lt;|assistant|&gt;Je suis MiniChat, ...&lt;|end|&gt;    <- l'identité, toujours en premier
 ///     &lt;|user|&gt;...&lt;|end|&gt;&lt;|assistant|&gt;...&lt;|end|&gt;    <- les derniers tours COMPLETS qui tiennent en mémoire
 ///     &lt;|user|&gt;{message}&lt;|end|&gt;                    <- la question
 ///     &lt;|assistant|&gt;                               <- le modèle continue ici
+///
+/// Le modèle sait qui il est (MiniChat) par le fine-tuning : data/identite.txt est mélangé aux dialogues.
+/// Rien n'est ajouté au prompt : toute la mémoire (BlockSize tokens) reste pour la conversation.
 ///
 /// À l'écran et dans les fichiers (questions de test, /save-chat), les messages gardent les noms Toi et IA.
 /// </summary>
@@ -27,10 +29,8 @@ public sealed class ChatSession
     public const string UserPrefix = "Toi: ";
     public const string BotPrefix = "IA: ";
 
-    /// <summary>Phrase d'identité placée au début de chaque conversation : le modèle "sait" qui il est.</summary>
-    public const string IdentityText = "Je suis MiniChat, un assistant qui répond en français.";
-
-    private static readonly string Identity = BpeTokenizer.DocToken + ChatFormat.Assistant(IdentityText);
+    // Début de chaque prompt : une conversation commence, comme chaque conversation du fine-tuning.
+    private const string Start = BpeTokenizer.DocToken;
 
     private readonly TextGenerator _generator;
     private readonly HashSet<long> _stopTokens;   // tous les tokens spéciaux : <|end|>, et les autres par sécurité
@@ -86,7 +86,7 @@ public sealed class ChatSession
         return reply;
     }
 
-    /// <summary>Oublie la conversation (le modèle, lui, ne change pas). L'identité reste.</summary>
+    /// <summary>Oublie la conversation (le modèle, lui, ne change pas).</summary>
     public void Reset()
     {
         _turns.Clear();
@@ -102,11 +102,11 @@ public sealed class ChatSession
     /// <summary>Les tours de la conversation, en texte simple (commande /save-chat).</summary>
     public IReadOnlyList<(string User, string Reply)> Turns => _turns;
 
-    /// <summary>Combien de ces tours tenaient dans le dernier prompt, en plus de l'identité (commande /info).</summary>
+    /// <summary>Combien de ces tours tenaient dans le dernier prompt (commande /info).</summary>
     public int TurnsInLastPrompt => _turnsInLastPrompt;
 
     /// <summary>
-    /// Identité + les tours les plus récents qui tiennent + la question.
+    /// &lt;|doc|&gt; + les tours les plus récents qui tiennent + la question.
     /// Le modèle ne voit que BlockSize tokens, et il faut laisser MaxReplyTokens pour sa réponse :
     /// on remonte les tours du plus récent au plus ancien, et on s'arrête au premier qui ne tient plus.
     /// Chaque morceau commence et finit par un token spécial, jamais fusionné avec ses voisins :
@@ -115,7 +115,7 @@ public sealed class ChatSession
     private string BuildPrompt(string question)
     {
         int budget = _generator.Model.Config.BlockSize - MaxReplyTokens
-                     - _generator.CountTokens(Identity) - _generator.CountTokens(question);
+                     - _generator.CountTokens(Start) - _generator.CountTokens(question);
 
         int first = _turns.Count;
         while (first > 0)
@@ -128,6 +128,6 @@ public sealed class ChatSession
         }
 
         _turnsInLastPrompt = _turns.Count - first;
-        return Identity + string.Concat(_turns.Skip(first).Select(t => ChatFormat.Turn(t.User, t.Reply))) + question;
+        return Start + string.Concat(_turns.Skip(first).Select(t => ChatFormat.Turn(t.User, t.Reply))) + question;
     }
 }

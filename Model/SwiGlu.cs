@@ -15,18 +15,21 @@ public sealed class SwiGlu : Module<Tensor, Tensor>
     private readonly TorchSharp.Modules.Linear _gate;
     private readonly TorchSharp.Modules.Linear _up;
     private readonly TorchSharp.Modules.Linear _down;
-    private readonly TorchSharp.Modules.Dropout _dropout;
+    private readonly DropoutRate _dropout;   // le même pour tout le modèle (voir DropoutRate)
 
-    public SwiGlu(ModelConfig config) : base(nameof(SwiGlu))
+    public SwiGlu(ModelConfig config, DropoutRate dropout) : base(nameof(SwiGlu))
     {
         _gate = Linear(config.EmbedDim, config.SwiGluHidden, hasBias: false);
         _up = Linear(config.EmbedDim, config.SwiGluHidden, hasBias: false);
         _down = Linear(config.SwiGluHidden, config.EmbedDim, hasBias: false);
-        _dropout = Dropout(config.Dropout);
+        _dropout = dropout;
 
         RegisterComponents();
     }
 
+    /// <summary>La projection de sortie : elle écrit dans la connexion résiduelle (voir MiniGpt, initialisation).</summary>
+    public TorchSharp.Modules.Linear Output => _down;
+
     public override Tensor forward(Tensor x) =>
-        _dropout.forward(_down.forward(functional.silu(_gate.forward(x)) * _up.forward(x)));
+        _dropout.Apply(_down.forward(functional.silu(_gate.forward(x)) * _up.forward(x)), training);
 }

@@ -62,4 +62,19 @@ public sealed class CommandContext
         double.TryParse(text.Replace(',', '.'), NumberStyles.Float, CultureInfo.InvariantCulture, out double value)
             ? value
             : throw new UserException($"« {text} » n'est pas un nombre. Utilisation : {usage}");
+
+    /// <summary>
+    /// L'option "--epochs 1,5" de /train et /finetune : nombre de passages sur les données (le nombre de pas en est
+    /// calculé). null si l'option n'est pas là : passages par défaut de la phase (voir TrainingConfig.Epochs).
+    /// </summary>
+    public static double? ParseEpochs(string[] args, string usage)
+    {
+        if (args.Length == 0)
+            return null;
+        if (args.Length != 2 || !args[0].Equals("--epochs", StringComparison.OrdinalIgnoreCase))
+            throw new UserException($"Option inconnue. Utilisation : {usage}");
+
+        double epochs = ParseNumber(args[1], usage);
+        return epochs > 0 ? epochs : throw new UserException("--epochs attend un nombre positif de passages, par exemple : --epochs 1,1");
+    }
 }

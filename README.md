@@ -16,8 +16,8 @@ Au lancement, un cadre d'accueil affiche le modèle chargé (taille), GPU ou CPU
 | Commande                                    | Ce qu'elle fait |
 |---------------------------------------------|-----------------|
 | `/help`                                     | La liste des commandes |
-| `/train`                                    | Nouveau modèle : pré-entraînement + fine-tuning |
-| `/finetune`                                 | Refait seulement le fine-tuning, depuis `model-pretrain/` |
+| `/train [--epochs 1,1]`                     | Nouveau modèle : pré-entraînement + fine-tuning (longueur en passages sur `texte.txt`) |
+| `/finetune [--epochs 2,5]`                  | Refait seulement le fine-tuning, depuis `model-pretrain/` (passages sur les dialogues) |
 | `/continue <étapes> [finetune] [--lr 3e-4]` | Entraîne plus longtemps un modèle existant (voir plus bas) |
 | `/resume`                                   | Reprend un entraînement interrompu |
 | `/test`                                     | Questions de test sur le modèle chargé (réponses dans `results/<date>-test.txt`) |
@@ -69,6 +69,7 @@ Les options en ligne de commande marchent toujours : elles lancent la commande q
 
 ```bash
 dotnet run -- --train      # refait tout : pré-entraînement + fine-tuning
+dotnet run -- --train --epochs 0.5       # pré-entraînement plus court : un demi-passage sur texte.txt
 dotnet run -- --finetune   # refait seulement le fine-tuning, depuis model-pretrain/
 dotnet run -- --resume     # reprend un entraînement interrompu (coupure, plantage, Ctrl+C)
 dotnet run -- --continue 2000            # 2000 pas de pré-entraînement en plus, depuis model-pretrain/
@@ -83,9 +84,12 @@ Pour entraîner plus longtemps, ou après avoir ajouté des données dans `data/
 - Le modèle repart de ses poids **et** de l'état d'AdamW, sauvegardés avec lui (`optimizer.dat`), et les pas
   continuent sa numérotation (`training.json`) : `--continue 2000` sur un modèle arrêté au pas 9000 va de 9000 à 11000.
 - Le tokenizer n'est jamais réentraîné : le modèle garde le sien, les caractères qu'il ne connaît pas sont ignorés.
-- Nouveau warmup court (200 pas, moitié des pas si tu en demandes moins de 400), puis cosinus depuis une vitesse
-  plus basse : 3e-4 en pré-entraînement, 2e-4 en fine-tuning.
-  `--lr` change ce départ ; la fin du cosinus est toujours dix fois plus bas.
+- La continuation a sa propre courbe complète sur exactement le nombre de pas demandé : warmup court
+  (200 pas, moitié des pas si tu en demandes moins de 400), puis cosinus jusqu'au dernier pas demandé,
+  depuis une vitesse plus basse : 3e-4 en pré-entraînement, 2e-4 en fine-tuning.
+  `--lr` change ce départ ; la fin du cosinus est toujours dix fois plus bas (LR/10 au dernier pas).
+- Le dropout, les betas d'AdamW et le weight decay sont ceux de la phase (voir plus bas). Un `optimizer.dat`
+  sauvegardé avant le weight decay séparé de l'embedding n'a pas les mêmes groupes : AdamW repart de zéro (message).
 - Le modèle sauvegardé n'est remplacé que si la loss de vérification est meilleure. L'ancienne est mesurée au
   premier pas, sur les données actuelles (comparaison juste même si elles ont changé) ; les deux sont affichées.
 - Les loss s'ajoutent au CSV de l'entraînement d'origine (`results/<date>-loss.csv`). Les réponses aux
@@ -99,21 +103,45 @@ Pendant l'entraînement, l'avancement est sauvegardé tous les 1000 pas dans `bi
 (`CheckpointInterval`) : poids, état de l'optimiseur, meilleurs poids. `--resume` repart de là.
 Le dossier est supprimé quand l'entraînement va jusqu'au bout.
 
-Arrêt anticipé : si la loss de vérification ne s'améliore plus pendant 2000 pas (300 en fine-tuning)
-(`EarlyStoppingPatience`, 0 = jamais), la phase s'arrête et garde le meilleur modèle.
+Vérification : la loss de vérification est mesurée sur 200 extraits fixes de la partie vérification
+(`ValidationExtracts`), tirés une fois avec une graine fixe : toujours les mêmes, à chaque mesure, reprise ou
+continuation. Deux mesures ne diffèrent que parce que le modèle a changé (avant, 20 batchs tirés au hasard
+faisaient bouger la loss de ±0,05 à modèle égal). Mesure tous les 500 pas en pré-entraînement, 50 en fine-tuning
+(`EvalInterval`).
 
-L'entraînement se fait en deux phases (réglages dans `TrainingConfig.Pretraining` / `FineTuning`) :
+Arrêt anticipé : si la loss de vérification ne s'améliore plus pendant 2000 pas (300 en fine-tuning)
+(`EarlyStoppingPatience`, 0 = jamais), la phase s'arrête et garde le meilleur modèle. En pré-entraînement,
+jamais avant un passage complet sur les données (`EarlyStoppingMinEpochs`) : avant, chaque extrait est du texte
+neuf. Le nombre de passages faits s'affiche à chaque mesure (et dans la colonne `passages` du CSV).
+
+L'entraînement se fait en deux phases (réglages dans `TrainingConfig.Pretraining` / `FineTuning`).
+Leur longueur se donne en passages sur les données (`Epochs`, option `--epochs`) : le nombre de pas en est
+calculé une fois les données découpées, et le cosinus du learning rate va toujours jusqu'au dernier pas prévu.
 
 1. **Pré-entraînement** sur `data/texte.txt` (beaucoup de texte général) -> sauvegardé dans `model-pretrain/`.
-   5000 étapes. `texte.txt` peut faire plusieurs Go : il est lu ligne par ligne, et ses tokens
+   1,1 passage : ~27 700 étapes pour les ~413 M tokens d'entraînement de `texte.txt`, ~3 h 15.
+   Dropout 0 (le modèle ne revoit presque jamais le même texte), AdamW betas (0,9 ; 0,95), weight decay 0,1
+   sur les matrices des couches mais pas sur l'embedding des tokens.
+   `texte.txt` peut faire plusieurs Go : il est lu ligne par ligne, et ses tokens
    restent sur le GPU, 2 octets chacun (1,5 Go de texte -> ~460 M tokens -> ~0,9 Go de mémoire GPU).
    Le découpage en tokens (~1 min) n'est fait qu'une fois : il est gardé dans `bin/.../cache/` et relu
    en ~1 s tant que `texte.txt` et le tokenizer ne changent pas (même chose pour `dialogues.txt`).
-2. **Fine-tuning** sur `data/dialogues.txt` -> sauvegardé dans `model/`. 2000 étapes à 2e-4, ~2,5 passages
-   sur les ~135 000 conversations (OpenAssistant, French Alpaca, French Instruct : voir DataBuilder).
+2. **Fine-tuning** sur `data/dialogues.txt` et `data/identite.txt` -> sauvegardé dans `model/`. 2,5 passages
+   (~1 900 étapes, ~14 min) à 2e-4 sur les ~135 000 conversations (OpenAssistant, French Alpaca, French Instruct :
+   voir DataBuilder). Dropout 0,1 (`ModelConfig.Dropout`), betas (0,9 ; 0,999), weight decay aussi sur l'embedding.
    Avec de petits dialogues, l'arrêt anticipé s'arrête avant qu'il les apprenne par cœur.
 
-Le tokenizer BPE (4000 tokens, `TokenizerVocabSize` dans `Program.cs`) est entraîné au début
+Identité : `data/identite.txt` contient 50 conversations sur qui est MiniChat (nom, ce qu'il sait faire, ses
+limites), au même format que `dialogues.txt`. Chacune est glissée 10 fois parmi les dialogues, à des places
+tirées au hasard (`IdentityRepeats` dans `Workbench`) : ~0,3 % des dialogues. Le chat n'ajoute plus de phrase
+d'identité au début de chaque conversation : toute la mémoire du modèle reste pour la discussion. Après avoir
+modifié `identite.txt`, refais `/finetune`.
+
+Initialisation d'un nouveau modèle (comme GPT-2) : embeddings et couches `Linear` selon N(0 ; 0,02), biais à 0,
+et les deux projections qui écrivent dans la connexion résiduelle (sortie de l'attention et du SwiGLU) selon
+N(0 ; 0,02/√(2 × Layers)), pour que la somme des 2 × Layers corrections ne grandisse pas avec la profondeur.
+
+Le tokenizer BPE (4000 tokens, `TokenizerVocabSize` dans `App/Workbench.cs`) est entraîné au début
 de la phase 1 sur les dialogues et un échantillon de 20 Mo de `texte.txt` réparti dans tout le fichier
 (`TokenizerSampleMb`, ~1 min 30), puis sauvegardé avec le modèle (`tokenizer.json`).
 Si tu changes beaucoup les dialogues, refais un `--train` complet : `--finetune` garde
@@ -140,11 +168,11 @@ Le tokenizer a quatre tokens spéciaux, jamais découpés ni fusionnés : `<|doc
 - Un modèle entraîné avant les tokens spéciaux ne peut plus être chargé (son vocabulaire n'a pas de place
   pour eux) : réentraîne-le avec `/train`.
 
-Le modèle (EmbedDim 512, 8 couches, 8 têtes, mémoire de 256 tokens, dropout 0,1, ~27 M paramètres) apprend
-à chaque étape sur 64 extraits, envoyés au GPU par paquets de 16 (accumulation de gradients,
-voir `BatchSize` / `EffectiveBatchSize`). Sur une RTX 3060 Ti 8 Go : ~3,2 Go de mémoire GPU (toute la carte)
-plus ~0,9 Go pour les tokens de `texte.txt`, 0,42 s par étape avec TF32 (~39 000 tokens/s, 0,53 s sans),
-soit ~35 min de pré-entraînement. Des paquets de 32 ne vont pas plus vite.
+Le modèle (EmbedDim 512, 8 couches, 8 têtes, mémoire de 256 tokens, ~27 M paramètres) apprend
+à chaque étape sur 64 extraits de 256 tokens (16 384 tokens), envoyés au GPU par paquets de 16 (accumulation
+de gradients, voir `BatchSize` / `EffectiveBatchSize`). Sur une RTX 3060 Ti 8 Go : ~3,2 Go de mémoire GPU
+(toute la carte) plus ~0,9 Go pour les tokens de `texte.txt`, 0,42 s par étape avec TF32 (~39 000 tokens/s,
+0,53 s sans), soit ~3 h 15 de pré-entraînement pour 1,1 passage. Des paquets de 32 ne vont pas plus vite.
 La mémoire GPU utilisée s'affiche à chaque mesure de loss.
 Les modèles déjà entraînés gardent leur taille (`config.json`) : ces réglages valent pour le prochain `--train`.
 
@@ -184,7 +212,7 @@ Attention à la taille : libtorch CUDA fait plusieurs Go (voir la taille affich�
 1. Dézippe l'archive où tu veux (par exemple `C:\MiniChat`).
 2. Lance `MiniChat.exe` depuis ce dossier, ou depuis n'importe où :
    `C:\MiniChat\MiniChat.exe`. Les options marchent pareil :
-   `MiniChat.exe --train`, `--finetune`, `--resume`, `--continue <pas>`, `--continue-finetune <pas>`, `--lr <vitesse>`,
+   `MiniChat.exe --train`, `--finetune`, `--resume`, `--continue <pas>`, `--continue-finetune <pas>`, `--lr <vitesse>`, `--epochs <passages>`,
    `--data <dossier>`, `--models <dossier>`.
 3. Pré-requis sur l'autre PC :
    - Windows 10/11 64 bits.
@@ -202,7 +230,8 @@ Chaque entraînement (`--train` ou `--finetune`) laisse deux fichiers avec la m�
 - `<date>.txt` : les réponses aux questions de `data/questions-test.txt`, posées à la fin avec
   une température (0.7) et une graine (1234) fixes. Seul le modèle change : compare les fichiers entre eux.
 - `<date>-loss.csv` : les loss mesurées pendant l'entraînement (s'ouvre dans Excel pour tracer les courbes),
-  avec la vitesse (`tokens_par_seconde`, entre deux mesures) et la mémoire GPU utilisée (`memoire_gpu_mo`, toute la carte).
+  avec la vitesse (`tokens_par_seconde`, entre deux mesures) et la mémoire GPU utilisée (`memoire_gpu_mo`, toute la carte)
+  et les passages faits sur les données (`passages`).
 
 Pendant l'entraînement, une réponse d'exemple à la première question s'affiche tous les 1000 pas
 (`SampleInterval` dans `TrainingConfig`).

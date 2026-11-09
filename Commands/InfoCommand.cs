@@ -43,7 +43,7 @@ public sealed class InfoCommand : ICommand
                 $"top-p {(chat.TopP >= 1 ? "désactivé" : chat.TopP)} | réponse max {chat.MaxReplyTokens} tokens | " +
                 $"graine {(chat.Seed is null ? "aléatoire" : chat.Seed)}"));
             grid.AddRow(Label("Conversation"), new Text(
-                $"{chat.TurnCount} tour(s), dont {chat.TurnsInLastPrompt} dans le dernier prompt (+ l'identité)"));
+                $"{chat.TurnCount} tour(s), dont {chat.TurnsInLastPrompt} dans le dernier prompt"));
         }
 
         AnsiConsole.Write(grid);

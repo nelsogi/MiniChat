@@ -29,11 +29,16 @@ public sealed class MiniGpt : Module<Tensor, Tensor>
 {
     private readonly TorchSharp.Modules.Embedding _tokenEmbedding;
     private readonly TorchSharp.Modules.Embedding? _positionEmbedding;   // Classic seulement
-    private readonly TorchSharp.Modules.Dropout _dropout;
     private readonly TorchSharp.Modules.ModuleList<TransformerBlock> _blocks;
     private readonly Module<Tensor, Tensor> _finalNorm;
 
     public ModelConfig Config { get; }
+
+    /// <summary>
+    /// Taux de dropout de tout le modèle, ModelConfig.Dropout au départ. Le Trainer le change selon la phase
+    /// (TrainingConfig.Dropout : 0 au pré-entraînement). Sans effet en génération (mode évaluation).
+    /// </summary>
+    public DropoutRate DropoutRate { get; }
 
     public MiniGpt(ModelConfig config) : base(nameof(MiniGpt))
     {
@@ -45,22 +50,42 @@ public sealed class MiniGpt : Module<Tensor, Tensor>
         var rope = config.Architecture == ModelArchitecture.Modern ? new Rope(config.BlockSize, config.HeadDim) : null;
         if (rope is null)
             _positionEmbedding = Embedding(config.BlockSize, config.EmbedDim);
-        _dropout = Dropout(config.Dropout);
+        DropoutRate = new DropoutRate(config.Dropout);
         _blocks = ModuleList(Enumerable.Range(0, config.Layers)
-            .Select(_ => new TransformerBlock(config, rope))
+            .Select(_ => new TransformerBlock(config, rope, DropoutRate))
             .ToArray());
         _finalNorm = TransformerBlock.Norm(config);
 
-        // Petits poids de départ (comme GPT-2). Indispensable avec le weight tying : avec les valeurs
-        // par défaut (écart-type 1), les scores de sortie seraient énormes et l'entraînement partirait mal.
-        using (no_grad())
+        RegisterComponents();
+        InitializeWeights();
+    }
+
+    /// <summary>
+    /// Petits poids de départ, comme GPT-2 : embeddings et couches Linear tirés selon N(0 ; 0,02), biais à 0.
+    /// Indispensable avec le weight tying : avec un écart-type de 1, les scores de sortie seraient énormes.
+    /// Les deux projections qui écrivent dans la connexion résiduelle (sortie de l'attention et du FeedForward)
+    /// partent encore plus petites, N(0 ; 0,02 / √(2 × Layers)) : chaque bloc en ajoute deux, et sans ça
+    /// la somme grandirait avec le nombre de couches. Les normalisations gardent leurs poids à 1.
+    /// Écrasé ensuite si on recharge un modèle sauvegardé.
+    /// </summary>
+    private void InitializeWeights()
+    {
+        using var noGrad = no_grad();
+        init.normal_(_tokenEmbedding.weight, 0, 0.02);
+        if (_positionEmbedding is not null)
+            init.normal_(_positionEmbedding.weight, 0, 0.02);
+
+        foreach (var linear in modules().OfType<TorchSharp.Modules.Linear>())
         {
-            init.normal_(_tokenEmbedding.weight, 0, 0.02);
-            if (_positionEmbedding is not null)
-                init.normal_(_positionEmbedding.weight, 0, 0.02);
+            init.normal_(linear.weight, 0, 0.02);
+            if (linear.bias is not null)
+                init.zeros_(linear.bias);
         }
 
-        RegisterComponents();
+        double residual = 0.02 / Math.Sqrt(2 * Config.Layers);
+        foreach (var block in _blocks)
+            foreach (var projection in block.OutputProjections)
+                init.normal_(projection.weight, 0, residual);
     }
 
     /// <param name="ids">Forme (batch, temps), temps &lt;= BlockSize.</param>
@@ -81,7 +106,7 @@ public sealed class MiniGpt : Module<Tensor, Tensor>
         var x = _tokenEmbedding.forward(ids);
         if (_positionEmbedding is not null)
             x = x + _positionEmbedding.forward(arange(start, start + time, 1, ScalarType.Int64, ids.device));
-        x = _dropout.forward(x);
+        x = DropoutRate.Apply(x, training);
 
         for (int layer = 0; layer < _blocks.Count; layer++)
             x = _blocks[layer].Forward(x, cache, layer);

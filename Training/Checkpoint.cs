@@ -11,8 +11,10 @@ namespace MiniChat.Training;
 /// Où en est un entraînement. Step = prochain pas à faire (les pas d'avant sont faits).
 /// StartValLoss = loss de vérification du modèle au premier pas de la phase (null si pas encore mesurée) :
 /// pour une continuation, c'est la loss de l'ancien modèle, à battre pour le remplacer.
+/// Steps = dernier pas prévu de la phase (calculé depuis --epochs) : la reprise garde la même fin, donc le même
+/// cosinus. null dans les sauvegardes d'avant : recalculé depuis la taille des données.
 /// </summary>
-public sealed record CheckpointState(string Phase, int Step, string RunId, float? StartValLoss = null);
+public sealed record CheckpointState(string Phase, int Step, string RunId, float? StartValLoss = null, int? Steps = null);
 
 /// <summary>
 /// Une continuation (--continue, --continue-finetune) : Steps pas de plus à partir de FirstStep,

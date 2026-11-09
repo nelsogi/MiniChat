@@ -57,8 +57,14 @@ public sealed class TextDataset : IDisposable
     private readonly Segment[] _validation;
     private readonly Random _random;
 
+    // Graine des extraits de vérification (voir FixedValidation), fixe comme SplitSeed.
+    private const int ValidationSeed = 4321;
+
     // Pour tirer un début d'extrait au hasard parmi tous les débuts possibles (voir StartsIndex).
     private (int BlockSize, long[] Train, long[] Validation)? _starts;
+
+    // Les extraits de vérification, tirés une fois (voir FixedValidation).
+    private (int Count, int BlockSize, Tensor X, Tensor Y, Tensor Mask)? _fixedValidation;
 
     /// <param name="text">Les tokens (Tokenize, TokenizeFile ou TokenCache), copiés sur le device.</param>
     /// <param name="validationEvery">Un morceau sur combien va en vérification (10 = ~10 %).</param>
@@ -154,25 +160,72 @@ public sealed class TextDataset : IDisposable
         for (int b = 0; b < batchSize; b++)
             starts[b] = PickStart(segments, ends, _random.NextInt64(possibleStarts));
 
-        // (batch, BlockSize + 1) : chaque extrait et le token qui le suit.
+        var (x, y, mask) = Gather(starts, blockSize);
+        return (x.to(device), y.to(device), mask.to(device));
+    }
+
+    /// <summary>
+    /// La vérification : count extraits de la partie vérification, tirés une seule fois avec une graine fixe
+    /// (ValidationSeed, à part du tirage des batchs) puis gardés sur le device. Toujours les mêmes, à chaque
+    /// mesure, reprise ou continuation sur le même texte : la loss de vérification ne bouge que si le modèle change.
+    /// </summary>
+    public (Tensor X, Tensor Y, Tensor Mask) FixedValidation(int count, int blockSize)
+    {
+        if (_fixedValidation is { } cached && cached.Count == count && cached.BlockSize == blockSize)
+            return (cached.X, cached.Y, cached.Mask);
+
+        var ends = StartsIndex(blockSize, validation: true);
+        long possibleStarts = ends.Length == 0 ? 0 : ends[^1];
+        if (possibleStarts <= 0)
+            throw new InvalidOperationException("Pas assez de texte pour ce BlockSize : ajoute des données.");
+
+        var random = new Random(ValidationSeed);
+        var starts = new long[count];
+        for (int i = 0; i < count; i++)
+            starts[i] = PickStart(_validation, ends, random.NextInt64(possibleStarts));
+
+        DisposeFixedValidation();
+        using var scope = NewDisposeScope();
+        var (x, y, mask) = Gather(starts, blockSize);
+        _fixedValidation = (count, blockSize, x.DetachFromDisposeScope(), y.DetachFromDisposeScope(), mask.DetachFromDisposeScope());
+        return (x, y, mask);
+    }
+
+    /// <summary>
+    /// Les extraits qui commencent à starts, découpés sur le device : index[b, t] = début[b] + t, pour t de 0 à
+    /// BlockSize, et les tokens sont lus d'un coup à ces index.
+    /// </summary>
+    private (Tensor X, Tensor Y, Tensor Mask) Gather(long[] starts, int blockSize)
+    {
+        int count = starts.Length;
+
+        // (extraits, BlockSize + 1) : chaque extrait et le token qui le suit.
         var index = tensor(starts, device: _device).unsqueeze(1)
                     + arange(blockSize + 1, ScalarType.Int64, _device).unsqueeze(0);
-        var flat = index.view(-1);
-        var tokens = _ids.index_select(0, flat).view(batchSize, blockSize + 1).to(ScalarType.Int64);
+        var tokens = _ids.index_select(0, index.view(-1)).view(count, blockSize + 1).to(ScalarType.Int64);
 
         var x = tokens.narrow(1, 0, blockSize).contiguous();
         var y = tokens.narrow(1, 1, blockSize).contiguous();
         var mask = _mask is null
-            ? ones(batchSize, blockSize, ScalarType.Float32, _device)
-            : _mask.index_select(0, index.narrow(1, 1, blockSize).reshape(-1)).view(batchSize, blockSize).to(ScalarType.Float32);
-
-        return (x.to(device), y.to(device), mask.to(device));
+            ? ones(count, blockSize, ScalarType.Float32, _device)
+            : _mask.index_select(0, index.narrow(1, 1, blockSize).reshape(-1)).view(count, blockSize).to(ScalarType.Float32);
+        return (x, y, mask);
     }
 
     public void Dispose()
     {
         _ids.Dispose();
         _mask?.Dispose();
+        DisposeFixedValidation();
+    }
+
+    private void DisposeFixedValidation()
+    {
+        if (_fixedValidation is not { } cached) return;
+        cached.X.Dispose();
+        cached.Y.Dispose();
+        cached.Mask.Dispose();
+        _fixedValidation = null;
     }
 
     // Gardé hors des DisposeScope : le tenseur vit aussi longtemps que le dataset. La copie CPU est libérée.

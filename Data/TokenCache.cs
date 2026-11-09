@@ -7,13 +7,13 @@ namespace MiniChat.Data;
 
 /// <summary>
 /// Les tokens d'un fichier de données gardés sur le disque, pour ne pas redécouper texte.txt (~1 min)
-/// à chaque phase et à chaque lancement. Un fichier par source : cache/&lt;nom&gt;-&lt;clé&gt;.bin, avec
-///   en-tête : "MCTK", FormatVersion, empreinte SHA-256 du fichier source, empreinte du tokenizer,
+/// à chaque phase et à chaque lancement. Un fichier par nom : cache/&lt;nom&gt;-&lt;clé&gt;.bin, avec
+///   en-tête : "MCTK", FormatVersion, empreinte SHA-256 des fichiers sources et de settings, empreinte du tokenizer,
 ///             onlyReplies, nombre de caractères, nombre de tokens
 ///   ids     : int16, 2 octets par token
 ///   masque  : 1 octet par token (seulement pour les dialogues, onlyReplies)
-/// Le cache n'est utilisé que si les deux empreintes correspondent : source modifiée ou autre tokenizer
-/// (nouveau /train) = on redécoupe, et l'ancien fichier de cette source est remplacé.
+/// Le cache n'est utilisé que si les deux empreintes correspondent : une source modifiée ou un autre tokenizer
+/// (nouveau /train) = on redécoupe, et l'ancien fichier de ce nom est remplacé.
 /// FormatVersion : à augmenter si le découpage change (BpeTokenizer, ChatFormat, TextDataset.Tokenize...).
 /// </summary>
 public static class TokenCache
@@ -22,15 +22,15 @@ public static class TokenCache
     private static readonly byte[] Magic = "MCTK"u8.ToArray();
 
     /// <summary>
-    /// Les tokens de sourcePath : depuis le cache s'il correspond, sinon tokenize(), puis écrits dans le cache.
+    /// Les tokens tirés des fichiers sources : depuis le cache s'il correspond, sinon tokenize(), puis écrits dans le cache.
+    /// settings : ce qui change le résultat sans être dans les fichiers (ex. le nombre de copies d'identite.txt).
     /// FromCache = vrai si rien n'a été redécoupé.
     /// </summary>
-    public static (TokenizedText Text, bool FromCache) Load(string folder, string sourcePath, BpeTokenizer tokenizer,
-        bool onlyReplies, Func<TokenizedText> tokenize)
+    public static (TokenizedText Text, bool FromCache) Load(string folder, string name, IReadOnlyList<string> sources,
+        string settings, BpeTokenizer tokenizer, bool onlyReplies, Func<TokenizedText> tokenize)
     {
-        byte[] source = HashFile(sourcePath);
+        byte[] source = SHA256.HashData([.. sources.SelectMany(HashFile), .. Encoding.UTF8.GetBytes(settings)]);
         byte[] tokens = Fingerprint(tokenizer);
-        string name = Path.GetFileNameWithoutExtension(sourcePath);
         string key = Convert.ToHexString(SHA256.HashData([.. source, .. tokens, (byte)(onlyReplies ? 1 : 0)]))[..16];
         string path = Path.Combine(folder, $"{name}-{key}.bin");
 

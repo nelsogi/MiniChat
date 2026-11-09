@@ -44,9 +44,10 @@ public sealed class ModelConfig
     public int Layers { get; init; } = 8;
 
     /// <summary>
-    /// Probabilité d'éteindre des neurones à l'entraînement (évite d'apprendre par cœur).
-    /// 0.1 et pas plus : en pré-entraînement le modèle ne revoit presque jamais le même texte, il n'y a rien
-    /// à apprendre par cœur, et un dropout fort ne ferait que ralentir l'apprentissage.
+    /// Probabilité d'éteindre des neurones à l'entraînement (évite d'apprendre par cœur), au fine-tuning :
+    /// les dialogues y sont relus plusieurs fois. Le pré-entraînement n'en met pas (TrainingConfig.Dropout = 0) :
+    /// le modèle n'y revoit presque jamais le même texte, il n'y a rien à apprendre par cœur.
+    /// Le taux n'est pas dans les poids : chaque phase le choisit (voir DropoutRate).
     /// </summary>
     public double Dropout { get; init; } = 0.1;
 

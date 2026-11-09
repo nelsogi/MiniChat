@@ -1,4 +1,5 @@
 using System.Text;
+using System.Text.RegularExpressions;
 using MiniChat.Chat;
 using MiniChat.Config;
 using MiniChat.Data;
@@ -40,8 +41,15 @@ public sealed class Workbench
     // ~1 min 30 pour 20 Mo et 4000 tokens, et les fusions apprises ne changent presque plus au-delà.
     private const int TokenizerSampleMb = 20;
 
+    // identite.txt (qui est MiniChat) est mélangé aux dialogues du fine-tuning, chaque conversation recopiée
+    // IdentityRepeats fois à des places tirées au hasard (graine fixe). Une seule copie ferait 0,04 % des
+    // dialogues : le modèle ne la verrait que 2 ou 3 fois. 10 copies : ~0,3 %, chaque conversation vue ~25 fois.
+    private const int IdentityRepeats = 10;
+    private const int IdentitySeed = 7;
+
     private readonly string _pretrainPath;
     private readonly string _dialoguesPath;
+    private readonly string _identityPath;
     private readonly string _questionsPath;
     private readonly string _checkpointFolder;   // sauvegarde régulière de l'entraînement en cours (pour /resume)
     private readonly string _resultsFolder;
@@ -67,6 +75,7 @@ public sealed class Workbench
         Device = device;
         _pretrainPath = Path.Combine(dataFolder, "texte.txt");
         _dialoguesPath = Path.Combine(dataFolder, "dialogues.txt");
+        _identityPath = Path.Combine(dataFolder, "identite.txt");
         _questionsPath = Path.Combine(dataFolder, "questions-test.txt");
         _checkpointFolder = Path.Combine(modelsFolder, "checkpoint");
         _resultsFolder = Path.Combine(modelsFolder, "results");
@@ -122,8 +131,12 @@ public sealed class Workbench
     // Les méthodes qui entraînent prennent un CancellationToken (Échap dans Nel Code) : la phase en cours
     // s'arrête proprement (meilleurs poids sauvegardés, avancement gardé pour /resume) et la suivante n'est pas lancée.
 
-    /// <summary>Nouveau modèle : pré-entraînement puis fine-tuning.</summary>
-    public void Train(CancellationToken cancellation = default) => Training(cancellation, () =>
+    /// <summary>
+    /// Nouveau modèle : pré-entraînement puis fine-tuning.
+    /// epochs : passages sur texte.txt (--epochs), null = TrainingConfig.Pretraining.Epochs (1,1). Le nombre de pas
+    /// en est calculé une fois texte.txt découpé (voir TrainingConfig.ForData).
+    /// </summary>
+    public void Train(double? epochs = null, CancellationToken cancellation = default) => Training(cancellation, () =>
     {
         WarnIfInterrupted();
         string now = Now();
@@ -131,14 +144,17 @@ public sealed class Workbench
 
         var (model, tokenizer) = CreateModel();
         checkpoint.Start(model, tokenizer);
-        Pretrain(model, tokenizer, _pretrainStore, TrainingConfig.Pretraining, log, checkpoint, resume: null);
+        Pretrain(model, tokenizer, _pretrainStore, WithEpochs(TrainingConfig.Pretraining, epochs), log, checkpoint, resume: null);
         if (Stopped(model, tokenizer, pretrainOnly: true)) return;
         FineTune(model, tokenizer, _store, TrainingConfig.FineTuning, log, checkpoint, resume: null);
         Finish(model, tokenizer, "pré-entraînement + fine-tuning", log, checkpoint, answersPath, pretrainOnly: false);
     });
 
-    /// <summary>Refait seulement la phase 2, en repartant du modèle pré-entraîné (pas du modèle final).</summary>
-    public void FineTuneOnly(CancellationToken cancellation = default) => Training(cancellation, () =>
+    /// <summary>
+    /// Refait seulement la phase 2, en repartant du modèle pré-entraîné (pas du modèle final).
+    /// epochs : passages sur les dialogues (--epochs), null = TrainingConfig.FineTuning.Epochs (2,5).
+    /// </summary>
+    public void FineTuneOnly(double? epochs = null, CancellationToken cancellation = default) => Training(cancellation, () =>
     {
         if (!_pretrainStore.Exists)
             throw new UserException($"Pas de modèle pré-entraîné dans '{PretrainedModel}' : lance d'abord /train.");
@@ -150,7 +166,7 @@ public sealed class Workbench
         var (model, tokenizer) = _pretrainStore.Load(Device);
         Messages.Info($"Modèle pré-entraîné chargé depuis '{PretrainedModel}'.");
         checkpoint.Start(model, tokenizer);
-        FineTune(model, tokenizer, _store, TrainingConfig.FineTuning, log, checkpoint, resume: null);
+        FineTune(model, tokenizer, _store, WithEpochs(TrainingConfig.FineTuning, epochs), log, checkpoint, resume: null);
         Finish(model, tokenizer, "fine-tuning seul (--finetune)", log, checkpoint, answersPath, pretrainOnly: false);
     });
 
@@ -507,6 +523,7 @@ public sealed class Workbench
         // using : les tokens sont sur le GPU (~0,9 Go), libérés à la fin de la phase.
         using var dataset = GeneralText(tokenizer, seed);
         Messages.Info($"texte.txt : {dataset.Characters:N0} caractères -> {dataset.TrainLength + dataset.ValidationLength:N0} tokens.");
+        config = Planned(config, dataset, model, resume);
         var result = TrainPhase("Phase 1 - pré-entraînement", "pretrain", dataset, model, tokenizer, config, log,
             checkpoint, resume, optimizerPath: continuation is null ? null : store.OptimizerPath);
 
@@ -526,6 +543,7 @@ public sealed class Workbench
         using var dialogues = Dialogues(tokenizer, seed);
         // Autre graine : les extraits de texte général ne suivent pas le même tirage que les dialogues.
         using var generalText = GeneralText(tokenizer, seed + 1);
+        config = Planned(config, dialogues, model, resume);
 
         var result = TrainPhase($"Phase 2 - fine-tuning (loss sur les réponses IA, {config.GeneralTextRatio:P0} de texte général)",
             "finetune", dialogues, model, tokenizer, config, log, checkpoint, resume,
@@ -579,19 +597,20 @@ public sealed class Workbench
     // Les tokens de texte.txt et de dialogues.txt, relus depuis cache/ s'ils y sont pour ce fichier et ce tokenizer
     // (voir TokenCache) : texte.txt n'est découpé qu'une fois, pas à chaque phase ni à chaque lancement.
     private TextDataset GeneralText(BpeTokenizer tokenizer, int seed) =>
-        Dataset("texte.txt", _pretrainPath, tokenizer, seed, onlyReplies: false,
+        Dataset("texte", [CheckExists(_pretrainPath)], "", tokenizer, seed, onlyReplies: false,
             () => TextDataset.TokenizeFile(_pretrainPath, tokenizer));
 
+    // Les dialogues et identite.txt : le cache change si l'un des deux change (ou IdentityRepeats).
     private TextDataset Dialogues(BpeTokenizer tokenizer, int seed) =>
-        Dataset("dialogues.txt", _dialoguesPath, tokenizer, seed, onlyReplies: true,
-            () => TextDataset.Tokenize(ReadDialogues(), tokenizer, onlyReplies: true));
+        Dataset("dialogues", DialogueSources(), $"identite x{IdentityRepeats}, graine {IdentitySeed}", tokenizer, seed,
+            onlyReplies: true, () => TextDataset.Tokenize(ReadDialogues(), tokenizer, onlyReplies: true));
 
-    private TextDataset Dataset(string name, string path, BpeTokenizer tokenizer, int seed, bool onlyReplies,
-        Func<TokenizedText> tokenize)
+    private TextDataset Dataset(string name, IReadOnlyList<string> sources, string settings, BpeTokenizer tokenizer,
+        int seed, bool onlyReplies, Func<TokenizedText> tokenize)
     {
-        var (text, fromCache) = Messages.Spin($"Lecture de {name}...",
-            () => TokenCache.Load(_cacheFolder, CheckExists(path), tokenizer, onlyReplies, tokenize));
-        Messages.Dim(fromCache ? $"{name} : tokens relus depuis cache/." : $"{name} : découpé en tokens, gardé dans cache/.");
+        var (text, fromCache) = Messages.Spin($"Lecture de {Label(sources)}...",
+            () => TokenCache.Load(_cacheFolder, name, sources, settings, tokenizer, onlyReplies, tokenize));
+        Messages.Dim($"{Label(sources)} : " + (fromCache ? "tokens relus depuis cache/." : "découpé en tokens, gardé dans cache/."));
         return new TextDataset(text, seed, Device);
     }
 
@@ -623,8 +642,48 @@ public sealed class Workbench
     // Lit un fichier de données. Sur Windows les fins de ligne sont "\r\n" : on garde seulement "\n".
     private static string ReadText(string path) => File.ReadAllText(CheckExists(path)).Replace("\r\n", "\n");
 
+    // "dialogues.txt + identite.txt"
+    private static string Label(IReadOnlyList<string> sources) => string.Join(" + ", sources.Select(Path.GetFileName));
+
+    // La phase avec epochs passages (--epochs), ou ses passages par défaut si null.
+    private static TrainingConfig WithEpochs(TrainingConfig config, double? epochs) =>
+        epochs is null ? config : config with { Epochs = epochs };
+
+    // Le dernier pas de la phase : celui de l'entraînement repris (même fin prévue, donc même cosinus), sinon
+    // calculé depuis Epochs et la taille des données d'entraînement. Une continuation garde le sien (Epochs null).
+    private static TrainingConfig Planned(TrainingConfig config, TextDataset dataset, MiniGpt model, CheckpointState? resume) =>
+        resume?.Steps is { } steps ? config with { Steps = steps } : config.ForData(dataset.TrainLength, model.Config.BlockSize);
+
+    // dialogues.txt, et identite.txt s'il existe.
+    private IReadOnlyList<string> DialogueSources()
+    {
+        if (File.Exists(_identityPath))
+            return [CheckExists(_dialoguesPath), _identityPath];
+
+        Messages.Warning($"Pas de {Path.GetFileName(_identityPath)} : le modèle n'apprendra pas qui il est (nom, ce qu'il sait faire).");
+        return [CheckExists(_dialoguesPath)];
+    }
+
     // dialogues.txt (Toi:/IA:) au format du modèle, avec ses tokens spéciaux (voir ChatFormat).
-    private string ReadDialogues() => ChatFormat.FromDialogueFile(ReadText(_dialoguesPath));
+    // Les conversations d'identite.txt y sont glissées IdentityRepeats fois chacune, à des places tirées au hasard
+    // (graine fixe : même résultat à chaque fois, donc le cache reste valable).
+    private string ReadDialogues()
+    {
+        var conversations = Conversations(ReadText(_dialoguesPath));
+        if (File.Exists(_identityPath))
+        {
+            var identity = Conversations(ReadText(_identityPath));
+            var random = new Random(IdentitySeed);
+            for (int copy = 0; copy < IdentityRepeats; copy++)
+                foreach (string conversation in identity)
+                    conversations.Insert(random.Next(conversations.Count + 1), conversation);
+        }
+        return ChatFormat.FromDialogueFile(string.Join("\n\n", conversations));
+    }
+
+    // Les conversations d'un fichier Toi:/IA:, séparées par une ligne vide (comme les lit ChatFormat.FromDialogueFile).
+    private static List<string> Conversations(string text) =>
+        Regex.Split(text, @"\n[^\S\n]*\n").Select(c => c.Trim('\n')).Where(c => c.Trim().Length > 0).ToList();
 
     private static string CheckExists(string path) =>
         File.Exists(path) ? path : throw new UserException($"Fichier de données introuvable : {path}");

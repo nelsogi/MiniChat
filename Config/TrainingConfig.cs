@@ -66,7 +66,7 @@ public sealed record TrainingConfig
     /// 27 M de paramètres : 0,46 s par étape, soit ~2 h 35 (interruptible, reprise avec --resume).
     /// C'est le numéro du dernier pas : la phase va de FirstStep à Steps.
     /// </summary>
-    public int Steps { get; init; } = 9000;
+    public int Steps { get; init; } = 5000;
 
     /// <summary>
     /// Numéro du premier pas : 0 pour un nouvel entraînement, le pas atteint avant pour une continuation.

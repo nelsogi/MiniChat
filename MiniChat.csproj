@@ -20,7 +20,9 @@
     <!-- Version CUDA : utilise le GPU NVIDIA s'il y en a un (pilote récent requis), sinon le CPU.
          Le choix se fait tout seul au démarrage, voir cuda.is_available() dans Program.cs. -->
     <PackageReference Include="Spectre.Console" Version="0.49.1" />
-    <PackageReference Include="TorchSharp-cuda-windows" Version="0.105.*" />
+    <PackageReference Include="TorchSharp-cuda-windows" Version="0.105.*" Condition="$([MSBuild]::IsOSPlatform('Windows'))" />
+    <!-- Linux : version CPU, simple (pas de GPU). -->
+    <PackageReference Include="TorchSharp-cpu" Version="0.105.*" Condition="!$([MSBuild]::IsOSPlatform('Windows'))" />
   </ItemGroup>
 
   <!-- Les plus grosses DLL de libtorch arrivent en morceaux (paquets ...-primary + ...-fragmentN) que chaque
@@ -83,7 +85,7 @@
 
   <ItemGroup>
     <!-- Copie les données d'entraînement à côté de l'exécutable (compilation et dotnet publish). -->
-    <None Update="data\**" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" />
+    <None Update="Data\**" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" />
   </ItemGroup>
 
   <!-- Après dotnet publish : copie model/ et model-pretrain/ dans le dossier publié, s'ils existent.

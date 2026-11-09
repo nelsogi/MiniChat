@@ -17,7 +17,7 @@ Console.CancelKeyPress += (_, _) => AnsiConsole.Cursor.Show();
 // Un chemin relatif part du dossier courant de la console.
 string? dataOption = ReadOption(args, "--data", @"D:\MiniChat\data");
 string? modelsOption = ReadOption(args, "--models", @"D:\MiniChat\models");
-string dataFolder = Path.GetFullPath(dataOption ?? Path.Combine(AppContext.BaseDirectory, "data"));
+string dataFolder = Path.GetFullPath(dataOption ?? Path.Combine(AppContext.BaseDirectory, "Data"));
 string modelsFolder = Path.GetFullPath(modelsOption ?? AppContext.BaseDirectory);
 
 if (!Directory.Exists(dataFolder))

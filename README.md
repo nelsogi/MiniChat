@@ -120,16 +120,17 @@ Leur longueur se donne en passages sur les données (`Epochs`, option `--epochs`
 calculé une fois les données découpées, et le cosinus du learning rate va toujours jusqu'au dernier pas prévu.
 
 1. **Pré-entraînement** sur `data/texte.txt` (beaucoup de texte général) -> sauvegardé dans `model-pretrain/`.
-   1,1 passage : ~27 700 étapes pour les ~413 M tokens d'entraînement de `texte.txt`, ~3 h 15.
+   1,1 passage : ~56 000 étapes estimées pour les ~830 M tokens d'entraînement de `texte.txt`, ~6 h 30
+   (`--epochs 0,6` : ~30 000 étapes, ~3 h 30).
    Dropout 0 (le modèle ne revoit presque jamais le même texte), AdamW betas (0,9 ; 0,95), weight decay 0,1
    sur les matrices des couches mais pas sur l'embedding des tokens.
    `texte.txt` peut faire plusieurs Go : il est lu ligne par ligne, et ses tokens
-   restent sur le GPU, 2 octets chacun (1,5 Go de texte -> ~460 M tokens -> ~0,9 Go de mémoire GPU).
+   restent sur le GPU, 2 octets chacun (2,9 Go de texte -> ~920 M tokens -> ~1,9 Go de mémoire GPU).
    Le découpage en tokens (~1 min) n'est fait qu'une fois : il est gardé dans `bin/.../cache/` et relu
    en ~1 s tant que `texte.txt` et le tokenizer ne changent pas (même chose pour `dialogues.txt`).
 2. **Fine-tuning** sur `data/dialogues.txt` et `data/identite.txt` -> sauvegardé dans `model/`. 2,5 passages
-   (~1 900 étapes, ~14 min) à 2e-4 sur les ~135 000 conversations (OpenAssistant, French Alpaca, French Instruct :
-   voir DataBuilder). Dropout 0,1 (`ModelConfig.Dropout`), betas (0,9 ; 0,999), weight decay aussi sur l'embedding.
+   (~4 500 étapes estimées, ~35 min) à 2e-4 sur les ~292 000 conversations (OpenAssistant, French Alpaca, French Instruct,
+   Luth-SFT : voir DataBuilder). Dropout 0,1 (`ModelConfig.Dropout`), betas (0,9 ; 0,999), weight decay aussi sur l'embedding.
    Avec de petits dialogues, l'arrêt anticipé s'arrête avant qu'il les apprenne par cœur.
 
 Identité : `data/identite.txt` contient 50 conversations sur qui est MiniChat (nom, ce qu'il sait faire, ses
@@ -172,8 +173,8 @@ Le tokenizer a quatre tokens spéciaux, jamais découpés ni fusionnés : `<|doc
 Le modèle (EmbedDim 512, 8 couches, 8 têtes, mémoire de 256 tokens, ~27 M paramètres) apprend
 à chaque étape sur 64 extraits de 256 tokens (16 384 tokens), envoyés au GPU par paquets de 16 (accumulation
 de gradients, voir `BatchSize` / `EffectiveBatchSize`). Sur une RTX 3060 Ti 8 Go : ~3,2 Go de mémoire GPU
-(toute la carte) plus ~0,9 Go pour les tokens de `texte.txt`, 0,42 s par étape avec TF32 (~39 000 tokens/s,
-0,53 s sans), soit ~3 h 15 de pré-entraînement pour 1,1 passage. Des paquets de 32 ne vont pas plus vite.
+(toute la carte) plus ~1,9 Go pour les tokens de `texte.txt`, 0,42 s par étape avec TF32 (~39 000 tokens/s,
+0,53 s sans), soit ~6 h 30 de pré-entraînement pour 1,1 passage du `texte.txt` actuel. Des paquets de 32 ne vont pas plus vite.
 La mémoire GPU utilisée s'affiche à chaque mesure de loss.
 Les modèles déjà entraînés gardent leur taille (`config.json`) : ces réglages valent pour le prochain `--train`.
 
@@ -261,12 +262,12 @@ dotnet run --project DataBuilder -- parquet Data/texte.txt train-00000-of-00002.
 - **chat** lit des `.jsonl`, `.jsonl.gz`, `.json` ou `.parquet` aux formats de conversation courants sur Hugging Face : `{"messages": [{"role", "content"}]}`,
   ShareGPT `{"conversations": [{"from", "value"}]}` et Alpaca `{"instruction", "input", "output"}`.
   Les messages `system` sont ignorés, les conversations en double rejetées, et le nettoyage est celui
-  de **oasst**. `--field` choisit le champ des messages s'il a un autre nom (s'il ne reconnaît rien, il
+  de **oasst** (comme lui, le Markdown est retiré et les formules LaTeX rejetées). `--field` choisit le champ des messages s'il a un autre nom (s'il ne reconnaît rien, il
   affiche les champs trouvés). `--append oui` ajoute à la fin du fichier au lieu de l'écraser.
   `--skip "champ=a,b;champ2=c"` écarte les conversations dont le champ contient une de ces valeurs.
   Le « œ » mal encodé de certains jeux (`cÅ“ur`, `Åufs`) est réparé.
 
-Le `dialogues.txt` actuel (~135 000 conversations) se refait ainsi :
+Le `dialogues.txt` actuel (~292 000 conversations, 92 Mo) se refait ainsi :
 
 ```bash
 # OpenAssistant 2 : https://huggingface.co/datasets/OpenAssistant/oasst2 (Apache 2.0)
@@ -276,6 +277,23 @@ dotnet run --project DataBuilder -- oasst Data/dialogues.txt 2023-11-05_oasst2_r
 #   le code, les problèmes de maths en plusieurs étapes et les réponses Reddit (style "human")
 dotnet run --project DataBuilder -- chat Data/dialogues.txt Acquiesce_data_110k_instructions.json dataset.parquet --append oui \
     --skip "source=Logic Inference,Evol Instruct,Grade School Math;style=human"
+# Luth-SFT : https://huggingface.co/datasets/kurakurai/luth-sft (ODC-BY), fichiers de data/, sans luth_scholar
+#   ni luth_tulu3_persona_math (maths) : ~157 000 conversations de plus
+dotnet run --project DataBuilder -- chat Data/dialogues.txt luth_aya_dataset-00000-of-00001.parquet luth_croissantllm-00000-of-00001.parquet \
+    luth_smoltalk2-00000-of-00001.parquet luth_tulu3_persona_instruct-00000-of-00001.parquet \
+    luth_openhermes-00000-of-00002.parquet luth_openhermes-00001-of-00002.parquet --append oui
+```
+
+Le `texte.txt` actuel (2,9 Go, 565 611 documents) est la mise bout à bout de deux sorties de **parquet** : l'ancien
+`texte.txt` (~0,1 Go de web FineWeb-2, puis ~1,3 Go de Wikipédia FR, 192 872 documents : ses 1 468 518 614 premiers
+octets), puis 1,4 Go de web de qualité (372 739 documents). Les extraits sont tirés au hasard dans tout le fichier :
+l'ordre ne compte pas.
+
+```bash
+# FineWeb2-HQ : https://huggingface.co/datasets/epfml/FineWeb2-HQ (ODC-BY), les 10 % meilleures pages françaises
+# de FineWeb-2. fra_Latn/000_00000 à 000_00002 : ~2 Go chacun, mais seulement ~0,5 Go de texte (le reste : d'autres colonnes)
+dotnet run --project DataBuilder -- parquet texte-hq.txt 000_00000.parquet 000_00001.parquet 000_00002.parquet
+cat texte-hq.txt >> Data/texte.txt
 ```
 - **gutenberg** retire l'en-tête et la licence, recolle les paragraphes (un par ligne),
   simplifie la typographie (’ … — -> ' ... -) et lit aussi les vieux fichiers en Latin-1.

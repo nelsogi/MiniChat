@@ -22,3 +22,4 @@ Data/texte.txt
 
 # Dialogues produits par DataBuilder (~36 Mo) : la commande pour les refaire est dans le README
 Data/dialogues.txt
+Data/dialogues-*.txt

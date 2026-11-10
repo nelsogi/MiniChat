@@ -63,6 +63,29 @@ public static partial class TextCleaner
     [GeneratedRegex("Å[“\"?«\u0080-\u009F�]?(?=u|il)|Å[“\u0093]")]
     private static partial Regex BrokenOe();
 
+    /// <summary>
+    /// Retire la mise en forme Markdown des réponses générées par d'autres IA : gras (**mot**, __mot__),
+    /// titres (## Titre), séparateurs (---, ***, ####), puces en début de ligne (- , * ).
+    /// "## Conseils\n- **Dormir** tôt" -> "Conseils\nDormir tôt". À appeler avant SingleLine (il lit les débuts de ligne).
+    /// </summary>
+    public static string StripMarkdown(string text) =>
+        Bold().Replace(Rules().Replace(LineMarks().Replace(text, ""), " "), "");
+
+    /// <summary>Formule LaTeX (\(...\), \[...\], $$...$$, \frac...) : illisible une fois sur une ligne pour un si petit modèle.</summary>
+    public static bool HasLatex(string text) => Latex().IsMatch(text);
+
+    [GeneratedRegex(@"^[ \t]*(#{1,6}[ \t]+|[-*+][ \t]+)", RegexOptions.Multiline)]
+    private static partial Regex LineMarks();
+
+    [GeneratedRegex(@"^[ \t]*([-*_#=])\1{2,}[ \t]*$|[ \t](-{3,}|\*{3,}|#{3,})(?=[ \t]|$)", RegexOptions.Multiline)]
+    private static partial Regex Rules();
+
+    [GeneratedRegex(@"\*\*|__")]
+    private static partial Regex Bold();
+
+    [GeneratedRegex(@"\\\(|\\\[|\$\$|\\(frac|sqrt|binom|times|cdot|sum|int|left|right)\b")]
+    private static partial Regex Latex();
+
     /// <summary>Met tout sur une ligne et réduit les espaces multiples à un seul.</summary>
     public static string SingleLine(string text) => Spaces().Replace(text, " ").Trim();
 

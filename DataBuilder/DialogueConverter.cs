@@ -17,6 +17,7 @@ public abstract class DialogueConverter
     // Raisons de rejet, affichées telles quelles dans le bilan.
     protected const string NoReply = "pas de réponse utilisable";
     protected const string HasCode = "contient du code";
+    protected const string HasLatex = "contient une formule LaTeX";
     protected const string ExoticChars = "caractères exotiques (emoji...)";
     protected const string QuestionTooLong = "question trop longue";
     protected const string NoSentenceEnd = "réponse trop longue, sans fin de phrase où couper";
@@ -98,9 +99,11 @@ public abstract class DialogueConverter
     {
         // Le code informatique n'a aucun sens pour un si petit modèle.
         if (rawText.Contains("```")) return (null, HasCode);
+        if (TextCleaner.HasLatex(rawText)) return (null, HasLatex);
 
         // Une réplique = une ligne : MiniChat s'arrête au premier retour à la ligne.
-        string text = TextCleaner.SingleLine(TextCleaner.Normalize(TextCleaner.FixBrokenOe(rawText)));
+        // Le Markdown (gras, titres, puces) des réponses d'autres IA est retiré avant : il ne s'affiche pas dans Nel Code.
+        string text = TextCleaner.SingleLine(TextCleaner.StripMarkdown(TextCleaner.Normalize(TextCleaner.FixBrokenOe(rawText))));
 
         if (text.Length == 0) return (null, Empty);
 

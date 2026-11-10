@@ -40,8 +40,8 @@ public sealed class ModelStore
 
     public ModelStore(string folder) => _folder = folder;
 
-    private string ConfigPath => Path.Combine(_folder, "config.json");
-    private string TokenizerPath => Path.Combine(_folder, "tokenizer.json");
+    public string ConfigPath => Path.Combine(_folder, "config.json");
+    public string TokenizerPath => Path.Combine(_folder, "tokenizer.json");
     public string WeightsPath => Path.Combine(_folder, "weights.dat");
     public string OptimizerPath => Path.Combine(_folder, "optimizer.dat");
     private string InfoPath => Path.Combine(_folder, "training.json");

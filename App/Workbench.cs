@@ -355,6 +355,45 @@ public sealed class Workbench
         return answers;
     }
 
+    /// <summary>
+    /// Exporte un modèle sauvegardé (model, model-pretrain, ou un nom de /save) en exports/&lt;nom&gt;.nelmodel,
+    /// pour /import dans Nel Code (voir NELMODEL-FORMAT.md), puis relit le fichier pour le vérifier.
+    /// Un export du même nom est remplacé.
+    /// </summary>
+    public ExportResult Export(string name, string source, string? description)
+    {
+        if (!IsValidName(name))
+            throw new UserException($"Nom invalide : « {name} ». Lettres, chiffres, - _ . (64 caractères au plus).");
+        var store = RequireStore(source);
+
+        // Le vrai nombre de paramètres : on charge le modèle (sur le CPU, la mémoire GPU reste au chat).
+        // Le chargement vérifie aussi que le modèle a ses tokens spéciaux, sans lesquels Nel Code le refuse.
+        long parameters;
+        using (var model = store.Load(CPU).Model)
+            parameters = model.ParameterCount;
+
+        var config = store.ReadConfig();
+        var training = store.ReadInfo();
+        var info = new NelModelInfo(NelModelFile.FormatVersion, name, DateTimeOffset.Now.ToString("yyyy-MM-dd'T'HH:mm:sszzz"),
+            parameters, config.Architecture, training?.ValLoss, training?.Step, description);
+
+        string path = Path.Combine(ExportsFolder, name + NelModelFile.Extension);
+        bool replaced = File.Exists(path);
+        NelModelFile.Write(store, info, path);
+        try
+        {
+            NelModelFile.Verify(path, store, parameters);
+        }
+        catch (InvalidDataException e)
+        {
+            File.Delete(path);
+            throw new UserException($"Export raté, fichier supprimé : {e.Message}");
+        }
+        return new ExportResult(path, NameOf(source), info, new FileInfo(path).Length, replaced);
+    }
+
+    private string ExportsFolder => Path.Combine(ModelsFolder, "exports");
+
     private ModelStore? TryStore(string name) =>
         name.Equals(ChatModel, StringComparison.OrdinalIgnoreCase) ? _store
         : name.Equals(PretrainedModel, StringComparison.OrdinalIgnoreCase) ? _pretrainStore
@@ -722,6 +761,9 @@ public sealed class Workbench
 /// </summary>
 public sealed record SavedModel(string Name, ModelConfig Config, long ParameterCount, long WeightsBytes,
     DateTime SavedAt, TrainingInfo? Info);
+
+/// <summary>Un .nelmodel écrit et vérifié par /export. Replaced = un export du même nom existait.</summary>
+public sealed record ExportResult(string Path, string Source, NelModelInfo Info, long Bytes, bool Replaced);
 
 /// <summary>Où un entraînement écrit son suivi : le CSV des loss, et les questions pour les exemples.</summary>
 public sealed record TrainingLog(string LossCsvPath, string QuestionsPath);

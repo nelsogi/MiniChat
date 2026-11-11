@@ -69,6 +69,37 @@ public sealed record TrainingConfig
     };
 
     /// <summary>
+    /// Pré-entraînement selon la taille du modèle (ModelConfig.SizeOf). small : Pretraining tel quel.
+    /// medium et large : contexte de 512 tokens, donc des petits batchs deux fois plus courts pour la mémoire
+    /// (8 x 8 et 4 x 16 = 64 extraits de 512 tokens, 32 768 tokens par étape), vitesse max plus basse
+    /// (un plus gros modèle est moins stable : 6e-4, comme GPT-3 de cette taille) et warmup plus long.
+    /// </summary>
+    public static TrainingConfig PretrainingFor(ModelConfig model) => ModelConfig.SizeOf(model) switch
+    {
+        "medium" => Pretraining with { BatchSize = 8, LearningRate = 6e-4, MinLearningRate = 6e-5, WarmupSteps = 1000 },
+        "large" => Pretraining with { BatchSize = 4, LearningRate = 6e-4, MinLearningRate = 6e-5, WarmupSteps = 1000 },
+        _ => Pretraining,
+    };
+
+    /// <summary>
+    /// Fine-tuning selon la taille du modèle : mêmes petits batchs qu'au pré-entraînement (mémoire), le reste
+    /// comme FineTuning. Texte général arrondi à 2 extraits sur 8 (medium) ou 1 sur 4 (large) : 25 %.
+    /// </summary>
+    public static TrainingConfig FineTuningFor(ModelConfig model) => ModelConfig.SizeOf(model) switch
+    {
+        "medium" => FineTuning with { BatchSize = 8 },
+        "large" => FineTuning with { BatchSize = 4 },
+        _ => FineTuning,
+    };
+
+    /// <summary>
+    /// Mémoire GPU (toute la carte, voir GpuMemory) à ne pas dépasser au premier pas : au-delà, le Trainer divise
+    /// BatchSize par deux et double l'accumulation (même EffectiveBatchSize, donc mêmes tokens par étape).
+    /// 7 Go : la marge d'une carte de 8 Go, que la loss de vérification et Windows utilisent aussi.
+    /// </summary>
+    public long GpuMemoryLimitMb { get; init; } = 7 * 1024;
+
+    /// <summary>
     /// Part de chaque batch tirée de texte.txt pendant le fine-tuning (0.2 = 20 %, arrondi : 3 extraits sur 16).
     /// Sans ça, le modèle oublie peu à peu le français général appris en phase 1.
     /// </summary>

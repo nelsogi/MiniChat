@@ -49,6 +49,7 @@ public sealed class NelShell
         // Échap pendant la commande ou la réponse : son token est annulé, elle s'arrête proprement.
         using var escape = EscapeKey.Watch();
         _context.Cancellation = escape.Token;
+        _context.Escape = escape;
         try
         {
             if (input.StartsWith('/'))
@@ -82,6 +83,7 @@ public sealed class NelShell
         finally
         {
             _context.Cancellation = default;
+            _context.Escape = null;
         }
     }
 }

@@ -47,7 +47,7 @@ public sealed class Trainer
     private readonly MiniGpt _model;
     private readonly TextDataset _dataset;
     private readonly TextDataset? _generalText;
-    private readonly TrainingConfig _config;
+    private TrainingConfig _config;   // BatchSize divisé par deux si la mémoire GPU déborde (voir FitGpuMemory)
     private readonly Device _device;
     private readonly string _phase;
     private readonly string? _lossCsvPath;
@@ -66,7 +66,7 @@ public sealed class Trainer
     private int _startStep;
 
     // Petits batchs par étape (EffectiveBatchSize / BatchSize), et pic de mémoire GPU vu.
-    private readonly int _accumulation;
+    private int _accumulation;
     private long _peakGpuMb;
 
     // Pas et temps de la mesure précédente : la vitesse (tokens/s) se calcule entre deux mesures.
@@ -215,6 +215,9 @@ public sealed class Trainer
 
             nn.utils.clip_grad_norm_(_model.parameters(), _config.GradClip);
             optimizer.step();
+
+            if (step == _startStep)
+                FitGpuMemory();
         }
 
         // On remet les poids qui avaient la meilleure loss de vérification (optimiseur sauvegardé avant, voir SaveFinalOptimizer).
@@ -226,6 +229,23 @@ public sealed class Trainer
             _progress.Log($"Mémoire GPU utilisée au maximum : {_peakGpuMb:N0} Mo.");
 
         return new TrainingResult(_startValLoss ?? _bestValLoss, _bestValLoss, _bestStep, lastStep, optimizerState);
+    }
+
+    /// <summary>
+    /// Après le premier pas (activations, gradients et AdamW sont tous en mémoire, c'est le pic) : si la mémoire
+    /// GPU dépasse GpuMemoryLimitMb, petits batchs deux fois plus petits et deux fois plus nombreux. Même
+    /// EffectiveBatchSize : l'étape apprend des mêmes tokens, le nombre de pas prévu ne change pas.
+    /// Une seule fois : libtorch garde en réserve la mémoire déjà prise, le chiffre ne redescendrait pas.
+    /// </summary>
+    private void FitGpuMemory()
+    {
+        if (GpuMemoryNow() is not { } memory || memory.UsedMb <= _config.GpuMemoryLimitMb || _config.BatchSize % 2 != 0)
+            return;
+
+        _config = _config with { BatchSize = _config.BatchSize / 2 };
+        _accumulation *= 2;
+        _progress.Log($"Mémoire GPU : {memory.UsedMb:N0} Mo au premier pas (plus de {_config.GpuMemoryLimitMb:N0}) : " +
+                      $"batch {_config.BatchSize} x {_accumulation} au lieu de {_config.BatchSize * 2} x {_accumulation / 2}.");
     }
 
     // Steps est gardé : une reprise finit la phase là où elle était prévue (même cosinus), même si les données ont changé.

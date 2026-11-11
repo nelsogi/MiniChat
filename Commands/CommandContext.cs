@@ -1,6 +1,8 @@
 using System.Globalization;
 using MiniChat.App;
 using MiniChat.Chat;
+using MiniChat.UI;
+using Spectre.Console;
 
 namespace MiniChat.Commands;
 
@@ -29,6 +31,26 @@ public sealed class CommandContext
 
     /// <summary>Annulé quand l'utilisateur appuie sur Échap pendant la commande en cours (entraînement, /test).</summary>
     public CancellationToken Cancellation { get; set; }
+
+    /// <summary>La surveillance d'Échap pendant la commande en cours (voir Confirm), null en dehors.</summary>
+    public EscapeKey? Escape { get; set; }
+
+    /// <summary>
+    /// Une question oui/non avant une commande longue (/train) : o ou n, Entrée = oui. Échap n'est plus surveillé
+    /// pendant la question (ses touches vont à la réponse). Entrée redirigée (script) : personne pour répondre, c'est oui.
+    /// </summary>
+    public bool Confirm(string question)
+    {
+        if (Console.IsInputRedirected)
+            return true;
+        using (Escape?.Pause())
+            return AnsiConsole.Prompt(new ConfirmationPrompt($"[{Theme.Accent}]{Markup.Escape(question)}[/]")
+            {
+                Yes = 'o',
+                No = 'n',
+                InvalidChoiceMessage = $"[{Theme.Error}]Réponds o (oui) ou n (non).[/]",
+            });
+    }
 
     /// <summary>
     /// La conversation avec le modèle chargé, null s'il n'y en a pas. La première part des réglages de

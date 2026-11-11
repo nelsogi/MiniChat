@@ -34,12 +34,16 @@ public sealed class Workbench
     public const string PretrainedModel = "model-pretrain";
 
     // Taille du vocabulaire BPE : plus grand = mots entiers plus souvent, mais plus de données nécessaires.
-    // 4000 : texte.txt fait maintenant des centaines de millions de tokens, de quoi apprendre chaque token.
-    private const int TokenizerVocabSize = 4000;
+    // 8000 : texte.txt fait près d'un milliard de tokens, de quoi apprendre chaque token ; chaque extrait de
+    // BlockSize tokens contient plus de texte. Les ids restent sur 2 octets dans cache/ (jusqu'à 32 767).
+    private const int TokenizerVocabSize = 8000;
 
-    // Le tokenizer apprend sur un échantillon de texte.txt réparti dans tout le fichier, pas sur le fichier entier :
-    // ~1 min 30 pour 20 Mo et 4000 tokens, et les fusions apprises ne changent presque plus au-delà.
-    private const int TokenizerSampleMb = 20;
+    // Le tokenizer apprend sur un échantillon de chaque fichier, réparti dans tout le fichier (voir ReadSample),
+    // pas sur les fichiers entiers : les fusions apprises ne changent presque plus au-delà. dialogues.txt a
+    // sa part à lui, sinon les mots des conversations (questions, "tu", consignes) seraient noyés dans texte.txt.
+    // ~1 min 30 pour 20 Mo et 4000 tokens ; compter quelques minutes pour 80 Mo et 8000 tokens.
+    private const int TokenizerTextSampleMb = 60;
+    private const int TokenizerDialogueSampleMb = 20;
 
     // identite.txt (qui est MiniChat) est mélangé aux dialogues du fine-tuning, chaque conversation recopiée
     // IdentityRepeats fois à des places tirées au hasard (graine fixe). Une seule copie ferait 0,04 % des
@@ -132,21 +136,42 @@ public sealed class Workbench
     // s'arrête proprement (meilleurs poids sauvegardés, avancement gardé pour /resume) et la suivante n'est pas lancée.
 
     /// <summary>
-    /// Nouveau modèle : pré-entraînement puis fine-tuning.
+    /// Ce que /train --size va faire, avant de le lancer : paramètres, pas et durée estimée de chaque phase.
+    /// Nombre de tokens estimé d'après la taille des fichiers (le tokenizer n'est pas encore entraîné).
+    /// </summary>
+    public TrainingPlan Plan(string size, double? epochs)
+    {
+        var config = SizeConfig(size);
+        long parameters;
+        using (var model = new MiniGpt(config))   // sur le CPU, juste pour compter
+            parameters = model.ParameterCount;
+
+        var pretrain = WithEpochs(TrainingConfig.PretrainingFor(config), epochs);
+        var fineTune = TrainingConfig.FineTuningFor(config);
+        int pretrainSteps = TrainingEstimate.Steps(pretrain, TrainingEstimate.TokensIn(CheckExists(_pretrainPath)), config.BlockSize);
+        int fineTuneSteps = TrainingEstimate.Steps(fineTune, TrainingEstimate.TokensIn(CheckExists(_dialoguesPath)), config.BlockSize);
+        return new TrainingPlan(size, config, parameters, pretrain, pretrainSteps,
+            TrainingEstimate.Duration(config, parameters, pretrain, pretrainSteps), fineTuneSteps,
+            TrainingEstimate.Duration(config, parameters, fineTune, fineTuneSteps));
+    }
+
+    /// <summary>
+    /// Nouveau modèle de la taille size (ModelConfig.Sizes) : pré-entraînement puis fine-tuning.
     /// epochs : passages sur texte.txt (--epochs), null = TrainingConfig.Pretraining.Epochs (1,1). Le nombre de pas
     /// en est calculé une fois texte.txt découpé (voir TrainingConfig.ForData).
     /// </summary>
-    public void Train(double? epochs = null, CancellationToken cancellation = default) => Training(cancellation, () =>
+    public void Train(string size = ModelConfig.DefaultSize, double? epochs = null, CancellationToken cancellation = default) =>
+        Training(cancellation, () =>
     {
         WarnIfInterrupted();
         string now = Now();
         var (log, checkpoint, answersPath) = NewRun(now, now);
 
-        var (model, tokenizer) = CreateModel();
+        var (model, tokenizer) = CreateModel(SizeConfig(size));
         checkpoint.Start(model, tokenizer);
-        Pretrain(model, tokenizer, _pretrainStore, WithEpochs(TrainingConfig.Pretraining, epochs), log, checkpoint, resume: null);
+        Pretrain(model, tokenizer, _pretrainStore, WithEpochs(TrainingConfig.PretrainingFor(model.Config), epochs), log, checkpoint, resume: null);
         if (Stopped(model, tokenizer, pretrainOnly: true)) return;
-        FineTune(model, tokenizer, _store, TrainingConfig.FineTuning, log, checkpoint, resume: null);
+        FineTune(model, tokenizer, _store, TrainingConfig.FineTuningFor(model.Config), log, checkpoint, resume: null);
         Finish(model, tokenizer, "pré-entraînement + fine-tuning", log, checkpoint, answersPath, pretrainOnly: false);
     });
 
@@ -166,7 +191,7 @@ public sealed class Workbench
         var (model, tokenizer) = _pretrainStore.Load(Device);
         Messages.Info($"Modèle pré-entraîné chargé depuis '{PretrainedModel}'.");
         checkpoint.Start(model, tokenizer);
-        FineTune(model, tokenizer, _store, WithEpochs(TrainingConfig.FineTuning, epochs), log, checkpoint, resume: null);
+        FineTune(model, tokenizer, _store, WithEpochs(TrainingConfig.FineTuningFor(model.Config), epochs), log, checkpoint, resume: null);
         Finish(model, tokenizer, "fine-tuning seul (--finetune)", log, checkpoint, answersPath, pretrainOnly: false);
     });
 
@@ -194,7 +219,7 @@ public sealed class Workbench
         var (model, tokenizer) = store.Load(Device);
         int firstStep = info?.Step ?? 0;
         var continuation = new ContinueState(phase, firstStep, steps,
-            BaseConfig(phase).Continuation(firstStep, steps, learningRate).LearningRate);
+            BaseConfig(phase, model.Config).Continuation(firstStep, steps, learningRate).LearningRate);
 
         Messages.Info($"Modèle chargé depuis '{StoreName(phase)}'" +
                       (info is null ? " (sauvegardé avant --continue : pas numérotés depuis 0)." : $", arrêté au pas {firstStep}."));
@@ -228,13 +253,13 @@ public sealed class Workbench
         }
         else if (state.Phase == "pretrain")
         {
-            Pretrain(model, tokenizer, _pretrainStore, TrainingConfig.Pretraining, log, checkpoint, state);
+            Pretrain(model, tokenizer, _pretrainStore, TrainingConfig.PretrainingFor(model.Config), log, checkpoint, state);
             if (Stopped(model, tokenizer, pretrainOnly: true)) return;
-            FineTune(model, tokenizer, _store, TrainingConfig.FineTuning, log, checkpoint, resume: null);
+            FineTune(model, tokenizer, _store, TrainingConfig.FineTuningFor(model.Config), log, checkpoint, resume: null);
         }
         else
         {
-            FineTune(model, tokenizer, _store, TrainingConfig.FineTuning, log, checkpoint, state);
+            FineTune(model, tokenizer, _store, TrainingConfig.FineTuningFor(model.Config), log, checkpoint, state);
         }
         Finish(model, tokenizer, "entraînement repris (--resume)", log, checkpoint, answersPath,
             pretrainOnly: continuation?.Phase == "pretrain");
@@ -531,16 +556,24 @@ public sealed class Workbench
         Messages.Dim($"(réponses écrites dans {path})");
     }
 
+    // Une taille de ModelConfig.Sizes, avec le vocabulaire du tokenizer qui sera entraîné.
+    private static ModelConfig SizeConfig(string size) =>
+        ModelConfig.Sizes.TryGetValue(size, out var config)
+            ? config with { VocabSize = TokenizerVocabSize }
+            : throw new UserException($"Taille inconnue : « {size} ». Tailles : {string.Join(", ", ModelConfig.Sizes.Keys)}.");
+
     // Nouveau modèle : entraîne le tokenizer BPE, puis crée le réseau (poids au hasard).
-    private (MiniGpt, BpeTokenizer) CreateModel()
+    // Un nouveau tokenizer a une autre empreinte : les tokens de cache/ sont redécoupés (voir TokenCache).
+    private (MiniGpt, BpeTokenizer) CreateModel(ModelConfig config)
     {
         manual_seed(TrainingConfig.Pretraining.Seed);
 
         // Le tokenizer apprend sur les DEUX fichiers : il connaît les mots des dialogues,
         // et le modèle garde le même vocabulaire (donc la même taille de sortie) entre les deux phases.
-        var tokenizer = Messages.Spin($"Entraînement du tokenizer BPE ({TokenizerVocabSize} tokens, sur {TokenizerSampleMb} Mo de texte.txt au plus)...",
-            () => BpeTokenizer.Train(ReadSample(_pretrainPath, TokenizerSampleMb) + "\n" + ReadDialogues(), TokenizerVocabSize));
-        var model = new MiniGpt(new ModelConfig { VocabSize = tokenizer.VocabSize }).to(Device);
+        var tokenizer = Messages.Spin($"Entraînement du tokenizer BPE ({TokenizerVocabSize} tokens, sur {TokenizerTextSampleMb} Mo " +
+                                      $"de texte.txt et {TokenizerDialogueSampleMb} Mo de dialogues.txt au plus)...",
+            () => BpeTokenizer.Train(ReadSample(_pretrainPath, TokenizerTextSampleMb) + "\n" + TokenizerDialogues(), TokenizerVocabSize));
+        var model = new MiniGpt(config with { VocabSize = tokenizer.VocabSize }).to(Device);
 
         Messages.Info($"Vocabulaire : {tokenizer.VocabSize} tokens ({tokenizer.Alphabet.Length} caractères de base + {tokenizer.Merges.Count} fusions " +
                       $"+ {tokenizer.SpecialTokens.Count} tokens spéciaux : {string.Join(" ", tokenizer.SpecialTokens)}).");
@@ -596,7 +629,7 @@ public sealed class Workbench
     private void ContinuePhase(ContinueState continuation, MiniGpt model, BpeTokenizer tokenizer, ModelStore store,
         TrainingInfo? previous, TrainingLog log, Checkpoint checkpoint, CheckpointState? resume)
     {
-        var config = BaseConfig(continuation.Phase).Continuation(continuation.FirstStep, continuation.Steps, continuation.LearningRate);
+        var config = BaseConfig(continuation.Phase, model.Config).Continuation(continuation.FirstStep, continuation.Steps, continuation.LearningRate);
         Messages.Info($"Continuation : pas {config.FirstStep} -> {config.Steps}, warmup {config.WarmupSteps} pas, " +
                       $"vitesse {config.LearningRate:0.0e0} -> {config.MinLearningRate:0.0e0}.");
 
@@ -673,8 +706,8 @@ public sealed class Workbench
 
     private static string StoreName(string phase) => phase == "pretrain" ? PretrainedModel : ChatModel;
 
-    private static TrainingConfig BaseConfig(string phase) =>
-        phase == "pretrain" ? TrainingConfig.Pretraining : TrainingConfig.FineTuning;
+    private static TrainingConfig BaseConfig(string phase, ModelConfig model) =>
+        phase == "pretrain" ? TrainingConfig.PretrainingFor(model) : TrainingConfig.FineTuningFor(model);
 
     private static string Now() => DateTime.Now.ToString("yyyy-MM-dd_HH-mm-ss");
 
@@ -718,6 +751,17 @@ public sealed class Workbench
                     conversations.Insert(random.Next(conversations.Count + 1), conversation);
         }
         return ChatFormat.FromDialogueFile(string.Join("\n\n", conversations));
+    }
+
+    // Les dialogues pour le tokenizer : un échantillon de dialogues.txt (voir ReadSample) et identite.txt en entier,
+    // au format du modèle comme à l'entraînement (BpeTokenizer.Train remplace les tokens spéciaux par "\n").
+    // L'échantillon commence au milieu d'une conversation : les lignes avant le premier "Toi:" ou "IA:" sont ignorées.
+    private string TokenizerDialogues()
+    {
+        string text = ReadSample(_dialoguesPath, TokenizerDialogueSampleMb);
+        if (File.Exists(_identityPath))
+            text += "\n\n" + ReadText(_identityPath);
+        return ChatFormat.FromDialogueFile(text);
     }
 
     // Les conversations d'un fichier Toi:/IA:, séparées par une ligne vide (comme les lit ChatFormat.FromDialogueFile).
@@ -767,3 +811,10 @@ public sealed record ExportResult(string Path, string Source, NelModelInfo Info,
 
 /// <summary>Où un entraînement écrit son suivi : le CSV des loss, et les questions pour les exemples.</summary>
 public sealed record TrainingLog(string LossCsvPath, string QuestionsPath);
+
+/// <summary>
+/// Ce que /train va faire (voir Workbench.Plan) : taille et réglages du modèle, paramètres, et pour chaque phase
+/// le nombre de pas et la durée estimés (voir TrainingEstimate).
+/// </summary>
+public sealed record TrainingPlan(string Size, ModelConfig Config, long Parameters, TrainingConfig Pretraining,
+    int PretrainSteps, TimeSpan PretrainDuration, int FineTuneSteps, TimeSpan FineTuneDuration);

@@ -16,7 +16,7 @@ Au lancement, un cadre d'accueil affiche le modèle chargé (taille), GPU ou CPU
 | Commande                                    | Ce qu'elle fait |
 |---------------------------------------------|-----------------|
 | `/help`                                     | La liste des commandes |
-| `/train [--epochs 1,1]`                     | Nouveau modèle : pré-entraînement + fine-tuning (longueur en passages sur `texte.txt`) |
+| `/train [--size small\|medium\|large] [--epochs 1,1]` | Nouveau modèle : pré-entraînement + fine-tuning (taille, voir plus bas ; longueur en passages sur `texte.txt`). Montre les paramètres et la durée estimée, puis demande confirmation |
 | `/finetune [--epochs 2,5]`                  | Refait seulement le fine-tuning, depuis `model-pretrain/` (passages sur les dialogues) |
 | `/continue <étapes> [finetune] [--lr 3e-4]` | Entraîne plus longtemps un modèle existant (voir plus bas) |
 | `/resume`                                   | Reprend un entraînement interrompu |
@@ -71,6 +71,7 @@ Les options en ligne de commande marchent toujours : elles lancent la commande q
 ```bash
 dotnet run -- --train      # refait tout : pré-entraînement + fine-tuning
 dotnet run -- --train --epochs 0.5       # pré-entraînement plus court : un demi-passage sur texte.txt
+dotnet run -- --train --size medium      # un plus gros modèle (voir « Tailles du modèle »)
 dotnet run -- --finetune   # refait seulement le fine-tuning, depuis model-pretrain/
 dotnet run -- --resume     # reprend un entraînement interrompu (coupure, plantage, Ctrl+C)
 dotnet run -- --continue 2000            # 2000 pas de pré-entraînement en plus, depuis model-pretrain/
@@ -115,7 +116,8 @@ Arrêt anticipé : si la loss de vérification ne s'améliore plus pendant 2000 
 jamais avant un passage complet sur les données (`EarlyStoppingMinEpochs`) : avant, chaque extrait est du texte
 neuf. Le nombre de passages faits s'affiche à chaque mesure (et dans la colonne `passages` du CSV).
 
-L'entraînement se fait en deux phases (réglages dans `TrainingConfig.Pretraining` / `FineTuning`).
+L'entraînement se fait en deux phases (réglages dans `TrainingConfig.Pretraining` / `FineTuning`,
+adaptés à la taille du modèle par `PretrainingFor` / `FineTuningFor`). Les durées ci-dessous sont celles du modèle small.
 Leur longueur se donne en passages sur les données (`Epochs`, option `--epochs`) : le nombre de pas en est
 calculé une fois les données découpées, et le cosinus du learning rate va toujours jusqu'au dernier pas prévu.
 
@@ -143,9 +145,14 @@ Initialisation d'un nouveau modèle (comme GPT-2) : embeddings et couches `Linea
 et les deux projections qui écrivent dans la connexion résiduelle (sortie de l'attention et du SwiGLU) selon
 N(0 ; 0,02/√(2 × Layers)), pour que la somme des 2 × Layers corrections ne grandisse pas avec la profondeur.
 
-Le tokenizer BPE (4000 tokens, `TokenizerVocabSize` dans `App/Workbench.cs`) est entraîné au début
-de la phase 1 sur les dialogues et un échantillon de 20 Mo de `texte.txt` réparti dans tout le fichier
-(`TokenizerSampleMb`, ~1 min 30), puis sauvegardé avec le modèle (`tokenizer.json`).
+Le tokenizer BPE (8000 tokens, `TokenizerVocabSize` dans `App/Workbench.cs`) est entraîné au début
+de la phase 1 sur un échantillon de 60 Mo de `texte.txt` et de 20 Mo de `dialogues.txt` (plus `identite.txt`),
+chacun pris en blocs de 1 Mo répartis dans tout le fichier (`TokenizerTextSampleMb`, `TokenizerDialogueSampleMb` ;
+quelques minutes), puis sauvegardé avec le modèle (`tokenizer.json`). Avec 8000 tokens au lieu de 4000, les mots
+fréquents tiennent plus souvent en un seul token : un même texte fait moins de tokens, et un extrait de 512 tokens
+contient plus de texte.
+Un nouveau tokenizer a une autre empreinte : le cache des tokens (`cache/`) est redécoupé au premier `/train`
+(~1 min pour `texte.txt`), et l'ancien fichier remplacé. Les modèles déjà entraînés gardent leur tokenizer.
 Si tu changes beaucoup les dialogues, refais un `--train` complet : `--finetune` garde
 l'ancien tokenizer (les caractères nouveaux seront ignorés).
 
@@ -170,13 +177,40 @@ Le tokenizer a quatre tokens spéciaux, jamais découpés ni fusionnés : `<|doc
 - Un modèle entraîné avant les tokens spéciaux ne peut plus être chargé (son vocabulaire n'a pas de place
   pour eux) : réentraîne-le avec `/train`.
 
-Le modèle (EmbedDim 512, 8 couches, 8 têtes, mémoire de 256 tokens, ~27 M paramètres) apprend
-à chaque étape sur 64 extraits de 256 tokens (16 384 tokens), envoyés au GPU par paquets de 16 (accumulation
-de gradients, voir `BatchSize` / `EffectiveBatchSize`). Sur une RTX 3060 Ti 8 Go : ~3,2 Go de mémoire GPU
-(toute la carte) plus ~1,9 Go pour les tokens de `texte.txt`, 0,42 s par étape avec TF32 (~39 000 tokens/s,
-0,53 s sans), soit ~6 h 30 de pré-entraînement pour 1,1 passage du `texte.txt` actuel. Des paquets de 32 ne vont pas plus vite.
+### Tailles du modèle (`/train --size`)
+
+Trois tailles (`ModelConfig.Sizes`), toutes avec des têtes d'attention de 64 dimensions :
+
+| Taille   | EmbedDim | Couches | Têtes | Contexte | Paramètres* | Batch par étape | LR max | Warmup |
+|----------|----------|---------|-------|----------|-------------|-----------------|--------|--------|
+| `small` (par défaut) | 512 | 8 | 8 | 256 | ~30 M | 16 x 4 extraits = 16 384 tokens | 1e-3 | 100 pas |
+| `medium` | 640 | 10 | 10 | 512 | ~55 M | 8 x 8 extraits = 32 768 tokens | 6e-4 | 1000 pas |
+| `large`  | 768 | 12 | 12 | 512 | ~91 M | 4 x 16 extraits = 32 768 tokens | 6e-4 | 1000 pas |
+
+\* avec 8000 tokens de vocabulaire. La vitesse descend en cosinus jusqu'à LR max / 10. Le fine-tuning garde
+ses réglages (2e-4, 2,5 passages) avec les mêmes paquets que le pré-entraînement (8 ou 4 extraits) ; le texte
+général y est arrondi à 2 extraits sur 8 (1 sur 4 pour large), soit 25 %.
+
+Avant de commencer, `/train` affiche le nombre exact de paramètres, le nombre d'étapes de chaque phase et la
+durée estimée, puis demande confirmation (`o` / `n`, Entrée = oui). L'estimation (`Training/TrainingEstimate.cs`)
+compte les calculs d'une étape (~6 opérations par paramètre et par token, plus l'attention) au rythme mesuré
+avec small sur une RTX 3060 Ti, et les tokens d'après la taille des fichiers : un ordre de grandeur
+(medium : ~14 h de pré-entraînement pour 1,1 passage du `texte.txt` actuel, large : ~24 h).
+
+Mémoire GPU : si elle dépasse 7 Go (toute la carte, `GpuMemoryLimitMb`) après le premier pas, les paquets
+sont divisés par deux et l'accumulation doublée (8 x 8 -> 4 x 16) : même nombre de tokens par étape, même
+nombre d'étapes prévu. Un message le dit. Les tokens de `texte.txt` (~1,8 Go) sont sur le GPU et comptent dans
+ces 7 Go.
+
+Les modèles déjà entraînés gardent leur taille (`config.json`). `/finetune`, `/continue` et `/resume`
+reconnaissent la taille d'un modèle à ses dimensions et reprennent ses réglages.
+
+Le modèle small apprend à chaque étape sur 64 extraits de 256 tokens (16 384 tokens), envoyés au GPU par
+paquets de 16 (accumulation de gradients, voir `BatchSize` / `EffectiveBatchSize`). Sur une RTX 3060 Ti 8 Go :
+~3,2 Go de mémoire GPU (toute la carte) plus ~1,9 Go pour les tokens de `texte.txt`, 0,42 s par étape avec TF32
+(~39 000 tokens/s, 0,53 s sans), soit ~6 h 30 de pré-entraînement pour 1,1 passage du `texte.txt` actuel
+(mesuré avec le tokenizer de 4000 tokens). Des paquets de 32 ne vont pas plus vite.
 La mémoire GPU utilisée s'affiche à chaque mesure de loss.
-Les modèles déjà entraînés gardent leur taille (`config.json`) : ces réglages valent pour le prochain `--train`.
 
 Le modèle entraîné est sauvegardé dans `bin/.../model/` : les lancements suivants
 démarrent directement le chat.

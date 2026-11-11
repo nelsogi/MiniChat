@@ -59,16 +59,18 @@ new NelShell(workbench, settings, settingsPath).Run(StartupCommand(args));
 //   --continue-finetune <pas>  /continue <pas> finetune   (fine-tuning en plus, depuis model/)
 //   --lr <vitesse>             ... --lr <vitesse>         (vitesse de départ d'une continuation)
 //   --epochs <passages>        ... --epochs <passages>    (longueur de --train ou --finetune, en passages sur les données)
+//   --size <taille>            /train --size <taille>     (small, medium, large : voir ModelConfig.Sizes)
 static string? StartupCommand(string[] args)
 {
     string lr = ReadOption(args, "--lr", "3e-4") is { } rate ? $" --lr {rate}" : "";
     string epochs = ReadOption(args, "--epochs", "1.1") is { } passes ? $" --epochs {passes}" : "";
+    string size = ReadOption(args, "--size", "medium") is { } name ? $" --size {name}" : "";
 
     if (args.Contains("--resume")) return "/resume";
     if (ReadOption(args, "--continue", "2000") is { } steps) return $"/continue {steps}{lr}";
     if (ReadOption(args, "--continue-finetune", "200") is { } finetuneSteps) return $"/continue {finetuneSteps} finetune{lr}";
     if (args.Contains("--finetune")) return "/finetune" + epochs;
-    if (args.Contains("--train")) return "/train" + epochs;
+    if (args.Contains("--train")) return "/train" + size + epochs;
     return null;
 }
 

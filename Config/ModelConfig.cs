@@ -25,9 +25,36 @@ public enum ModelArchitecture
 /// Taille et forme du réseau de neurones.
 /// Plus les valeurs sont grandes, plus le modèle est capable... et lent à entraîner.
 /// Ces réglages valent pour le prochain /train : un modèle sauvegardé garde les siens (config.json).
+/// Trois tailles toutes prêtes (voir Sizes), choisies avec /train --size.
 /// </summary>
-public sealed class ModelConfig
+public sealed record ModelConfig
 {
+    /// <summary>
+    /// Les tailles de /train --size. Têtes de 64 dimensions partout (EmbedDim / Heads).
+    ///   small   512 dims, 8 couches, 8 têtes, contexte 256 : le modèle d'avant, ~30 M paramètres
+    ///   medium  640 dims, 10 couches, 10 têtes, contexte 512 : ~55 M paramètres
+    ///   large   768 dims, 12 couches, 12 têtes, contexte 512 : ~91 M paramètres (la taille de GPT-2 small)
+    /// (avec 8000 tokens de vocabulaire). Les réglages d'entraînement de chaque taille :
+    /// TrainingConfig.PretrainingFor et FineTuningFor.
+    /// </summary>
+    public static readonly IReadOnlyDictionary<string, ModelConfig> Sizes = new Dictionary<string, ModelConfig>
+    {
+        ["small"] = new(),
+        ["medium"] = new() { BlockSize = 512, EmbedDim = 640, Layers = 10, Heads = 10 },
+        ["large"] = new() { BlockSize = 512, EmbedDim = 768, Layers = 12, Heads = 12 },
+    };
+
+    public const string DefaultSize = "small";
+
+    /// <summary>
+    /// La taille (clé de Sizes) d'un modèle, d'après ses dimensions, ses couches et ses têtes :
+    /// un modèle sauvegardé est reconnu sans que sa taille soit écrite dans config.json.
+    /// null : un modèle aux dimensions faites à la main.
+    /// </summary>
+    public static string? SizeOf(ModelConfig config) =>
+        Sizes.FirstOrDefault(s => s.Value.EmbedDim == config.EmbedDim && s.Value.Layers == config.Layers
+                                  && s.Value.Heads == config.Heads).Key;
+
     /// <summary>Nombre de tokens différents connus (rempli à partir du tokenizer).</summary>
     public int VocabSize { get; init; }
 

@@ -391,28 +391,39 @@ public sealed class Workbench
             throw new UserException($"Nom invalide : « {name} ». Lettres, chiffres, - _ . (64 caractères au plus).");
         var store = RequireStore(source);
 
-        // Le vrai nombre de paramètres : on charge le modèle (sur le CPU, la mémoire GPU reste au chat).
-        // Le chargement vérifie aussi que le modèle a ses tokens spéciaux, sans lesquels Nel Code le refuse.
-        long parameters;
-        using (var model = store.Load(CPU).Model)
-            parameters = model.ParameterCount;
-
         var config = store.ReadConfig();
         var training = store.ReadInfo();
-        var info = new NelModelInfo(NelModelFile.FormatVersion, name, DateTimeOffset.Now.ToString("yyyy-MM-dd'T'HH:mm:sszzz"),
-            parameters, config.Architecture, training?.ValLoss, training?.Step, description);
-
         string path = Path.Combine(ExportsFolder, name + NelModelFile.Extension);
         bool replaced = File.Exists(path);
-        NelModelFile.Write(store, info, path);
+
+        // Le modèle est chargé sur le CPU (la mémoire GPU reste au chat) : pour le vrai nombre de paramètres,
+        // model.safetensors et reference.json (calculé en float32, sans TF32). Le chargement vérifie aussi que le
+        // modèle a ses tokens spéciaux, sans lesquels Nel Code le refuse.
+        string generated = Path.Combine(Path.GetTempPath(), "minichat-export-" + Guid.NewGuid().ToString("N"));
+        NelModelInfo info;
         try
         {
-            NelModelFile.Verify(path, store, parameters);
+            var (model, tokenizer) = store.Load(CPU);
+            using (model)
+            {
+                info = new NelModelInfo(NelModelFile.FormatVersion, name, DateTimeOffset.Now.ToString("yyyy-MM-dd'T'HH:mm:sszzz"),
+                    model.ParameterCount, config.Architecture, training?.ValLoss, training?.Step, description);
+                Directory.CreateDirectory(generated);
+                NelModelFile.WriteGenerated(model, tokenizer, generated);
+            }
+
+            NelModelFile.Write(store, generated, info, path);
+            NelModelFile.Verify(path, store, info.Parameters!.Value);
         }
         catch (InvalidDataException e)
         {
             File.Delete(path);
             throw new UserException($"Export raté, fichier supprimé : {e.Message}");
+        }
+        finally
+        {
+            if (Directory.Exists(generated))
+                Directory.Delete(generated, recursive: true);
         }
         return new ExportResult(path, NameOf(source), info, new FileInfo(path).Length, replaced);
     }

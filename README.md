@@ -24,7 +24,7 @@ Au lancement, un cadre d'accueil affiche le modèle chargé (taille), GPU ou CPU
 | `/models`                                   | Les modèles sauvegardés : taille, loss de vérification, pas, dates |
 | `/save <nom>`                               | Garde le modèle chargé sous un nom (`saved/<nom>/`), avant un `/train` ou un `/continue` par exemple |
 | `/load <nom>`                               | Charge un modèle (`model`, `model-pretrain` ou un nom de `/save`) pour le chat |
-| `/export <nom> [description] [--from model-pretrain]` | Exporte un modèle (par défaut `model`) en `exports/<nom>.nelmodel`, pour `/import` dans Nel Code (format : `NELMODEL-FORMAT.md`) |
+| `/export <nom> [description] [--from model-pretrain]` | Exporte un modèle (par défaut `model`) en `exports/<nom>.nelmodel`, pour `/import` dans Nel Code (format version 2, avec `model.safetensors` et `reference.json` : `NELMODEL-FORMAT.md`) |
 | `/compare <nom1> <nom2>`                    | Les questions de test posées aux deux modèles, réponses côte à côte |
 | `/stats`                                    | Courbes de loss (entraînement et vérification) du dernier entraînement, meilleur point marqué ★ |
 | `/temp 0.8`, `/topk 20`, `/topp 0.9`        | Réglages de génération pour la conversation en cours (sans nombre : affiche la valeur) |

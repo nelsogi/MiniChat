@@ -83,6 +83,8 @@ switch (command)
                 CalculGenerator.Operation.Addition => "additions",
                 CalculGenerator.Operation.Subtraction => "soustractions",
                 _ => "multiplications" }}")) + ".");
+        Console.WriteLine("Par nombre de tours : " + string.Join(", ",
+            generator.TurnCounts.Select(t => $"{t.Value:N0} de {t.Key} tour{(t.Key > 1 ? "s" : "")}")) + ".");
         output = AppendTo(outputPath, output, options);
         break;
 

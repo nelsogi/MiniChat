@@ -335,7 +335,10 @@ dotnet run --project DataBuilder -- sans-eval Data/dialogues.txt Data/eval.json
   négatif), une douzaine de formulations par opération (« Combien font 7 + 5 ? », « Quelle est la somme de 7 et 5 ? »,
   petits problèmes de billes, de crayons...). `--count` (20 000) et `--seed` (1) : mêmes dialogues à chaque fois.
   Aucune question n'est une question de `eval.json`, et aucun de ses calculs n'est repris (ni 7 + 5, ni 5 + 7) :
-  `/eval` mesure si le modèle sait calculer, pas s'il a retenu la réponse.
+  `/eval` mesure si le modèle sait calculer, pas s'il a retenu la réponse. 30 % des conversations ont 2 ou 3 tours :
+  les questions d'après reprennent le résultat (« Et si on ajoute 4 ? », « Multiplie ça par 2. », « Double ce
+  résultat. »), et leurs calculs ne sont pas non plus ceux de `eval.json`. Avec la graine 1 : 14 000 conversations
+  d'un tour, 2 975 de deux, 3 025 de trois.
 - **sans-eval** retire d'un `dialogues.txt` les conversations qui contiennent une question de `eval.json` mot pour
   mot (sans tenir compte des majuscules, des accents ni de la ponctuation, en mots entiers). À refaire après chaque
   ajout de dialogues : le test `NoEvalQuestionIsInTheDialogues` échoue sinon.

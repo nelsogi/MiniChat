@@ -82,7 +82,7 @@ public sealed class CalculGeneratorTests
 {
     private static readonly string EvalPath = Path.Combine(AppContext.BaseDirectory, "eval.json");
 
-    private static List<(string Question, string Reply, CalculGenerator.Problem Problem)> Generate(int count, int seed) =>
+    private static List<CalculGenerator.Dialogue> Generate(int count, int seed) =>
         new CalculGenerator(CalculGenerator.ReadEvalQuestions(EvalPath)).Generate(count, seed);
 
     [Fact]
@@ -99,33 +99,63 @@ public sealed class CalculGeneratorTests
         var evalSimplified = evalQuestions.Select(CalculGenerator.Simplify).ToHashSet();
         var evalProblems = evalQuestions.SelectMany(CalculGenerator.ProblemsIn).ToHashSet();
         var dialogues = Generate(20_000, 1);
+        var firsts = dialogues.Select(d => d.Turns[0]).ToList();
 
         Assert.Equal(20_000, dialogues.Count);
-        Assert.Equal(dialogues.Count, dialogues.Select(d => d.Question).Distinct().Count());
+        Assert.Equal(dialogues.Count, firsts.Select(t => t.Question).Distinct().Count());
         Assert.All(Enum.GetValues<CalculGenerator.Operation>(),
-            op => Assert.InRange(dialogues.Count(d => d.Problem.Op == op), 6_666, 6_667));
-        Assert.All(dialogues, d =>
+            op => Assert.InRange(firsts.Count(t => t.Problem.Op == op), 6_666, 6_667));
+        Assert.All(firsts, t =>
         {
-            Assert.InRange(d.Problem.A, 0, CalculGenerator.MaxNumber);
-            Assert.InRange(d.Problem.B, 0, CalculGenerator.MaxNumber);
-            Assert.True(d.Problem.Result >= 0, d.Question);
-            Assert.Contains($" {d.Problem.Result} ", $" {CalculGenerator.Simplify(d.Reply)} ");
-            Assert.DoesNotContain(CalculGenerator.Simplify(d.Question), evalSimplified);
-            Assert.DoesNotContain(d.Problem, evalProblems);
+            Assert.InRange(t.Problem.A, 0, CalculGenerator.MaxNumber);
+            Assert.InRange(t.Problem.B, 0, CalculGenerator.MaxNumber);
             // La question demande bien ce calcul (aussi pour les petits problèmes : « 12 boîtes de 3 crayons »).
-            Assert.Contains(d.Problem.A.ToString(), d.Question);
-            Assert.Contains(d.Problem.B.ToString(), d.Question);
+            Assert.Contains(t.Problem.A.ToString(), t.Question);
+            Assert.Contains(t.Problem.B.ToString(), t.Question);
+        });
+        Assert.All(dialogues.SelectMany(d => d.Turns), t =>
+        {
+            Assert.True(t.Problem.Result >= 0, t.Question);
+            Assert.Contains($" {t.Problem.Result} ", $" {CalculGenerator.Simplify(t.Reply)} ");
+            Assert.DoesNotContain(CalculGenerator.Simplify(t.Question), evalSimplified);
+            Assert.DoesNotContain(t.Problem, evalProblems);
+        });
+    }
+
+    [Fact]
+    public void ThirtyPercentOfConversationsFollowThePreviousResult()
+    {
+        var dialogues = Generate(20_000, 1);
+        var multiTurn = dialogues.Where(d => d.Turns.Count > 1).ToList();
+
+        // 3 conversations sur 10, de 2 ou 3 tours (un peu moins si aucune suite ne convenait).
+        Assert.InRange(multiTurn.Count, 5_900, 6_000);
+        Assert.All(dialogues, d => Assert.InRange(d.Turns.Count, 1, 3));
+        Assert.Contains(multiTurn, d => d.Turns.Count == 2);
+        Assert.Contains(multiTurn, d => d.Turns.Count == 3);
+        Assert.All(multiTurn, d =>
+        {
+            for (int i = 1; i < d.Turns.Count; i++)
+            {
+                var (previous, problem) = (d.Turns[i - 1].Problem.Result, d.Turns[i].Problem);
+                // Le calcul part du résultat d'avant, avec un nombre de 0 à 100.
+                Assert.True(problem.A == previous || problem.B == previous, d.Turns[i].Question);
+                Assert.InRange(Math.Min(problem.A, problem.B) == previous ? Math.Max(problem.A, problem.B) : Math.Min(problem.A, problem.B),
+                    0, CalculGenerator.MaxNumber);
+            }
         });
     }
 
     [Fact]
     public void FormatIsTheDialogueFile()
     {
-        string text = CalculGenerator.Format(Generate(2, 1));
+        var dialogues = Generate(10, 1);
+        string text = CalculGenerator.Format(dialogues);
         var conversations = text.Split("\n\n");
 
-        Assert.Equal(2, conversations.Length);
-        Assert.All(conversations, c => Assert.Matches(@"^Toi: [^\n]+\nIA: [^\n]+\n?$", c));
+        Assert.Equal(10, conversations.Length);
+        Assert.All(conversations, c => Assert.Matches(@"^(Toi: [^\n]+\nIA: [^\n]+\n?){1,3}$", c));
+        Assert.Equal(dialogues.Select(d => d.Turns.Count), conversations.Select(c => c.Split("Toi: ").Length - 1));
         Assert.EndsWith("\n", text);
     }
 
@@ -143,7 +173,7 @@ public sealed class CalculGeneratorTests
     public void EvalCalculationIsNeverAskedInAnyWording()
     {
         var generator = new CalculGenerator(["Combien font 7 + 5 ?", "Combien font 3 fois 4 ?"]);
-        var problems = generator.Generate(15_000, 3).Select(d => d.Problem).ToHashSet();
+        var problems = generator.Generate(15_000, 3).SelectMany(d => d.Turns).Select(t => t.Problem).ToHashSet();
 
         Assert.DoesNotContain(CalculGenerator.Problem.Of(CalculGenerator.Operation.Addition, 7, 5), problems);
         Assert.DoesNotContain(CalculGenerator.Problem.Of(CalculGenerator.Operation.Multiplication, 4, 3), problems);

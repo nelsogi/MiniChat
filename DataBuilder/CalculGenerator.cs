@@ -14,6 +14,10 @@ namespace DataBuilder;
 /// ponctuation), et aucun calcul n'est un calcul de eval.json (7 + 5 n'est jamais demandé si eval.json le demande, ni
 /// 5 + 7, ni 3 fois 4 / 4 fois 3) : /eval mesure si le modèle sait calculer, pas s'il a appris la réponse par cœur.
 /// Les soustractions ne donnent jamais de nombre négatif. Une question n'est posée qu'une fois.
+///
+/// MultiTurnShare des conversations (30 %) ont 2 ou 3 tours : les questions d'après reprennent le résultat précédent
+/// (« Et si on ajoute 4 ? », « Multiplie ça par 2. »), pour que le modèle apprenne à suivre une conversation. Ces
+/// calculs-là non plus ne sont jamais des calculs de eval.json.
 /// </summary>
 public sealed partial class CalculGenerator
 {
@@ -32,6 +36,39 @@ public sealed partial class CalculGenerator
         public static Problem Of(Operation op, int a, int b) =>
             op == Operation.Subtraction || a <= b ? new(op, a, b) : new(op, b, a);
     }
+
+    /// <summary>Un tour : la question, la réponse, et le calcul demandé.</summary>
+    public sealed record Turn(string Question, string Reply, Problem Problem);
+
+    /// <summary>Une conversation de 1 à 3 tours.</summary>
+    public sealed record Dialogue(IReadOnlyList<Turn> Turns);
+
+    /// <summary>Part des conversations à 2 ou 3 tours : 3 sur 10.</summary>
+    public const double MultiTurnShare = 0.3;
+
+    /// <summary>
+    /// Une question qui reprend le résultat précédent ({a}) avec un nombre {b} (Fixed : toujours le même, « Double ce
+    /// résultat. ») ; {r} = le nouveau résultat.
+    /// </summary>
+    private sealed record FollowUp(Operation Op, string Question, string[] Replies, int? Fixed = null);
+
+    private static readonly FollowUp[] FollowUps =
+    [
+        new(Operation.Addition, "Et si on ajoute {b} ?", ["{a} + {b} = {r}.", "Ça fait {r}.", "Alors on obtient {r}."]),
+        new(Operation.Addition, "Et si j'en ajoute {b} ?", ["{a} + {b} = {r}.", "Tu en as alors {r}."]),
+        new(Operation.Addition, "Ajoute {b} à ce résultat.", ["{a} + {b} = {r}.", "Ça fait {r}."]),
+        new(Operation.Addition, "Plus {b}, ça fait combien ?", ["{a} + {b} = {r}.", "Ça fait {r}."]),
+        new(Operation.Addition, "Et avec {b} de plus ?", ["{a} + {b} = {r}.", "On arrive à {r}."]),
+        new(Operation.Subtraction, "Et si on enlève {b} ?", ["{a} - {b} = {r}.", "Il reste {r}."]),
+        new(Operation.Subtraction, "Retire {b} à ce résultat.", ["{a} - {b} = {r}.", "Ça fait {r}."]),
+        new(Operation.Subtraction, "Moins {b}, ça fait combien ?", ["{a} - {b} = {r}.", "Ça fait {r}."]),
+        new(Operation.Subtraction, "Et si on en retire {b} ?", ["{a} - {b} = {r}.", "Il en reste {r}."]),
+        new(Operation.Multiplication, "Multiplie ça par {b}.", ["{a} x {b} = {r}.", "Ça fait {r}."]),
+        new(Operation.Multiplication, "Et si on multiplie par {b} ?", ["{a} x {b} = {r}.", "Alors on obtient {r}."]),
+        new(Operation.Multiplication, "Et fois {b} ?", ["{a} x {b} = {r}.", "Ça fait {r}."]),
+        new(Operation.Multiplication, "Double ce résultat.", ["Le double de {a} est {r}.", "{a} x 2 = {r}."], Fixed: 2),
+        new(Operation.Multiplication, "Triple ce résultat.", ["Le triple de {a} est {r}.", "{a} x 3 = {r}."], Fixed: 3),
+    ];
 
     /// <summary>Une formulation : la question et ses réponses possibles, avec {a}, {b} et {r} (le résultat). Min : plus petit nombre (2 pour un petit problème : ni « 0 crayons » ni « 1 livres »).</summary>
     private sealed record Template(string Question, string[] Replies, int Min = 0);
@@ -95,8 +132,11 @@ public sealed partial class CalculGenerator
     /// <summary>Calculs de eval.json reconnus (jamais demandés).</summary>
     public int ExcludedProblems => _excludedProblems.Count;
 
-    /// <summary>Dialogues fabriqués par opération.</summary>
+    /// <summary>Dialogues fabriqués par opération (celle du premier tour).</summary>
     public Dictionary<Operation, int> Counts { get; } = new();
+
+    /// <summary>Dialogues fabriqués par nombre de tours.</summary>
+    public SortedDictionary<int, int> TurnCounts { get; } = new();
 
     /// <param name="evalQuestions">Les questions de eval.json : ni elles, ni leurs calculs ne sont repris.</param>
     public CalculGenerator(IEnumerable<string> evalQuestions)
@@ -116,12 +156,14 @@ public sealed partial class CalculGenerator
                 yield return value;
     }
 
-    /// <summary>count dialogues d'un tour (question, réponse), dans l'ordre du tirage.</summary>
-    public List<(string Question, string Reply, Problem Problem)> Generate(int count, int seed)
+    /// <summary>
+    /// count dialogues, dans l'ordre du tirage : 3 sur 10 (MultiTurnShare) ont 2 ou 3 tours, les autres un seul.
+    /// </summary>
+    public List<Dialogue> Generate(int count, int seed)
     {
         var random = new Random(seed);
         var questions = new HashSet<string>();
-        var dialogues = new List<(string, string, Problem)>(count);
+        var dialogues = new List<Dialogue>(count);
         var operations = Enum.GetValues<Operation>();
 
         // 3 opérations x ~5 000 calculs x ~11 formulations : bien plus de questions que demandé, la boucle finit vite.
@@ -139,20 +181,60 @@ public sealed partial class CalculGenerator
             if (_excludedProblems.Contains(problem) || _excludedQuestions.Contains(Simplify(question)) || !questions.Add(question))
                 continue;
 
-            dialogues.Add((question, Fill(reply, a, b, problem.Result), problem));
+            var turns = new List<Turn> { new(question, Fill(reply, a, b, problem.Result), problem) };
+            // 3 conversations sur 10 (les 3 premières de chaque dizaine) : 1 ou 2 questions de plus sur le résultat.
+            if (dialogues.Count % 10 < MultiTurnShare * 10)
+            {
+                int more = random.Next(1, 3);
+                while (turns.Count <= more && FollowUpOf(random, turns[^1].Problem.Result) is { } next)
+                    turns.Add(next);
+            }
+
+            dialogues.Add(new Dialogue(turns));
             Counts[op] = Counts.GetValueOrDefault(op) + 1;
+            TurnCounts[turns.Count] = TurnCounts.GetValueOrDefault(turns.Count) + 1;
         }
         return dialogues;
     }
 
+    /// <summary>
+    /// Une question sur le résultat précédent : ajouter ou enlever un nombre de 1 à 100 (jamais en dessous de 0),
+    /// ou multiplier par 2 à 10 un résultat qui ne dépasse pas 100. null si aucun essai ne convient (calcul de eval.json).
+    /// </summary>
+    private Turn? FollowUpOf(Random random, int previous)
+    {
+        for (int attempt = 0; attempt < 20; attempt++)
+        {
+            var followUp = FollowUps[random.Next(FollowUps.Length)];
+            if (followUp.Op == Operation.Multiplication && previous > MaxNumber || followUp.Op == Operation.Subtraction && previous < 1)
+                continue;
+
+            int b = followUp.Fixed ?? followUp.Op switch
+            {
+                Operation.Addition => random.Next(1, MaxNumber + 1),
+                Operation.Subtraction => random.Next(1, Math.Min(previous, MaxNumber) + 1),
+                _ => random.Next(2, 11),
+            };
+            var problem = Problem.Of(followUp.Op, previous, b);
+            string question = Fill(followUp.Question, previous, b, problem.Result);
+            if (_excludedProblems.Contains(problem) || _excludedQuestions.Contains(Simplify(question)))
+                continue;
+
+            string reply = followUp.Replies[random.Next(followUp.Replies.Length)];
+            return new Turn(question, Fill(reply, previous, b, problem.Result), problem);
+        }
+        return null;
+    }
+
     /// <summary>Les dialogues au format de dialogues.txt.</summary>
-    public static string Format(IEnumerable<(string Question, string Reply, Problem Problem)> dialogues)
+    public static string Format(IEnumerable<Dialogue> dialogues)
     {
         var output = new StringBuilder();
-        foreach (var (question, reply, _) in dialogues)
+        foreach (var dialogue in dialogues)
         {
             if (output.Length > 0) output.Append('\n');
-            output.Append("Toi: ").Append(question).Append('\n').Append("IA: ").Append(reply).Append('\n');
+            foreach (var turn in dialogue.Turns)
+                output.Append("Toi: ").Append(turn.Question).Append('\n').Append("IA: ").Append(turn.Reply).Append('\n');
         }
         return output.ToString();
     }

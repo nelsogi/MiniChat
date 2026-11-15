@@ -71,6 +71,18 @@ internal static class TestData
                 $"Toi: {questions[random.Next(questions.Length)]}\nIA: {replies[random.Next(replies.Length)]}"))));
     }
 
+    /// <summary>
+    /// Un fichier du dossier Data/ du projet (au-dessus du dossier des tests, là où est MiniChat.csproj),
+    /// ou un chemin qui n'existe pas si le projet n'est pas trouvé.
+    /// </summary>
+    public static string ProjectDataFile(string name)
+    {
+        for (var folder = new DirectoryInfo(AppContext.BaseDirectory); folder is not null; folder = folder.Parent)
+            if (File.Exists(System.IO.Path.Combine(folder.FullName, "MiniChat.csproj")))
+                return System.IO.Path.Combine(folder.FullName, "Data", name);
+        return System.IO.Path.Combine(AppContext.BaseDirectory, "introuvable", name);
+    }
+
     /// <summary>Réglages d'un entraînement de quelques pas sur le modèle minuscule.</summary>
     public static TrainingConfig TinyTraining(int steps) => new()
     {

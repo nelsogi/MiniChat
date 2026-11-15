@@ -21,7 +21,7 @@ Au lancement, un cadre d'accueil affiche le modèle chargé (taille), GPU ou CPU
 | `/continue <étapes> [finetune] [--lr 3e-4]` | Entraîne plus longtemps un modèle existant (voir plus bas) |
 | `/resume`                                   | Reprend un entraînement interrompu |
 | `/test`                                     | Questions de test sur le modèle chargé (réponses dans `results/<date>-test.txt`) |
-| `/eval [nom]`                               | Évaluation notée : les 100 questions de `data/eval.json`, score par catégorie, comparé à l'évaluation d'avant (voir plus bas) |
+| `/eval [nom]`                               | Évaluation notée : les 300 questions de `data/eval.json`, score par catégorie, comparé à l'évaluation d'avant (voir plus bas) |
 | `/models`                                   | Les modèles sauvegardés : taille, loss de vérification, pas, dates |
 | `/save <nom>`                               | Garde le modèle chargé sous un nom (`saved/<nom>/`), avant un `/train` ou un `/continue` par exemple |
 | `/load <nom>`                               | Charge un modèle (`model`, `model-pretrain` ou un nom de `/save`) pour le chat |
@@ -128,12 +128,13 @@ calculé une fois les données découpées, et le cosinus du learning rate va to
    Dropout 0 (le modèle ne revoit presque jamais le même texte), AdamW betas (0,9 ; 0,95), weight decay 0,1
    sur les matrices des couches mais pas sur l'embedding des tokens.
    `texte.txt` peut faire plusieurs Go : il est lu ligne par ligne, et ses tokens
-   restent sur le GPU, 2 octets chacun (2,9 Go de texte -> ~920 M tokens -> ~1,9 Go de mémoire GPU).
+   restent sur le CPU, 2 octets chacun (2,9 Go de texte -> ~820 M tokens -> ~1,6 Go de mémoire du PC) : seuls
+   les extraits de chaque micro-batch passent sur le GPU (0,3 ms pour 4 x 512 tokens), la carte reste pour l'entraînement.
    Le découpage en tokens (~1 min) n'est fait qu'une fois : il est gardé dans `bin/.../cache/` et relu
    en ~1 s tant que `texte.txt` et le tokenizer ne changent pas (même chose pour `dialogues.txt`).
 2. **Fine-tuning** sur `data/dialogues.txt` et `data/identite.txt` -> sauvegardé dans `model/`. 1,5 passage
-   (~1 450 étapes pour le modèle large) à 2e-4 sur les ~292 000 conversations (OpenAssistant, French Alpaca, French Instruct,
-   Luth-SFT : voir DataBuilder). Dropout 0,1 (`ModelConfig.Dropout`), betas (0,9 ; 0,999), weight decay aussi sur l'embedding.
+   (~1 450 étapes pour le modèle large) à 2e-4 sur les ~312 000 conversations (OpenAssistant, French Alpaca, French Instruct,
+   Luth-SFT, 20 000 de calcul : voir DataBuilder). Dropout 0,1 (`ModelConfig.Dropout`), betas (0,9 ; 0,999), weight decay aussi sur l'embedding.
    Avec de petits dialogues, l'arrêt anticipé s'arrête avant qu'il les apprenne par cœur.
    Chaque extrait commence au début d'une conversation (`<|doc|>`), suivie des conversations d'après tant qu'elles
    tiennent en entier ; le reste de l'extrait est du remplissage, jamais noté (~9 % en contexte 512, ~17 % en 256).
@@ -206,15 +207,15 @@ avec small sur une RTX 3060 Ti, et les tokens d'après la taille des fichiers : 
 
 Mémoire GPU : si elle dépasse 7 Go (toute la carte, `GpuMemoryLimitMb`) après le premier pas, les paquets
 sont divisés par deux et l'accumulation doublée (8 x 8 -> 4 x 16) : même nombre de tokens par étape, même
-nombre d'étapes prévu. Un message le dit. Les tokens de `texte.txt` (~1,8 Go) sont sur le GPU et comptent dans
-ces 7 Go.
+nombre d'étapes prévu. Un message le dit. Les tokens de `texte.txt` sont dans la mémoire du PC, pas sur le GPU :
+ils ne comptent pas dans ces 7 Go.
 
 Les modèles déjà entraînés gardent leur taille (`config.json`). `/finetune`, `/continue` et `/resume`
 reconnaissent la taille d'un modèle à ses dimensions et reprennent ses réglages.
 
 Le modèle small apprend à chaque étape sur 64 extraits de 256 tokens (16 384 tokens), envoyés au GPU par
 paquets de 16 (accumulation de gradients, voir `BatchSize` / `EffectiveBatchSize`). Sur une RTX 3060 Ti 8 Go :
-~3,2 Go de mémoire GPU (toute la carte) plus ~1,9 Go pour les tokens de `texte.txt`, 0,42 s par étape avec TF32
+~3,2 Go de mémoire GPU (toute la carte ; les tokens de `texte.txt` étaient alors aussi sur le GPU, ~1,9 Go de plus), 0,42 s par étape avec TF32
 (~39 000 tokens/s, 0,53 s sans), soit ~6 h 30 de pré-entraînement pour 1,1 passage du `texte.txt` actuel
 (mesuré avec le tokenizer de 4000 tokens). Des paquets de 32 ne vont pas plus vite.
 La mémoire GPU utilisée s'affiche à chaque mesure de loss.
@@ -285,8 +286,9 @@ nombre de tokens (les tokens spéciaux comptent 0 caractère, mais leur erreur c
 tokenizer : un modèle à 8000 tokens et un à 4000 se comparent avec elle, pas avec la loss par token. Elle est
 notée avec le modèle (`training.json`) et affichée par `/stats` et `/compare` ; `?` pour un modèle d'avant.
 
-Évaluation notée (`/eval`) : 100 questions de `data/eval.json` (20 par catégorie : capitales, sciences,
-histoire, vocabulaire, calcul), chacune avec ses réponses acceptées. Le modèle répond en glouton (toujours le
+Évaluation notée (`/eval`) : 300 questions de `data/eval.json` (60 par catégorie : capitales, sciences,
+histoire, vocabulaire, calcul), chacune avec ses réponses acceptées. Aucune n'est dans `dialogues.txt` (un test le
+vérifie, et DataBuilder `sans-eval` les retire), ni ne contient sa propre réponse. Le modèle répond en glouton (toujours le
 token le plus probable, 48 tokens au plus) : même modèle, mêmes réponses. Une réponse est juste si elle contient
 l'une des réponses acceptées, sans tenir compte des majuscules, des accents ni de la ponctuation, en mots entiers
 (« 4 » n'est pas trouvé dans « 14 »). Le fichier se modifie à la main (catégories et réponses libres).
@@ -314,11 +316,29 @@ dotnet run --project DataBuilder -- gutenberg Data/texte.txt pg4650.txt pg17489.
 
 # Colonne de texte de fichiers .parquet (Wikipedia, FineWeb... sur Hugging Face), arrêt à 50 Mo
 dotnet run --project DataBuilder -- parquet Data/texte.txt train-00000-of-00002.parquet --column text --max-mo 50
+
+# 20 000 dialogues de calcul (graine fixe), sans les questions ni les calculs de eval.json, à la suite des dialogues
+dotnet run --project DataBuilder -- calcul Data/dialogues.txt Data/eval.json --append oui
+
+# Retire des dialogues les conversations qui contiennent une question de eval.json
+dotnet run --project DataBuilder -- sans-eval Data/dialogues.txt Data/eval.json
 ```
 
-- **oasst** suit la réponse la mieux classée de chaque conversation, ignore les messages supprimés,
-  refusés, trop longs, avec du code ou des caractères exotiques (emoji...). OASST2 (2023-11-05) contient
-  déjà tout OASST1 : inutile de donner les deux. Il n'a que ~300 conversations françaises utilisables.
+- **oasst** garde les conversations complètes : de chaque arbre, tous les chemins de la question de départ
+  jusqu'aux feuilles. Après une question, il prend la réponse la mieux classée (la suivante si elle est
+  inutilisable) ; après une réponse, chaque relance de l'utilisateur ouvre un chemin. `--min-turns` (2 par défaut)
+  écarte les chemins plus courts. Il ignore les messages supprimés, refusés, trop longs, avec du code ou des
+  caractères exotiques (emoji...), et affiche les conversations par nombre de tours, avant (l'ancienne extraction :
+  une par arbre) et après. OASST2 (2023-11-05) contient déjà tout OASST1 : inutile de donner les deux. En français :
+  278 conversations avant (154 d'un tour, 119 de deux, 5 de trois), 150 après (144 de deux tours, 6 de trois).
+- **calcul** fabrique des additions, soustractions et multiplications de nombres de 0 à 100 (jamais de résultat
+  négatif), une douzaine de formulations par opération (« Combien font 7 + 5 ? », « Quelle est la somme de 7 et 5 ? »,
+  petits problèmes de billes, de crayons...). `--count` (20 000) et `--seed` (1) : mêmes dialogues à chaque fois.
+  Aucune question n'est une question de `eval.json`, et aucun de ses calculs n'est repris (ni 7 + 5, ni 5 + 7) :
+  `/eval` mesure si le modèle sait calculer, pas s'il a retenu la réponse.
+- **sans-eval** retire d'un `dialogues.txt` les conversations qui contiennent une question de `eval.json` mot pour
+  mot (sans tenir compte des majuscules, des accents ni de la ponctuation, en mots entiers). À refaire après chaque
+  ajout de dialogues : le test `NoEvalQuestionIsInTheDialogues` échoue sinon.
 - **chat** lit des `.jsonl`, `.jsonl.gz`, `.json` ou `.parquet` aux formats de conversation courants sur Hugging Face : `{"messages": [{"role", "content"}]}`,
   ShareGPT `{"conversations": [{"from", "value"}]}` et Alpaca `{"instruction", "input", "output"}`.
   Les messages `system` sont ignorés, les conversations en double rejetées, et le nettoyage est celui
@@ -327,7 +347,8 @@ dotnet run --project DataBuilder -- parquet Data/texte.txt train-00000-of-00002.
   `--skip "champ=a,b;champ2=c"` écarte les conversations dont le champ contient une de ces valeurs.
   Le « œ » mal encodé de certains jeux (`cÅ“ur`, `Åufs`) est réparé.
 
-Le `dialogues.txt` actuel (~292 000 conversations, 92 Mo) se refait ainsi :
+Le `dialogues.txt` actuel (~312 000 conversations, 93 Mo) se refait ainsi (l'OpenAssistant qu'il contient est
+encore celui de l'ancienne extraction, une conversation par arbre) :
 
 ```bash
 # OpenAssistant 2 : https://huggingface.co/datasets/OpenAssistant/oasst2 (Apache 2.0)
@@ -342,6 +363,9 @@ dotnet run --project DataBuilder -- chat Data/dialogues.txt Acquiesce_data_110k_
 dotnet run --project DataBuilder -- chat Data/dialogues.txt luth_aya_dataset-00000-of-00001.parquet luth_croissantllm-00000-of-00001.parquet \
     luth_smoltalk2-00000-of-00001.parquet luth_tulu3_persona_instruct-00000-of-00001.parquet \
     luth_openhermes-00000-of-00002.parquet luth_openhermes-00001-of-00002.parquet --append oui
+# Sans les questions de /eval (360 conversations retirées), puis 20 000 dialogues de calcul
+dotnet run --project DataBuilder -- sans-eval Data/dialogues.txt Data/eval.json
+dotnet run --project DataBuilder -- calcul Data/dialogues.txt Data/eval.json --append oui
 ```
 
 Le `texte.txt` actuel (2,9 Go, 565 611 documents) est la mise bout à bout de deux sorties de **parquet** : l'ancien
@@ -361,6 +385,19 @@ cat texte-hq.txt >> Data/texte.txt
   seule colonne de texte (TinyStories : `french-tinystories`) utilise celle-là. Un document par valeur,
   nettoyé comme pour Gutenberg, une ligne du document = un paragraphe. `--max-mo` arrête avant le document qui
   ferait dépasser la taille ; sans cette option, tout est gardé. Affiche le nombre de documents gardés.
+  Jamais deux fois le même document (même texte après nettoyage) : `--append oui` ajoute à la fin du fichier sans
+  reprendre ses documents, `--exclude a.parquet,b.parquet` ne reprend pas ceux de fichiers déjà utilisés.
+
+Plus de Wikipédia : `wikimedia/wikipedia`, dossier `20231101.fr` (17 fichiers ; `train-00000-of-00017` est déjà
+dans `texte.txt`). Les 5 suivants, `train-00001-of-00017.parquet` à `train-00005-of-00017.parquet` (1,6 Go en
+tout), à mettre dans `Data/` :
+
+```bash
+# https://huggingface.co/datasets/wikimedia/wikipedia (CC BY-SA 3.0 / GFDL)
+dotnet run --project DataBuilder -- parquet Data/texte.txt Data/train-00001-of-00017.parquet Data/train-00002-of-00017.parquet \
+    Data/train-00003-of-00017.parquet Data/train-00004-of-00017.parquet Data/train-00005-of-00017.parquet \
+    --append oui --exclude Data/train-00000-of-00017.parquet
+```
 
 Attention : la sortie est **écrasée** (sauf avec `chat --append oui`). Garde une copie de tes `dialogues.txt` faits à la main.
 
@@ -413,7 +450,9 @@ Projet xUnit à part, `MiniChat.Tests/` (sur le CPU, avec libtorch CPU : pas bes
 tokenizer BPE, format des conversations et masque de la loss, découpage entraînement/vérification, extraits de
 conversations et masque d'attention par conversation (des conversations mises bout à bout donnent les mêmes logits
 que chacune seule), calendrier du learning rate, nombre de pas avec `--epochs`, checkpoint et reprise, cache de
-tokens, loss par caractère, `/eval` (réponses acceptées, historique). Les tests tournent un par un (ils partagent
+tokens, loss par caractère, `/eval` (réponses acceptées, historique, 300 questions dont aucune n'est dans
+`dialogues.txt` ni ne contient sa réponse), et DataBuilder : chemins OpenAssistant, dialogues de calcul,
+`sans-eval`, documents Parquet sans doublon. Les tests tournent un par un (ils partagent
 le tokenizer de test et la graine de TorchSharp). Les tests qui
 entraînent utilisent un modèle minuscule (1 couche, 32 dimensions).
 

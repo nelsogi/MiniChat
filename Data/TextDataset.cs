@@ -6,7 +6,7 @@ using static TorchSharp.torch;
 namespace MiniChat.Data;
 
 /// <summary>
-/// Un texte découpé en tokens, avant d'être envoyé sur le GPU : ce que TokenCache garde sur le disque.
+/// Un texte découpé en tokens, avant TextDataset : ce que TokenCache garde sur le disque.
 /// Ids sur 2 octets (short, vocabulaire &lt;= 32 768). Mask : le poids (0 ou 1) de chaque token dans la loss,
 /// null = le modèle est noté sur tous les tokens. Characters = nombre de caractères du texte de départ.
 /// </summary>
@@ -45,9 +45,9 @@ public sealed record Batch(Tensor X, Tensor Y, Tensor Mask, Tensor? Documents = 
 /// Une conversation appartient au côté (entraînement ou vérification) où elle commence, et s'arrête à la fin de
 /// son segment : rien ne passe d'un côté à l'autre.
 ///
-/// Les tokens sont gardés directement sur le device (GPU), en int16 : un texte.txt de 1,5 Go donne
-/// ~460 millions de tokens, soit ~0,9 Go de mémoire GPU. Un batch y est découpé par des index :
-/// seuls les débuts d'extrait (un nombre par extrait) passent du CPU au GPU. À libérer (Dispose) après la phase.
+/// Les tokens sont gardés sur le CPU, en int16 : un texte.txt de 3 Go donne ~820 millions de tokens (1,6 Go), qui
+/// prendraient au GPU la place de l'entraînement. Un batch y est découpé par des index, puis seuls ses tokens
+/// (quelques milliers) passent sur le device : 0,3 ms par micro-batch de 4 x 512 (mesuré, 820 M tokens, RTX 3060 Ti). À libérer (Dispose) après la phase.
 /// </summary>
 public sealed class TextDataset : IDisposable
 {
@@ -74,8 +74,8 @@ public sealed class TextDataset : IDisposable
     /// </summary>
     internal readonly record struct Conversation(int Start, int Length);
 
-    private readonly Tensor _ids;      // int16, forme (tokens), sur le device
-    private readonly Tensor? _mask;    // uint8, forme (tokens), sur le device ; null = noté sur tous les tokens
+    private readonly Tensor _ids;      // int16, forme (tokens), sur le CPU (voir plus bas)
+    private readonly Tensor? _mask;    // uint8, forme (tokens), sur le CPU ; null = noté sur tous les tokens
     private readonly Device _device;
     private readonly Segment[] _train;
     private readonly Segment[] _validation;
@@ -97,7 +97,8 @@ public sealed class TextDataset : IDisposable
     // Remplissage moyen des extraits d'entraînement (voir ExtractFill), calculé une fois par BlockSize.
     private (int BlockSize, double Fill)? _fill;
 
-    /// <param name="text">Les tokens (Tokenize, TokenizeFile ou TokenCache), copiés sur le device.</param>
+    /// <param name="text">Les tokens (Tokenize, TokenizeFile ou TokenCache), gardés sur le CPU.</param>
+    /// <param name="device">Où vont les extraits de vérification (FixedValidation). GetBatch prend le sien.</param>
     /// <param name="validationEvery">Un morceau sur combien va en vérification (10 = ~10 %).</param>
     /// <param name="documentToken">
     /// L'id de &lt;|doc|&gt; pour des dialogues : chaque extrait est fait de conversations entières, qui ne se voient
@@ -106,8 +107,8 @@ public sealed class TextDataset : IDisposable
     public TextDataset(TokenizedText text, int seed, Device device, int validationEvery = 10, int? documentToken = null)
     {
         _device = device;
-        _ids = ToDevice(tensor(text.Ids), device);
-        _mask = text.Mask is null ? null : ToDevice(tensor(text.Mask), device);
+        _ids = tensor(text.Ids).DetachFromDisposeScope();
+        _mask = text.Mask is null ? null : tensor(text.Mask).DetachFromDisposeScope();
         (_train, _validation) = Split(text.Ids.Length, validationEvery);
         _random = new Random(seed);
         Characters = text.Characters;
@@ -186,7 +187,7 @@ public sealed class TextDataset : IDisposable
     /// mask = le poids de chaque token de y dans la loss.
     /// Exemple : x = [" Bon", "jour", " à"], y = ["jour", " à", " toi"].
     ///
-    /// Les débuts sont tirés sur le CPU (même tirage qu'avant, donc les mêmes extraits), puis le GPU découpe :
+    /// Les débuts sont tirés sur le CPU (même tirage qu'avant, donc les mêmes extraits), puis le CPU découpe :
     /// index[b, t] = début[b] + t, pour t de 0 à BlockSize, et les tokens sont lus d'un coup à ces index.
     /// Dialogues : une conversation tirée au hasard par extrait, puis les suivantes (voir Pack).
     /// </summary>
@@ -240,7 +241,7 @@ public sealed class TextDataset : IDisposable
 
         DisposeFixedValidation();
         using var scope = NewDisposeScope();
-        var batch = Draw();
+        var batch = To(Draw(), _device);
         _fixedValidation = (count, blockSize, new Batch(batch.X.DetachFromDisposeScope(), batch.Y.DetachFromDisposeScope(),
             batch.Mask.DetachFromDisposeScope(), batch.Documents?.DetachFromDisposeScope()));
         return batch;
@@ -317,8 +318,8 @@ public sealed class TextDataset : IDisposable
     }
 
     /// <summary>
-    /// Les extraits de dialogues qui commencent aux conversations firsts (voir Runs), construits sur le CPU puis
-    /// lus d'un coup sur le device : pour chaque place, l'index de son token (x) et de la réponse attendue (y),
+    /// Les extraits de dialogues qui commencent aux conversations firsts (voir Runs), construits et lus sur le
+    /// CPU : pour chaque place, l'index de son token (x) et de la réponse attendue (y),
     /// son numéro de conversation, et 1 (vrai texte) ou 0 (remplissage). Le remplissage forme une conversation
     /// à lui (il ne voit et ne gêne personne) et n'est jamais noté.
     /// </summary>
@@ -341,9 +342,9 @@ public sealed class TextDataset : IDisposable
                 (xIndex[place], documents[place], real[place]) = (runs[0].Start, runs.Count, 0);
         }
 
-        var xAt = tensor(xIndex, device: _device);
-        var yAt = xAt + tensor(real, device: _device).to(ScalarType.Int64);   // le token suivant ; remplissage : lui-même
-        var realMask = tensor(real, device: _device).view(count, blockSize);
+        var xAt = tensor(xIndex, device: CPU);
+        var yAt = xAt + tensor(real, device: CPU).to(ScalarType.Int64);   // le token suivant ; remplissage : lui-même
+        var realMask = tensor(real, device: CPU).view(count, blockSize);
         var mask = _mask is null
             ? realMask
             : _mask.index_select(0, yAt).view(count, blockSize).to(ScalarType.Float32) * realMask;
@@ -351,14 +352,14 @@ public sealed class TextDataset : IDisposable
             _ids.index_select(0, xAt).view(count, blockSize).to(ScalarType.Int64),
             _ids.index_select(0, yAt).view(count, blockSize).to(ScalarType.Int64),
             mask,
-            tensor(documents, device: _device).view(count, blockSize));
+            tensor(documents, device: CPU).view(count, blockSize));
     }
 
     private static Batch To(Batch batch, Device device) =>
         new(batch.X.to(device), batch.Y.to(device), batch.Mask.to(device), batch.Documents?.to(device));
 
     /// <summary>
-    /// Les extraits qui commencent à starts, découpés sur le device : index[b, t] = début[b] + t, pour t de 0 à
+    /// Les extraits qui commencent à starts, découpés sur le CPU : index[b, t] = début[b] + t, pour t de 0 à
     /// BlockSize, et les tokens sont lus d'un coup à ces index.
     /// </summary>
     private Batch Gather(long[] starts, int blockSize)
@@ -366,14 +367,14 @@ public sealed class TextDataset : IDisposable
         int count = starts.Length;
 
         // (extraits, BlockSize + 1) : chaque extrait et le token qui le suit.
-        var index = tensor(starts, device: _device).unsqueeze(1)
-                    + arange(blockSize + 1, ScalarType.Int64, _device).unsqueeze(0);
+        var index = tensor(starts, device: CPU).unsqueeze(1)
+                    + arange(blockSize + 1, ScalarType.Int64, CPU).unsqueeze(0);
         var tokens = _ids.index_select(0, index.view(-1)).view(count, blockSize + 1).to(ScalarType.Int64);
 
         var x = tokens.narrow(1, 0, blockSize).contiguous();
         var y = tokens.narrow(1, 1, blockSize).contiguous();
         var mask = _mask is null
-            ? ones(count, blockSize, ScalarType.Float32, _device)
+            ? ones(count, blockSize, ScalarType.Float32, CPU)
             : _mask.index_select(0, index.narrow(1, 1, blockSize).reshape(-1)).view(count, blockSize).to(ScalarType.Float32);
         return new Batch(x, y, mask);
     }
@@ -393,17 +394,6 @@ public sealed class TextDataset : IDisposable
         cached.Batch.Mask.Dispose();
         cached.Batch.Documents?.Dispose();
         _fixedValidation = null;
-    }
-
-    // Gardé hors des DisposeScope : le tenseur vit aussi longtemps que le dataset. La copie CPU est libérée.
-    private static Tensor ToDevice(Tensor cpu, Device device)
-    {
-        if (device.type == DeviceType.CPU)
-            return cpu.DetachFromDisposeScope();
-
-        var moved = cpu.to(device).DetachFromDisposeScope();
-        cpu.Dispose();
-        return moved;
     }
 
     /// <summary>

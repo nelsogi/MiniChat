@@ -7,21 +7,26 @@ using DataBuilder;
 //   chat       : conversations en JSON (messages, ShareGPT, Alpaca)   -> idem
 //   gutenberg  : livres du Projet Gutenberg (.txt)      -> texte propre pour le pré-entraînement (texte.txt)
 //   parquet    : une colonne de texte de fichiers .parquet (Wikipedia, FineWeb...) -> idem
+//   calcul     : dialogues de calcul fabriqués (additions, soustractions, multiplications) -> dialogues
+//   sans-eval  : retire d'un dialogues.txt les conversations qui contiennent une question de eval.json
 
 Console.OutputEncoding = Encoding.UTF8;
 
 const string Usage = """
     Utilisation :
-      dotnet run --project DataBuilder -- oasst     <sortie.txt> <messages.jsonl[.gz]>... [--lang fr] [--max 300] [--sentences 2]
+      dotnet run --project DataBuilder -- oasst     <sortie.txt> <messages.jsonl[.gz]>... [--lang fr] [--max 300] [--sentences 2] [--min-turns 2]
       dotnet run --project DataBuilder -- chat      <sortie.txt> <fichier.jsonl[.gz]|.json|.parquet>... [--field messages] [--skip "source=a,b;style=c"] [--max 300] [--sentences 2] [--append oui]
       dotnet run --project DataBuilder -- gutenberg <sortie.txt> <livre.txt>...
-      dotnet run --project DataBuilder -- parquet   <sortie.txt> <fichier.parquet>... [--column text] [--max-mo 50]
+      dotnet run --project DataBuilder -- parquet   <sortie.txt> <fichier.parquet>... [--column text] [--max-mo 50] [--append oui] [--exclude a.parquet,b.parquet]
+      dotnet run --project DataBuilder -- calcul    <sortie.txt> <eval.json> [--count 20000] [--seed 1] [--append oui]
+      dotnet run --project DataBuilder -- sans-eval <dialogues.txt> <eval.json>
 
     Exemples :
       dotnet run --project DataBuilder -- oasst     Data/dialogues.txt 2023-11-05_oasst2_ready.messages.jsonl.gz
       dotnet run --project DataBuilder -- chat      Data/dialogues.txt conversations-fr.jsonl --append oui
       dotnet run --project DataBuilder -- gutenberg Data/texte.txt pg17489.txt pg135.txt
       dotnet run --project DataBuilder -- parquet   Data/texte.txt train-00000-of-00002.parquet --max-mo 50
+      dotnet run --project DataBuilder -- calcul    Data/dialogues.txt Data/eval.json --append oui
     """;
 
 // Sépare les options (--lang fr) des chemins de fichiers.
@@ -57,11 +62,42 @@ switch (command)
         string lang = options.GetValueOrDefault("--lang", "fr");
         int maxLength = int.Parse(options.GetValueOrDefault("--max", "300"));
         int maxSentences = int.Parse(options.GetValueOrDefault("--sentences", "2"));
+        int minTurns = int.Parse(options.GetValueOrDefault("--min-turns", "2"));
 
-        var converter = new OasstConverter(lang, maxLength, maxSentences);
+        var converter = new OasstConverter(lang, maxLength, maxSentences, minTurns);
         output = converter.Convert(inputs);
         Console.WriteLine($"Langue '{lang}'.");
         PrintDialogueReport(converter);
+        PrintTurns(converter);
+        break;
+
+    case "calcul":
+        int count = int.Parse(options.GetValueOrDefault("--count", "20000"));
+        int seed = int.Parse(options.GetValueOrDefault("--seed", "1"));
+        var generator = new CalculGenerator(inputs.SelectMany(CalculGenerator.ReadEvalQuestions));
+        output = CalculGenerator.Format(generator.Generate(count, seed));
+        Console.WriteLine($"{generator.EvalQuestions} questions d'évaluation lues : ni elles, ni leurs " +
+                          $"{generator.ExcludedProblems} calculs ne sont repris.");
+        Console.WriteLine($"Dialogues : {count:N0} (graine {seed}) : " + string.Join(", ",
+            generator.Counts.Select(c => $"{c.Value:N0} {c.Key switch {
+                CalculGenerator.Operation.Addition => "additions",
+                CalculGenerator.Operation.Subtraction => "soustractions",
+                _ => "multiplications" }}")) + ".");
+        output = AppendTo(outputPath, output, options);
+        break;
+
+    case "sans-eval":
+        if (!File.Exists(outputPath))
+        {
+            Console.WriteLine($"Fichier introuvable : {outputPath}");
+            return 1;
+        }
+        var filter = new EvalFilter(inputs.SelectMany(CalculGenerator.ReadEvalQuestions));
+        output = filter.Filter(TextCleaner.ReadFile(outputPath));
+        Console.WriteLine($"Conversations gardées : {filter.Kept:N0}, retirées : {filter.Removed:N0} " +
+                          $"({filter.Found.Count} questions d'évaluation trouvées).");
+        foreach (var (question, found) in filter.Found.OrderByDescending(f => f.Value))
+            Console.WriteLine($"  {found,6:N0}  {question}");
         break;
 
     case "chat":
@@ -90,16 +126,7 @@ switch (command)
             return 1;
         }
 
-        // --append oui : ajoute à la fin d'un dialogues.txt existant (fait par exemple avec oasst), une ligne vide entre les deux.
-        if (options.GetValueOrDefault("--append") == "oui" && File.Exists(outputPath))
-        {
-            string existing = TextCleaner.ReadFile(outputPath).TrimEnd('\n');
-            if (existing.Length > 0)
-            {
-                Console.WriteLine($"Ajouté à la suite de {outputPath}.");
-                output = existing + "\n\n" + output;
-            }
-        }
+        output = AppendTo(outputPath, output, options);
         break;
 
     case "gutenberg":
@@ -119,11 +146,22 @@ switch (command)
             ? (long)(double.Parse(maxMo, CultureInfo.InvariantCulture) * 1024 * 1024)
             : null;
 
+        // --append oui : à la fin du fichier (texte.txt déjà fait), sans reprendre ses documents.
+        // --exclude : fichiers .parquet déjà utilisés, dont les documents ne sont pas repris non plus.
+        bool append = options.GetValueOrDefault("--append") == "oui";
+        var exclude = options.GetValueOrDefault("--exclude", "")
+            .Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries).ToList();
+        if (exclude.FirstOrDefault(p => !File.Exists(p)) is { } missingExclude)
+        {
+            Console.WriteLine($"Fichier introuvable : {missingExclude}");
+            return 1;
+        }
+
         // Écrit lui-même le fichier au fur et à mesure (la sortie peut dépasser la taille max d'une chaîne).
         var parquet = new ParquetConverter(column, maxBytes);
         try
         {
-            await parquet.ConvertAsync(inputs, outputPath);
+            await parquet.ConvertAsync(inputs, outputPath, append, exclude);
         }
         catch (InvalidDataException e)
         {
@@ -132,7 +170,9 @@ switch (command)
         }
         Console.WriteLine($"Documents gardés : {parquet.Kept:N0}"
             + (parquet.ReachedMaxSize ? $" (arrêt à {maxMo} Mo)" : "")
-            + $", vides après nettoyage : {parquet.Empty:N0}.");
+            + $", vides après nettoyage : {parquet.Empty:N0}, doublons écartés : {parquet.Duplicates:N0}.");
+        if (append)
+            Console.WriteLine($"Ajoutés à la suite de {outputPath}.");
         Console.WriteLine($"Écrit : {outputPath} ({parquet.Characters:N0} caractères, {parquet.Vocabulary} caractères différents).");
         return 0;
 
@@ -150,6 +190,29 @@ Console.WriteLine($"Écrit : {outputPath} ({output.Length:N0} caractères, {voca
 return 0;
 
 // ---------------------------------------------------------------------------
+
+// --append oui : output à la fin d'un dialogues.txt existant (fait par exemple avec oasst), une ligne vide entre les deux.
+static string AppendTo(string outputPath, string output, Dictionary<string, string> options)
+{
+    if (options.GetValueOrDefault("--append") != "oui" || !File.Exists(outputPath))
+        return output;
+    string existing = TextCleaner.ReadFile(outputPath).TrimEnd('\n');
+    if (existing.Length == 0)
+        return output;
+    Console.WriteLine($"Ajouté à la suite de {outputPath}.");
+    return existing + "\n\n" + output;
+}
+
+// Conversations par nombre de tours (question + réponse), avant (une par arbre) et après (chemins jusqu'aux feuilles).
+static void PrintTurns(OasstConverter converter)
+{
+    var turns = converter.TurnsBefore.Keys.Union(converter.TurnsAfter.Keys).Order().ToList();
+    Console.WriteLine($"Conversations par nombre de tours : avant (une par arbre, arrêt au premier message inutilisable) " +
+                      $"-> après (chemins jusqu'aux feuilles, {converter.MinTurns} tour{(converter.MinTurns > 1 ? "s" : "")} au moins) :");
+    foreach (int turn in turns)
+        Console.WriteLine($"  {turn,3} tour{(turn > 1 ? "s" : " ")} : {converter.TurnsBefore.GetValueOrDefault(turn),6:N0} -> {converter.TurnsAfter.GetValueOrDefault(turn),6:N0}");
+    Console.WriteLine($"  total      : {converter.TurnsBefore.Values.Sum(),6:N0} -> {converter.TurnsAfter.Values.Sum(),6:N0}");
+}
 
 // Bilan de la conversion : ce qui est gardé, ce qui est rejeté et pourquoi (raisons les plus fréquentes d'abord).
 static void PrintDialogueReport(DialogueConverter converter)

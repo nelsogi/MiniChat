@@ -37,17 +37,47 @@ public sealed class EvalTests
         Assert.True(EvalTest.IsCorrect("Beijing, bien sûr.", ["Pékin", "Beijing"]));
 
     [Fact]
-    public void EvalFileHasOneHundredQuestionsInFiveCategories()
+    public void EvalFileHasThreeHundredQuestionsInFiveCategories()
     {
         var questions = EvalTest.ReadQuestions(EvalPath);
 
-        Assert.Equal(100, questions.Count);
+        Assert.Equal(300, questions.Count);
         var categories = questions.GroupBy(q => q.Category).ToDictionary(g => g.Key, g => g.Count());
         Assert.Equal(["capitales", "sciences", "histoire", "vocabulaire", "calcul"], categories.Keys);
-        Assert.All(categories.Values, count => Assert.Equal(20, count));
-        Assert.Equal(questions.Count, questions.Select(q => q.Question).Distinct().Count());
+        Assert.All(categories.Values, count => Assert.Equal(60, count));
+        Assert.Equal(questions.Count, questions.Select(q => EvalTest.Normalize(q.Question)).Distinct().Count());
         // Chaque réponse acceptée garde au moins un mot une fois simplifiée.
         Assert.All(questions.SelectMany(q => q.Answers), a => Assert.NotEmpty(EvalTest.Normalize(a)));
+    }
+
+    [Fact]
+    public void NoQuestionContainsItsOwnAnswer()
+    {
+        // Sinon un modèle qui répète la question aurait juste.
+        Assert.Empty(EvalTest.ReadQuestions(EvalPath).Where(q => EvalTest.IsCorrect(q.Question, q.Answers)).Select(q => q.Question));
+    }
+
+    [Fact]
+    public void NoEvalQuestionIsInTheDialogues()
+    {
+        // Les dialogues du fine-tuning (Data/ du projet, pas copiés à côté des tests) : une question de /eval qui y est
+        // mot pour mot (sans tenir compte des majuscules, des accents ni de la ponctuation) mesurerait la mémoire du
+        // modèle, pas ce qu'il sait. DataBuilder sans-eval les retire. dialogues.txt n'est pas dans git : sans lui
+        // (dépôt tout juste cloné), rien à vérifier.
+        var questions = EvalTest.ReadQuestions(EvalPath).Select(q => $" {EvalTest.Normalize(q.Question)} ").ToArray();
+        foreach (string path in new[] { "dialogues.txt", "identite.txt" }.Select(TestData.ProjectDataFile).Where(File.Exists))
+        {
+            var conversations = File.ReadAllText(path).Replace("\r\n", "\n").Split("\n\n");
+            var found = new System.Collections.Concurrent.ConcurrentBag<string>();
+            Parallel.ForEach(conversations, conversation =>
+            {
+                string text = $" {EvalTest.Normalize(conversation)} ";
+                foreach (string question in questions.Where(q => text.Contains(q, StringComparison.Ordinal)))
+                    found.Add(question.Trim());
+            });
+            Assert.True(found.IsEmpty, $"{Path.GetFileName(path)} contient des questions de eval.json : " +
+                                       string.Join(" ; ", found.Distinct().Take(10)));
+        }
     }
 
     [Fact]

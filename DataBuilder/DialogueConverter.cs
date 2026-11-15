@@ -68,7 +68,8 @@ public abstract class DialogueConverter
     /// ou la compte comme rejetée.
     /// StopReason = pourquoi elle s'arrête avant la fin (null si on est allé au bout).
     /// </summary>
-    protected void Add(List<string> lines, string? stopReason)
+    /// <returns>Vrai si elle est écrite.</returns>
+    protected bool Add(List<string> lines, string? stopReason)
     {
         // Une conversation doit finir par une réponse de l'IA.
         if (lines.Count > 0 && lines[^1].StartsWith("Toi: "))
@@ -77,14 +78,14 @@ public abstract class DialogueConverter
         if (lines.Count < 2)   // il faut au moins une question et une réponse
         {
             Count(Rejected, stopReason ?? NoReply);
-            return;
+            return false;
         }
 
         // Beaucoup de jeux de données (et leurs traductions) contiennent les mêmes conversations plusieurs fois.
         if (!_seen.Add(string.Join('\n', lines)))
         {
             Count(Rejected, Duplicate);
-            return;
+            return false;
         }
 
         // Une ligne vide entre deux conversations : MiniChat y met un <|doc|> (une nouvelle conversation commence).
@@ -92,6 +93,7 @@ public abstract class DialogueConverter
         foreach (var line in lines) _output.Append(line).Append('\n');
         Kept++;
         if (stopReason is not null) Shortened++;
+        return true;
     }
 
     /// <summary>Texte prêt pour MiniChat, ou null avec la raison du rejet.</summary>

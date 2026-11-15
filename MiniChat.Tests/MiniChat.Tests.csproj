@@ -1,0 +1,33 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <LangVersion>14</LangVersion>
+    <IsPackable>false</IsPackable>
+    <RootNamespace>MiniChat.Tests</RootNamespace>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.NET.Test.Sdk" Version="17.12.0" />
+    <PackageReference Include="xunit" Version="2.9.3" />
+    <PackageReference Include="xunit.runner.visualstudio" Version="2.8.2" />
+    <!-- Les tests tournent sur le CPU, avec de tout petits modèles : libtorch CPU, pas la version CUDA de MiniChat.
+         Même version de TorchSharp que MiniChat. -->
+    <PackageReference Include="TorchSharp-cpu" Version="0.105.2" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\MiniChat.csproj" />
+  </ItemGroup>
+
+  <!-- MiniChat copie Data\ à côté de son exécutable : les tests n'en ont pas besoin (texte.txt fait des Go). -->
+  <Target Name="SkipMiniChatData" AfterTargets="GetCopyToOutputDirectoryItems">
+    <ItemGroup>
+      <_SourceItemsToCopyToOutputDirectory Remove="@(_SourceItemsToCopyToOutputDirectory)"
+                                           Condition="$([System.String]::Copy('%(TargetPath)').StartsWith('Data\'))" />
+    </ItemGroup>
+  </Target>
+
+</Project>

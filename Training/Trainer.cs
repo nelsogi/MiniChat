@@ -300,24 +300,8 @@ public sealed class Trainer
         return optimizer;
     }
 
-    /// <summary>
-    /// Warmup puis cosinus, de FirstStep à Steps (le dernier pas prévu) :
-    ///   - pendant WarmupSteps, la vitesse monte en ligne droite de 0 à LearningRate,
-    ///   - ensuite elle descend doucement en suivant une demi-courbe cosinus, jusqu'à MinLearningRate au pas Steps.
-    /// Grands pas au début pour avancer vite, petits pas à la fin pour affiner.
-    /// </summary>
-    private double LearningRateAt(int step)
-    {
-        // Compté depuis FirstStep : une continuation a son propre warmup et son propre cosinus.
-        int done = step - _config.FirstStep;
-        int total = _config.Steps - _config.FirstStep;
-        if (done < _config.WarmupSteps)
-            return _config.LearningRate * (done + 1) / _config.WarmupSteps;
-
-        double progress = (double)(done - _config.WarmupSteps) / Math.Max(1, total - _config.WarmupSteps);
-        double cosine = 0.5 * (1 + Math.Cos(Math.PI * Math.Min(progress, 1.0)));   // 1 -> 0
-        return _config.MinLearningRate + (_config.LearningRate - _config.MinLearningRate) * cosine;
-    }
+    /// <summary>Warmup puis cosinus, de FirstStep à Steps (voir TrainingConfig.LearningRateAt).</summary>
+    private double LearningRateAt(int step) => _config.LearningRateAt(step);
 
     /// <summary>
     /// Passages faits sur le texte principal au pas step, comptés depuis le pas 0 (une continuation garde ceux d'avant) :

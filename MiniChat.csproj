@@ -6,9 +6,9 @@
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
     <RootNamespace>MiniChat</RootNamespace>
-    <!-- DataBuilder est un projet à part : ses fichiers ne font pas partie de MiniChat.
+    <!-- DataBuilder et MiniChat.Tests sont des projets à part : leurs fichiers ne font pas partie de MiniChat.
          publish/ est le dossier produit par publish.ps1 : à ne pas reprendre dans le projet. -->
-    <DefaultItemExcludes>$(DefaultItemExcludes);DataBuilder/**;publish/**</DefaultItemExcludes>
+    <DefaultItemExcludes>$(DefaultItemExcludes);DataBuilder/**;MiniChat.Tests/**;publish/**</DefaultItemExcludes>
 
     <!-- Où chercher les modèles entraînés à mettre dans le dossier publié : là où "dotnet run" les crée.
          Autre dossier : dotnet publish ... -p:ModelsSource=D:\MesModeles -->
@@ -20,9 +20,15 @@
     <!-- Version CUDA : utilise le GPU NVIDIA s'il y en a un (pilote récent requis), sinon le CPU.
          Le choix se fait tout seul au démarrage, voir cuda.is_available() dans Program.cs. -->
     <PackageReference Include="Spectre.Console" Version="0.49.1" />
-    <PackageReference Include="TorchSharp-cuda-windows" Version="0.105.*" Condition="$([MSBuild]::IsOSPlatform('Windows'))" />
+    <!-- PrivateAssets : MiniChat.Tests ne reçoit pas libtorch par MiniChat, il prend la version CPU (bien plus légère). -->
+    <PackageReference Include="TorchSharp-cuda-windows" Version="0.105.*" Condition="$([MSBuild]::IsOSPlatform('Windows'))" PrivateAssets="all" />
     <!-- Linux : version CPU, simple (pas de GPU). -->
-    <PackageReference Include="TorchSharp-cpu" Version="0.105.*" Condition="!$([MSBuild]::IsOSPlatform('Windows'))" />
+    <PackageReference Include="TorchSharp-cpu" Version="0.105.*" Condition="!$([MSBuild]::IsOSPlatform('Windows'))" PrivateAssets="all" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- Les tests voient le découpage entraînement/vérification de TextDataset (internal). -->
+    <InternalsVisibleTo Include="MiniChat.Tests" />
   </ItemGroup>
 
   <!-- Les plus grosses DLL de libtorch arrivent en morceaux (paquets ...-primary + ...-fragmentN) que chaque

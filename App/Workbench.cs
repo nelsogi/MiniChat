@@ -1,12 +1,7 @@
-using System.Text;
-using System.Text.RegularExpressions;
-using MiniChat.Chat;
 using MiniChat.Config;
-using MiniChat.Data;
 using MiniChat.Evaluation;
 using MiniChat.Generation;
 using MiniChat.Model;
-using MiniChat.Storage;
 using MiniChat.Tokenization;
 using MiniChat.Training;
 using MiniChat.UI;
@@ -23,6 +18,8 @@ public sealed class UserException(string message) : Exception(message);
 /// Le modèle chargé et tout ce qui le change : entraîner (/train, --train), refaire le fine-tuning (/finetune),
 /// continuer (/continue), reprendre (/resume), et passer les questions de test (/test).
 /// Les commandes de Nel Code comme les options en ligne de commande passent par ici.
+/// Le détail est ailleurs : les fichiers de données (DatasetFactory), les phases (PretrainPhase, FinetunePhase,
+/// ContinuePhase), les modèles sauvegardés (ModelCatalog) et /export (ExportService).
 ///
 /// Deux dossiers :
 ///   data/    texte.txt, dialogues.txt, questions-test.txt
@@ -30,38 +27,18 @@ public sealed class UserException(string message) : Exception(message);
 /// </summary>
 public sealed class Workbench
 {
-    public const string ChatModel = "model";
-    public const string PretrainedModel = "model-pretrain";
+    public const string ChatModel = ModelCatalog.ChatModel;
+    public const string PretrainedModel = ModelCatalog.PretrainedModel;
 
-    // Taille du vocabulaire BPE : plus grand = mots entiers plus souvent, mais plus de données nécessaires.
-    // 8000 : texte.txt fait près d'un milliard de tokens, de quoi apprendre chaque token ; chaque extrait de
-    // BlockSize tokens contient plus de texte. Les ids restent sur 2 octets dans cache/ (jusqu'à 32 767).
-    private const int TokenizerVocabSize = 8000;
-
-    // Le tokenizer apprend sur un échantillon de chaque fichier, réparti dans tout le fichier (voir ReadSample),
-    // pas sur les fichiers entiers : les fusions apprises ne changent presque plus au-delà. dialogues.txt a
-    // sa part à lui, sinon les mots des conversations (questions, "tu", consignes) seraient noyés dans texte.txt.
-    // ~1 min 30 pour 20 Mo et 4000 tokens ; compter quelques minutes pour 80 Mo et 8000 tokens.
-    private const int TokenizerTextSampleMb = 60;
-    private const int TokenizerDialogueSampleMb = 20;
-
-    // identite.txt (qui est MiniChat) est mélangé aux dialogues du fine-tuning, chaque conversation recopiée
-    // IdentityRepeats fois à des places tirées au hasard (graine fixe). Une seule copie ferait 0,04 % des
-    // dialogues : le modèle ne la verrait que 2 ou 3 fois. 10 copies : ~0,3 %, chaque conversation vue ~25 fois.
-    private const int IdentityRepeats = 10;
-    private const int IdentitySeed = 7;
-
-    private readonly string _pretrainPath;
-    private readonly string _dialoguesPath;
-    private readonly string _identityPath;
-    private readonly string _questionsPath;
     private readonly string _checkpointFolder;   // sauvegarde régulière de l'entraînement en cours (pour /resume)
     private readonly string _resultsFolder;
-    private readonly string _cacheFolder;        // tokens de texte.txt et dialogues.txt déjà découpés (voir TokenCache)
 
-    // Deux sauvegardes : le modèle pré-entraîné (base pour refaire le fine-tuning) et le modèle final.
-    private readonly ModelStore _pretrainStore;
-    private readonly ModelStore _store;
+    private readonly DatasetFactory _data;
+    private readonly ModelCatalog _models;
+    private readonly ExportService _export;
+    private readonly PretrainPhase _pretrain;
+    private readonly FinetunePhase _finetune;
+    private readonly ContinuePhase _continue;
 
     // L'arrêt demandé pour l'entraînement en cours (voir Training), vide le reste du temps.
     private CancellationToken _cancellation;
@@ -69,23 +46,21 @@ public sealed class Workbench
     // Le tokenizer de Model (pour /save).
     private BpeTokenizer? _tokenizer;
 
-    // Les modèles gardés avec /save : models/saved/<nom>/, même contenu que model/.
-    private string SavedFolder => Path.Combine(ModelsFolder, "saved");
-
     public Workbench(string dataFolder, string modelsFolder, Device device)
     {
         DataFolder = dataFolder;
         ModelsFolder = modelsFolder;
         Device = device;
-        _pretrainPath = Path.Combine(dataFolder, "texte.txt");
-        _dialoguesPath = Path.Combine(dataFolder, "dialogues.txt");
-        _identityPath = Path.Combine(dataFolder, "identite.txt");
-        _questionsPath = Path.Combine(dataFolder, "questions-test.txt");
         _checkpointFolder = Path.Combine(modelsFolder, "checkpoint");
         _resultsFolder = Path.Combine(modelsFolder, "results");
-        _cacheFolder = Path.Combine(modelsFolder, "cache");
-        _pretrainStore = new ModelStore(Path.Combine(modelsFolder, PretrainedModel));
-        _store = new ModelStore(Path.Combine(modelsFolder, ChatModel));
+        _data = new DatasetFactory(dataFolder, Path.Combine(modelsFolder, "cache"), device);
+        _models = new ModelCatalog(modelsFolder);
+        _export = new ExportService(_models, Path.Combine(modelsFolder, "exports"));
+
+        var phase = new TrainingPhase(device);
+        _pretrain = new PretrainPhase(_data, phase);
+        _finetune = new FinetunePhase(_data, phase);
+        _continue = new ContinuePhase(_pretrain, _finetune);
     }
 
     public string DataFolder { get; }
@@ -109,9 +84,9 @@ public sealed class Workbench
     /// <summary>Charge le modèle par défaut (DefaultModel) s'il existe. Sinon, pas de modèle : Nel Code propose /train.</summary>
     public void LoadSaved()
     {
-        var (store, name) = DefaultModel == PretrainedModel && _pretrainStore.Exists
-            ? (_pretrainStore, PretrainedModel)
-            : (_store, ChatModel);
+        var (store, name) = DefaultModel == PretrainedModel && _models.Pretrained.Exists
+            ? (_models.Pretrained, PretrainedModel)
+            : (_models.Chat, ChatModel);
         if (!store.Exists)
             return;
 
@@ -146,10 +121,10 @@ public sealed class Workbench
         using (var model = new MiniGpt(config))   // sur le CPU, juste pour compter
             parameters = model.ParameterCount;
 
-        var pretrain = WithEpochs(TrainingConfig.PretrainingFor(config), epochs);
+        var pretrain = TrainingConfig.PretrainingFor(config).WithEpochs(epochs);
         var fineTune = TrainingConfig.FineTuningFor(config);
-        int pretrainSteps = TrainingEstimate.Steps(pretrain, TrainingEstimate.TokensIn(CheckExists(_pretrainPath)), config.BlockSize);
-        int fineTuneSteps = TrainingEstimate.Steps(fineTune, TrainingEstimate.TokensIn(CheckExists(_dialoguesPath)), config.BlockSize);
+        int pretrainSteps = TrainingEstimate.Steps(pretrain, TrainingEstimate.TokensIn(DatasetFactory.CheckExists(_data.TextPath)), config.BlockSize);
+        int fineTuneSteps = TrainingEstimate.Steps(fineTune, TrainingEstimate.TokensIn(DatasetFactory.CheckExists(_data.DialoguesPath)), config.BlockSize);
         return new TrainingPlan(size, config, parameters, pretrain, pretrainSteps,
             TrainingEstimate.Duration(config, parameters, pretrain, pretrainSteps), fineTuneSteps,
             TrainingEstimate.Duration(config, parameters, fineTune, fineTuneSteps));
@@ -165,14 +140,14 @@ public sealed class Workbench
     {
         WarnIfInterrupted();
         string now = Now();
-        var (log, checkpoint, answersPath) = NewRun(now, now);
+        var run = NewRun(now, now);
 
         var (model, tokenizer) = CreateModel(SizeConfig(size));
-        checkpoint.Start(model, tokenizer);
-        Pretrain(model, tokenizer, _pretrainStore, WithEpochs(TrainingConfig.PretrainingFor(model.Config), epochs), log, checkpoint, resume: null);
+        run.Checkpoint.Start(model, tokenizer);
+        _pretrain.Run(model, tokenizer, _models.Pretrained, TrainingConfig.PretrainingFor(model.Config).WithEpochs(epochs), run, resume: null);
         if (Stopped(model, tokenizer, pretrainOnly: true)) return;
-        FineTune(model, tokenizer, _store, TrainingConfig.FineTuningFor(model.Config), log, checkpoint, resume: null);
-        Finish(model, tokenizer, "pré-entraînement + fine-tuning", log, checkpoint, answersPath, pretrainOnly: false);
+        _finetune.Run(model, tokenizer, _models.Chat, TrainingConfig.FineTuningFor(model.Config), run, resume: null);
+        Finish(model, tokenizer, "pré-entraînement + fine-tuning", run, pretrainOnly: false);
     });
 
     /// <summary>
@@ -181,18 +156,18 @@ public sealed class Workbench
     /// </summary>
     public void FineTuneOnly(double? epochs = null, CancellationToken cancellation = default) => Training(cancellation, () =>
     {
-        if (!_pretrainStore.Exists)
+        if (!_models.Pretrained.Exists)
             throw new UserException($"Pas de modèle pré-entraîné dans '{PretrainedModel}' : lance d'abord /train.");
 
         WarnIfInterrupted();
         string now = Now();
-        var (log, checkpoint, answersPath) = NewRun(now, now);
+        var run = NewRun(now, now);
 
-        var (model, tokenizer) = _pretrainStore.Load(Device);
+        var (model, tokenizer) = _models.Pretrained.Load(Device);
         Messages.Info($"Modèle pré-entraîné chargé depuis '{PretrainedModel}'.");
-        checkpoint.Start(model, tokenizer);
-        FineTune(model, tokenizer, _store, WithEpochs(TrainingConfig.FineTuningFor(model.Config), epochs), log, checkpoint, resume: null);
-        Finish(model, tokenizer, "fine-tuning seul (--finetune)", log, checkpoint, answersPath, pretrainOnly: false);
+        run.Checkpoint.Start(model, tokenizer);
+        _finetune.Run(model, tokenizer, _models.Chat, TrainingConfig.FineTuningFor(model.Config).WithEpochs(epochs), run, resume: null);
+        Finish(model, tokenizer, "fine-tuning seul (--finetune)", run, pretrainOnly: false);
     });
 
     /// <summary>
@@ -203,32 +178,32 @@ public sealed class Workbench
     public void Continue(string phase, int steps, double? learningRate, CancellationToken cancellation = default) =>
         Training(cancellation, () =>
     {
-        var store = StoreFor(phase);
+        var store = _models.StoreFor(phase);
         if (!store.Exists)
-            throw new UserException($"Rien à continuer : pas de modèle dans '{StoreName(phase)}'. Lance d'abord /train.");
+            throw new UserException($"Rien à continuer : pas de modèle dans '{ModelCatalog.StoreName(phase)}'. Lance d'abord /train.");
 
         WarnIfInterrupted();
         // Le CSV des loss continue celui de l'entraînement d'origine (date gardée dans training.json),
         // mais les réponses aux questions ont leur propre fichier.
         var info = store.ReadInfo();
         string now = Now();
-        var (log, checkpoint, answersPath) = NewRun(info?.RunId ?? now, now);
+        var run = NewRun(info?.RunId ?? now, now);
 
         // Repart du modèle sauvegardé, avec SON tokenizer : jamais de nouveau BPE, sinon les ids ne voudraient
         // plus rien dire pour le modèle. Les caractères des nouvelles données qu'il ne connaît pas sont ignorés.
         var (model, tokenizer) = store.Load(Device);
         int firstStep = info?.Step ?? 0;
         var continuation = new ContinueState(phase, firstStep, steps,
-            BaseConfig(phase, model.Config).Continuation(firstStep, steps, learningRate).LearningRate);
+            ContinuePhase.BaseConfig(phase, model.Config).Continuation(firstStep, steps, learningRate).LearningRate);
 
-        Messages.Info($"Modèle chargé depuis '{StoreName(phase)}'" +
+        Messages.Info($"Modèle chargé depuis '{ModelCatalog.StoreName(phase)}'" +
                       (info is null ? " (sauvegardé avant --continue : pas numérotés depuis 0)." : $", arrêté au pas {firstStep}."));
-        checkpoint.Start(model, tokenizer, continuation);
-        ContinuePhase(continuation, model, tokenizer, store, info, log, checkpoint, resume: null);
+        run.Checkpoint.Start(model, tokenizer, continuation);
+        _continue.Run(continuation, model, tokenizer, store, info, run, resume: null);
         Finish(model, tokenizer, phase == "pretrain"
                 ? $"pré-entraînement continué de {steps} pas (--continue)"
                 : $"fine-tuning continué de {steps} pas (--continue-finetune)",
-            log, checkpoint, answersPath, pretrainOnly: phase == "pretrain");
+            run, pretrainOnly: phase == "pretrain");
     });
 
     /// <summary>Reprend la phase en cours là où elle s'est arrêtée (poids, optimiseur, pas, meilleure loss).</summary>
@@ -240,29 +215,28 @@ public sealed class Workbench
         // Une reprise garde la date de l'entraînement d'origine : le CSV continue au même endroit.
         var state = Checkpoint.ReadState(_checkpointFolder);
         var continuation = new Checkpoint(_checkpointFolder, state.RunId).ReadContinuation();
-        var (log, checkpoint, answersPath) = NewRun(state.RunId, continuation is null ? state.RunId : Now());
+        var run = NewRun(state.RunId, continuation is null ? state.RunId : Now());
 
-        var (model, tokenizer) = checkpoint.LoadModel(Device);
+        var (model, tokenizer) = run.Checkpoint.LoadModel(Device);
         Messages.Info($"Reprise de l'entraînement du {state.RunId} : phase '{state.Phase}', pas {state.Step}.");
 
         if (continuation is not null)
         {
             // Un --continue interrompu : mêmes réglages, et toujours rien qu'une phase.
-            var store = StoreFor(continuation.Phase);
-            ContinuePhase(continuation, model, tokenizer, store, store.ReadInfo(), log, checkpoint, state);
+            var store = _models.StoreFor(continuation.Phase);
+            _continue.Run(continuation, model, tokenizer, store, store.ReadInfo(), run, state);
         }
         else if (state.Phase == "pretrain")
         {
-            Pretrain(model, tokenizer, _pretrainStore, TrainingConfig.PretrainingFor(model.Config), log, checkpoint, state);
+            _pretrain.Run(model, tokenizer, _models.Pretrained, TrainingConfig.PretrainingFor(model.Config), run, state);
             if (Stopped(model, tokenizer, pretrainOnly: true)) return;
-            FineTune(model, tokenizer, _store, TrainingConfig.FineTuningFor(model.Config), log, checkpoint, resume: null);
+            _finetune.Run(model, tokenizer, _models.Chat, TrainingConfig.FineTuningFor(model.Config), run, resume: null);
         }
         else
         {
-            FineTune(model, tokenizer, _store, TrainingConfig.FineTuningFor(model.Config), log, checkpoint, state);
+            _finetune.Run(model, tokenizer, _models.Chat, TrainingConfig.FineTuningFor(model.Config), run, state);
         }
-        Finish(model, tokenizer, "entraînement repris (--resume)", log, checkpoint, answersPath,
-            pretrainOnly: continuation?.Phase == "pretrain");
+        Finish(model, tokenizer, "entraînement repris (--resume)", run, pretrainOnly: continuation?.Phase == "pretrain");
     });
 
     /// <summary>Les questions de test sur le modèle chargé, sans rien entraîner. Réponses dans results/&lt;date&gt;-test.txt.</summary>
@@ -273,7 +247,7 @@ public sealed class Workbench
 
         string path = Path.Combine(_resultsFolder, $"{Now()}-test.txt");
         string report = Messages.Spin("Questions de test... (Échap pour arrêter)", () => QuestionTest.Run(generator,
-            _questionsPath, path, $"Test (/test) | modèle '{ModelSource}' | {model.ParameterCount:N0} paramètres", cancellation));
+            _data.QuestionsPath, path, $"Test (/test) | modèle '{ModelSource}' | {model.ParameterCount:N0} paramètres", cancellation));
         ShowReport(report, path);
     }
 
@@ -290,21 +264,7 @@ public sealed class Workbench
     /// Tous les modèles sauvegardés : model/, model-pretrain/, puis ceux gardés avec /save (saved/&lt;nom&gt;/),
     /// par ordre alphabétique.
     /// </summary>
-    public IReadOnlyList<SavedModel> ListModels()
-    {
-        var stores = new List<(string Name, ModelStore Store)> { (ChatModel, _store), (PretrainedModel, _pretrainStore) };
-        if (Directory.Exists(SavedFolder))
-            stores.AddRange(Directory.EnumerateDirectories(SavedFolder)
-                .Select(folder => (Path.GetFileName(folder), new ModelStore(folder)))
-                .OrderBy(s => s.Item1, StringComparer.OrdinalIgnoreCase));
-
-        return stores
-            .Where(s => s.Store.Exists)
-            // Les poids sont en float32 : 4 octets par paramètre (plus un en-tête de quelques octets).
-            .Select(s => new SavedModel(s.Name, s.Store.ReadConfig(), s.Store.WeightsBytes / 4, s.Store.WeightsBytes,
-                s.Store.SavedAt, s.Store.ReadInfo()))
-            .ToList();
-    }
+    public IReadOnlyList<SavedModel> ListModels() => _models.List();
 
     /// <summary>
     /// Garde le modèle chargé sous un nom (saved/&lt;nom&gt;/), pour le recharger ou le comparer plus tard,
@@ -314,27 +274,26 @@ public sealed class Workbench
     {
         if (Model is not { } model || _tokenizer is not { } tokenizer)
             throw new UserException("Aucun modèle chargé : rien à sauvegarder.");
-        CheckSavedName(name);
+        var saved = _models.SavedStore(name);
 
         // L'avancement (pas, loss, date de l'entraînement) suit le modèle ; l'état d'AdamW (deux fois la taille
         // du modèle) non : un modèle gardé sert à discuter et à comparer, pas à être continué.
-        var info = ModelSource is { } source && TryStore(source) is { Exists: true } from ? from.ReadInfo() : null;
-        string folder = Path.Combine(SavedFolder, name);
-        bool replaced = Directory.Exists(folder);
+        var info = ModelSource is { } source && _models.TryStore(source) is { Exists: true } from ? from.ReadInfo() : null;
+        bool replaced = Directory.Exists(saved.Folder);
         if (replaced)
-            Directory.Delete(folder, recursive: true);
-        new ModelStore(folder).Save(model, tokenizer, info: info);
+            Directory.Delete(saved.Folder, recursive: true);
+        saved.Save(model, tokenizer, info: info);
         return replaced;
     }
 
     /// <summary>Charge un modèle sauvegardé (model, model-pretrain, ou un nom de /save) : il devient celui du chat.</summary>
     public void Load(string name)
     {
-        var store = RequireStore(name);
+        var store = _models.Require(name);
         SetModel(null, null);   // libère la mémoire (GPU) de l'ancien avant de charger le nouveau
         try
         {
-            SetModel(store.Load(Device), NameOf(name));
+            SetModel(store.Load(Device), _models.NameOf(name));
         }
         finally
         {
@@ -350,8 +309,8 @@ public sealed class Workbench
     public IReadOnlyList<(string Question, string First, string Second)> Compare(string first, string second,
         CancellationToken cancellation = default)
     {
-        var (firstStore, secondStore) = (RequireStore(first), RequireStore(second));
-        var questions = QuestionTest.ReadQuestions(_questionsPath);
+        var (firstStore, secondStore) = (_models.Require(first), _models.Require(second));
+        var questions = QuestionTest.ReadQuestions(_data.QuestionsPath);
         var answers = new List<(string, string, string)>();
 
         var (modelA, tokenizerA) = Messages.Spin($"Chargement de '{first}'...", () => firstStore.Load(Device));
@@ -385,77 +344,7 @@ public sealed class Workbench
     /// pour /import dans Nel Code (voir NELMODEL-FORMAT.md), puis relit le fichier pour le vérifier.
     /// Un export du même nom est remplacé.
     /// </summary>
-    public ExportResult Export(string name, string source, string? description)
-    {
-        if (!IsValidName(name))
-            throw new UserException($"Nom invalide : « {name} ». Lettres, chiffres, - _ . (64 caractères au plus).");
-        var store = RequireStore(source);
-
-        var config = store.ReadConfig();
-        var training = store.ReadInfo();
-        string path = Path.Combine(ExportsFolder, name + NelModelFile.Extension);
-        bool replaced = File.Exists(path);
-
-        // Le modèle est chargé sur le CPU (la mémoire GPU reste au chat) : pour le vrai nombre de paramètres,
-        // model.safetensors et reference.json (calculé en float32, sans TF32). Le chargement vérifie aussi que le
-        // modèle a ses tokens spéciaux, sans lesquels Nel Code le refuse.
-        string generated = Path.Combine(Path.GetTempPath(), "minichat-export-" + Guid.NewGuid().ToString("N"));
-        NelModelInfo info;
-        try
-        {
-            var (model, tokenizer) = store.Load(CPU);
-            using (model)
-            {
-                info = new NelModelInfo(NelModelFile.FormatVersion, name, DateTimeOffset.Now.ToString("yyyy-MM-dd'T'HH:mm:sszzz"),
-                    model.ParameterCount, config.Architecture, training?.ValLoss, training?.Step, description);
-                Directory.CreateDirectory(generated);
-                NelModelFile.WriteGenerated(model, tokenizer, generated);
-            }
-
-            NelModelFile.Write(store, generated, info, path);
-            NelModelFile.Verify(path, store, info.Parameters!.Value);
-        }
-        catch (InvalidDataException e)
-        {
-            File.Delete(path);
-            throw new UserException($"Export raté, fichier supprimé : {e.Message}");
-        }
-        finally
-        {
-            if (Directory.Exists(generated))
-                Directory.Delete(generated, recursive: true);
-        }
-        return new ExportResult(path, NameOf(source), info, new FileInfo(path).Length, replaced);
-    }
-
-    private string ExportsFolder => Path.Combine(ModelsFolder, "exports");
-
-    private ModelStore? TryStore(string name) =>
-        name.Equals(ChatModel, StringComparison.OrdinalIgnoreCase) ? _store
-        : name.Equals(PretrainedModel, StringComparison.OrdinalIgnoreCase) ? _pretrainStore
-        : IsValidName(name) ? new ModelStore(Path.Combine(SavedFolder, name))
-        : null;
-
-    private ModelStore RequireStore(string name) =>
-        TryStore(name) is { Exists: true } store
-            ? store
-            : throw new UserException($"Pas de modèle « {name} ». Modèles : {string.Join(", ", ListModels().Select(m => m.Name))}" +
-                                      " (/models pour le détail).");
-
-    // Le nom tel qu'il est écrit sur le disque : "/load MODEL" charge "model".
-    private string NameOf(string name) =>
-        ListModels().FirstOrDefault(m => m.Name.Equals(name, StringComparison.OrdinalIgnoreCase))?.Name ?? name;
-
-    private static bool IsValidName(string name) =>
-        name.Length is > 0 and <= 64 && name.All(c => char.IsLetterOrDigit(c) || c is '-' or '_' or '.') && name[0] != '.';
-
-    private static void CheckSavedName(string name)
-    {
-        if (!IsValidName(name))
-            throw new UserException($"Nom invalide : « {name} ». Lettres, chiffres, - _ . (64 caractères au plus).");
-        if (name.Equals(ChatModel, StringComparison.OrdinalIgnoreCase) || name.Equals(PretrainedModel, StringComparison.OrdinalIgnoreCase))
-            throw new UserException($"« {name} » est réservé à l'entraînement : choisis un autre nom.");
-    }
+    public ExportResult Export(string name, string source, string? description) => _export.Export(name, source, description);
 
     // ---------------------------------------------------------------------------
 
@@ -499,10 +388,10 @@ public sealed class Workbench
     /// </summary>
     private void Adopt(MiniGpt model, BpeTokenizer tokenizer, bool pretrainOnly)
     {
-        if (pretrainOnly && _store.Exists)
+        if (pretrainOnly && _models.Chat.Exists)
         {
             model.Dispose();
-            SetModel(_store.Load(Device), ChatModel);
+            SetModel(_models.Chat.Load(Device), ChatModel);
             return;
         }
         SetModel((model, tokenizer), pretrainOnly ? PretrainedModel : ChatModel);
@@ -528,30 +417,30 @@ public sealed class Workbench
     // Chaque entraînement laisse deux fichiers avec la même date dans results/ :
     //   <date>.txt       les réponses aux questions de test
     //   <date>-loss.csv  les loss mesurées pendant l'entraînement
-    private (TrainingLog Log, Checkpoint Checkpoint, string AnswersPath) NewRun(string runId, string answersName) =>
-        (new TrainingLog(Path.Combine(_resultsFolder, $"{runId}-loss.csv"), _questionsPath),
-         new Checkpoint(_checkpointFolder, runId),
-         Path.Combine(_resultsFolder, $"{answersName}.txt"));
+    private TrainingRun NewRun(string runId, string answersName) =>
+        new(new TrainingLog(Path.Combine(_resultsFolder, $"{runId}-loss.csv"), _data.QuestionsPath),
+            new Checkpoint(_checkpointFolder, runId),
+            Path.Combine(_resultsFolder, $"{answersName}.txt"),
+            _cancellation);
 
     /// <summary>
     /// Fin d'un entraînement complet : plus rien à reprendre, le même examen qu'après chaque entraînement
     /// (pour les comparer entre eux), puis le nouveau modèle devient celui du chat.
     /// </summary>
-    private void Finish(MiniGpt model, BpeTokenizer tokenizer, string training, TrainingLog log, Checkpoint checkpoint,
-        string answersPath, bool pretrainOnly)
+    private void Finish(MiniGpt model, BpeTokenizer tokenizer, string training, TrainingRun run, bool pretrainOnly)
     {
         if (Stopped(model, tokenizer, pretrainOnly))
             return;
 
-        checkpoint.Delete();
+        run.Checkpoint.Delete();
 
         if (OnGpu && GpuMemory.Read() is var (usedMb, totalMb))
             Messages.Dim($"Mémoire GPU utilisée : {usedMb:N0} / {totalMb:N0} Mo (toute la carte).");
 
         string report = Messages.Spin("Questions de test...", () => QuestionTest.Run(
-            new TextGenerator(model, tokenizer, Device), _questionsPath, answersPath,
-            $"Entraînement : {training} | {model.ParameterCount:N0} paramètres | loss : {Path.GetFileName(log.LossCsvPath)}"));
-        ShowReport(report, answersPath);
+            new TextGenerator(model, tokenizer, Device), _data.QuestionsPath, run.AnswersPath,
+            $"Entraînement : {training} | {model.ParameterCount:N0} paramètres | loss : {Path.GetFileName(run.Log.LossCsvPath)}"));
+        ShowReport(report, run.AnswersPath);
 
         // Après un --continue du pré-entraînement, le modèle en mémoire ne sait pas encore discuter.
         if (pretrainOnly)
@@ -570,7 +459,7 @@ public sealed class Workbench
     // Une taille de ModelConfig.Sizes, avec le vocabulaire du tokenizer qui sera entraîné.
     private static ModelConfig SizeConfig(string size) =>
         ModelConfig.Sizes.TryGetValue(size, out var config)
-            ? config with { VocabSize = TokenizerVocabSize }
+            ? config with { VocabSize = DatasetFactory.TokenizerVocabSize }
             : throw new UserException($"Taille inconnue : « {size} ». Tailles : {string.Join(", ", ModelConfig.Sizes.Keys)}.");
 
     // Nouveau modèle : entraîne le tokenizer BPE, puis crée le réseau (poids au hasard).
@@ -579,11 +468,7 @@ public sealed class Workbench
     {
         manual_seed(TrainingConfig.Pretraining.Seed);
 
-        // Le tokenizer apprend sur les DEUX fichiers : il connaît les mots des dialogues,
-        // et le modèle garde le même vocabulaire (donc la même taille de sortie) entre les deux phases.
-        var tokenizer = Messages.Spin($"Entraînement du tokenizer BPE ({TokenizerVocabSize} tokens, sur {TokenizerTextSampleMb} Mo " +
-                                      $"de texte.txt et {TokenizerDialogueSampleMb} Mo de dialogues.txt au plus)...",
-            () => BpeTokenizer.Train(ReadSample(_pretrainPath, TokenizerTextSampleMb) + "\n" + TokenizerDialogues(), TokenizerVocabSize));
+        var tokenizer = _data.TrainTokenizer();
         var model = new MiniGpt(config with { VocabSize = tokenizer.VocabSize }).to(Device);
 
         Messages.Info($"Vocabulaire : {tokenizer.VocabSize} tokens ({tokenizer.Alphabet.Length} caractères de base + {tokenizer.Merges.Count} fusions " +
@@ -592,236 +477,8 @@ public sealed class Workbench
         return (model, tokenizer);
     }
 
-    // Phase 1 : apprend la langue au modèle sur texte.txt.
-    // continuation non null (--continue) : store n'est remplacé que si la loss de vérification a baissé.
-    private void Pretrain(MiniGpt model, BpeTokenizer tokenizer, ModelStore store, TrainingConfig config,
-        TrainingLog log, Checkpoint checkpoint, CheckpointState? resume,
-        ContinueState? continuation = null, TrainingInfo? previous = null)
-    {
-        // À la reprise, graine décalée du pas : on ne rejoue pas les mêmes extraits qu'au début.
-        // Une continuation part aussi de son premier pas (sinon elle retirerait les extraits de --train).
-        int seed = config.Seed + (resume?.Step ?? config.FirstStep);
-        manual_seed(seed);
-
-        // using : les tokens sont sur le GPU (~0,9 Go), libérés à la fin de la phase.
-        using var dataset = GeneralText(tokenizer, seed);
-        Messages.Info($"texte.txt : {dataset.Characters:N0} caractères -> {dataset.TrainLength + dataset.ValidationLength:N0} tokens.");
-        config = Planned(config, dataset, model, resume);
-        var result = TrainPhase("Phase 1 - pré-entraînement", "pretrain", dataset, model, tokenizer, config, log,
-            checkpoint, resume, optimizerPath: continuation is null ? null : store.OptimizerPath);
-
-        SaveResult(store, PretrainedModel, model, tokenizer, result, checkpoint.RunId, continuation, previous);
-    }
-
-    // Phase 2 : spécialise le modèle (déjà pré-entraîné) sur les dialogues.
-    // Le modèle n'est noté que sur les réponses "IA:", et 20 % de chaque batch vient de texte.txt
-    // pour qu'il n'oublie pas le français général.
-    private void FineTune(MiniGpt model, BpeTokenizer tokenizer, ModelStore store, TrainingConfig config,
-        TrainingLog log, Checkpoint checkpoint, CheckpointState? resume,
-        ContinueState? continuation = null, TrainingInfo? previous = null)
-    {
-        int seed = config.Seed + (resume?.Step ?? config.FirstStep);
-        manual_seed(seed);
-
-        using var dialogues = Dialogues(tokenizer, seed);
-        // Autre graine : les extraits de texte général ne suivent pas le même tirage que les dialogues.
-        using var generalText = GeneralText(tokenizer, seed + 1);
-        config = Planned(config, dialogues, model, resume);
-
-        var result = TrainPhase($"Phase 2 - fine-tuning (loss sur les réponses IA, {config.GeneralTextRatio:P0} de texte général)",
-            "finetune", dialogues, model, tokenizer, config, log, checkpoint, resume,
-            optimizerPath: continuation is null ? null : store.OptimizerPath, generalText);
-
-        SaveResult(store, ChatModel, model, tokenizer, result, checkpoint.RunId, continuation, previous);
-    }
-
-    // --continue / --continue-finetune : steps pas de plus sur un modèle déjà entraîné, avec les données actuelles
-    // de data/ et l'optimiseur sauvegardé avec lui. Les pas continuent la numérotation (et le CSV) d'avant.
-    private void ContinuePhase(ContinueState continuation, MiniGpt model, BpeTokenizer tokenizer, ModelStore store,
-        TrainingInfo? previous, TrainingLog log, Checkpoint checkpoint, CheckpointState? resume)
-    {
-        var config = BaseConfig(continuation.Phase, model.Config).Continuation(continuation.FirstStep, continuation.Steps, continuation.LearningRate);
-        Messages.Info($"Continuation : pas {config.FirstStep} -> {config.Steps}, warmup {config.WarmupSteps} pas, " +
-                      $"vitesse {config.LearningRate:0.0e0} -> {config.MinLearningRate:0.0e0}.");
-
-        if (continuation.Phase == "pretrain")
-            Pretrain(model, tokenizer, store, config, log, checkpoint, resume, continuation, previous);
-        else
-            FineTune(model, tokenizer, store, config, log, checkpoint, resume, continuation, previous);
-    }
-
-    // Sauvegarde le modèle avec l'état d'AdamW et l'avancement (pas atteint, loss, date du CSV).
-    // Une continuation ne remplace l'ancien modèle que si sa loss de vérification est meilleure. Les deux loss sont
-    // mesurées sur les données actuelles (l'ancien modèle au premier pas) : celle notée à l'ancienne sauvegarde
-    // a pu l'être sur d'autres données, elle n'est affichée que pour info.
-    private static void SaveResult(ModelStore store, string name, MiniGpt model, BpeTokenizer tokenizer, TrainingResult result,
-        string runId, ContinueState? continuation, TrainingInfo? previous)
-    {
-        if (continuation is not null)
-        {
-            string saved = previous is null ? "" : $", {previous.ValLoss:F3} à sa sauvegarde";
-            Messages.Info($"Loss de vérification : ancienne {result.StartValLoss:F3} (sur les données actuelles{saved}), " +
-                          $"nouvelle {result.BestValLoss:F3} (pas {result.BestStep}).");
-            if (!result.Improved)
-            {
-                Messages.Warning($"Pas meilleure : '{name}' n'est pas remplacé, l'ancien modèle est gardé.");
-                return;
-            }
-        }
-
-        // ponytail: l'état d'AdamW est celui du dernier pas, les poids ceux du meilleur pas ;
-        // assez proches pour repartir, pas la peine de sauvegarder l'optimiseur à chaque meilleur pas.
-        store.Save(model, tokenizer, result.OptimizerStatePath, new TrainingInfo(result.LastStep, result.BestValLoss, runId));
-        Messages.Success(continuation is null
-            ? $"Modèle sauvegardé dans '{name}'."
-            : $"Meilleure : modèle remplacé dans '{name}'.");
-    }
-
-    // Les tokens de texte.txt et de dialogues.txt, relus depuis cache/ s'ils y sont pour ce fichier et ce tokenizer
-    // (voir TokenCache) : texte.txt n'est découpé qu'une fois, pas à chaque phase ni à chaque lancement.
-    private TextDataset GeneralText(BpeTokenizer tokenizer, int seed) =>
-        Dataset("texte", [CheckExists(_pretrainPath)], "", tokenizer, seed, onlyReplies: false,
-            () => TextDataset.TokenizeFile(_pretrainPath, tokenizer));
-
-    // Les dialogues et identite.txt : le cache change si l'un des deux change (ou IdentityRepeats).
-    private TextDataset Dialogues(BpeTokenizer tokenizer, int seed) =>
-        Dataset("dialogues", DialogueSources(), $"identite x{IdentityRepeats}, graine {IdentitySeed}", tokenizer, seed,
-            onlyReplies: true, () => TextDataset.Tokenize(ReadDialogues(), tokenizer, onlyReplies: true));
-
-    private TextDataset Dataset(string name, IReadOnlyList<string> sources, string settings, BpeTokenizer tokenizer,
-        int seed, bool onlyReplies, Func<TokenizedText> tokenize)
-    {
-        var (text, fromCache) = Messages.Spin($"Lecture de {Label(sources)}...",
-            () => TokenCache.Load(_cacheFolder, name, sources, settings, tokenizer, onlyReplies, tokenize));
-        Messages.Dim($"{Label(sources)} : " + (fromCache ? "tokens relus depuis cache/." : "découpé en tokens, gardé dans cache/."));
-        return new TextDataset(text, seed, Device);
-    }
-
-    private TrainingResult TrainPhase(string name, string phase, TextDataset dataset, MiniGpt model, BpeTokenizer tokenizer,
-        TrainingConfig config, TrainingLog log, Checkpoint checkpoint, CheckpointState? resume,
-        string? optimizerPath = null, TextDataset? generalText = null)
-    {
-        // Lu dès le début : si le fichier de questions manque, on le sait tout de suite, pas après des heures.
-        string sampleQuestion = QuestionTest.ReadQuestions(log.QuestionsPath)[0];
-        var generator = new TextGenerator(model, tokenizer, Device);
-
-        Messages.Title(name);
-        Messages.Info($"{dataset.TrainLength + dataset.ValidationLength:N0} tokens, {config.Steps - config.FirstStep} étapes.");
-        return TrainingProgressView.Run(config.FirstStep, config.Steps, progress =>
-            new Trainer(model, dataset, config, Device, checkpoint, progress, generalText, phase, log.LossCsvPath,
-                showSample: step => progress.Log(QuestionTest.Sample(generator, sampleQuestion, step)))
-                .Train(resume, optimizerPath, _cancellation));
-    }
-
-    private ModelStore StoreFor(string phase) => phase == "pretrain" ? _pretrainStore : _store;
-
-    private static string StoreName(string phase) => phase == "pretrain" ? PretrainedModel : ChatModel;
-
-    private static TrainingConfig BaseConfig(string phase, ModelConfig model) =>
-        phase == "pretrain" ? TrainingConfig.PretrainingFor(model) : TrainingConfig.FineTuningFor(model);
-
     private static string Now() => DateTime.Now.ToString("yyyy-MM-dd_HH-mm-ss");
-
-    // Lit un fichier de données. Sur Windows les fins de ligne sont "\r\n" : on garde seulement "\n".
-    private static string ReadText(string path) => File.ReadAllText(CheckExists(path)).Replace("\r\n", "\n");
-
-    // "dialogues.txt + identite.txt"
-    private static string Label(IReadOnlyList<string> sources) => string.Join(" + ", sources.Select(Path.GetFileName));
-
-    // La phase avec epochs passages (--epochs), ou ses passages par défaut si null.
-    private static TrainingConfig WithEpochs(TrainingConfig config, double? epochs) =>
-        epochs is null ? config : config with { Epochs = epochs };
-
-    // Le dernier pas de la phase : celui de l'entraînement repris (même fin prévue, donc même cosinus), sinon
-    // calculé depuis Epochs et la taille des données d'entraînement. Une continuation garde le sien (Epochs null).
-    private static TrainingConfig Planned(TrainingConfig config, TextDataset dataset, MiniGpt model, CheckpointState? resume) =>
-        resume?.Steps is { } steps ? config with { Steps = steps } : config.ForData(dataset.TrainLength, model.Config.BlockSize);
-
-    // dialogues.txt, et identite.txt s'il existe.
-    private IReadOnlyList<string> DialogueSources()
-    {
-        if (File.Exists(_identityPath))
-            return [CheckExists(_dialoguesPath), _identityPath];
-
-        Messages.Warning($"Pas de {Path.GetFileName(_identityPath)} : le modèle n'apprendra pas qui il est (nom, ce qu'il sait faire).");
-        return [CheckExists(_dialoguesPath)];
-    }
-
-    // dialogues.txt (Toi:/IA:) au format du modèle, avec ses tokens spéciaux (voir ChatFormat).
-    // Les conversations d'identite.txt y sont glissées IdentityRepeats fois chacune, à des places tirées au hasard
-    // (graine fixe : même résultat à chaque fois, donc le cache reste valable).
-    private string ReadDialogues()
-    {
-        var conversations = Conversations(ReadText(_dialoguesPath));
-        if (File.Exists(_identityPath))
-        {
-            var identity = Conversations(ReadText(_identityPath));
-            var random = new Random(IdentitySeed);
-            for (int copy = 0; copy < IdentityRepeats; copy++)
-                foreach (string conversation in identity)
-                    conversations.Insert(random.Next(conversations.Count + 1), conversation);
-        }
-        return ChatFormat.FromDialogueFile(string.Join("\n\n", conversations));
-    }
-
-    // Les dialogues pour le tokenizer : un échantillon de dialogues.txt (voir ReadSample) et identite.txt en entier,
-    // au format du modèle comme à l'entraînement (BpeTokenizer.Train remplace les tokens spéciaux par "\n").
-    // L'échantillon commence au milieu d'une conversation : les lignes avant le premier "Toi:" ou "IA:" sont ignorées.
-    private string TokenizerDialogues()
-    {
-        string text = ReadSample(_dialoguesPath, TokenizerDialogueSampleMb);
-        if (File.Exists(_identityPath))
-            text += "\n\n" + ReadText(_identityPath);
-        return ChatFormat.FromDialogueFile(text);
-    }
-
-    // Les conversations d'un fichier Toi:/IA:, séparées par une ligne vide (comme les lit ChatFormat.FromDialogueFile).
-    private static List<string> Conversations(string text) =>
-        Regex.Split(text, @"\n[^\S\n]*\n").Select(c => c.Trim('\n')).Where(c => c.Trim().Length > 0).ToList();
-
-    private static string CheckExists(string path) =>
-        File.Exists(path) ? path : throw new UserException($"Fichier de données introuvable : {path}");
-
-    // Un fichier de plus de maxMb Mo : maxMb blocs de 1 Mo pris à intervalles réguliers, coupés aux fins de ligne.
-    // Réparti dans tout le fichier, l'échantillon voit chaque source (texte.txt en colle souvent plusieurs bout à bout).
-    // Un fichier plus petit est lu en entier.
-    private static string ReadSample(string path, int maxMb)
-    {
-        const int BlockSize = 1 << 20;
-        long length = new FileInfo(CheckExists(path)).Length;
-        if (length <= (long)maxMb * BlockSize)
-            return ReadText(path);
-
-        var sample = new StringBuilder();
-        var buffer = new byte[BlockSize];
-        using var file = File.OpenRead(path);
-        for (int i = 0; i < maxMb; i++)
-        {
-            file.Position = length / maxMb * i;
-            int read = file.ReadAtLeast(buffer, BlockSize, throwOnEndOfStream: false);
-            // Le bloc commence et finit au milieu d'une ligne (voire d'un caractère UTF-8) : on garde les lignes entières.
-            string block = Encoding.UTF8.GetString(buffer, 0, read);
-            int first = block.IndexOf('\n') + 1;
-            int last = block.LastIndexOf('\n') + 1;
-            if (last > first)
-                sample.Append(block, first, last - first);
-        }
-        return sample.Replace("\r\n", "\n").ToString();
-    }
 }
-
-/// <summary>
-/// Un modèle sauvegardé, pour /models. ParameterCount est déduit de la taille des poids (sans les charger).
-/// Info = pas, loss de vérification et date de l'entraînement ; null pour un modèle d'avant --continue.
-/// </summary>
-public sealed record SavedModel(string Name, ModelConfig Config, long ParameterCount, long WeightsBytes,
-    DateTime SavedAt, TrainingInfo? Info);
-
-/// <summary>Un .nelmodel écrit et vérifié par /export. Replaced = un export du même nom existait.</summary>
-public sealed record ExportResult(string Path, string Source, NelModelInfo Info, long Bytes, bool Replaced);
-
-/// <summary>Où un entraînement écrit son suivi : le CSV des loss, et les questions pour les exemples.</summary>
-public sealed record TrainingLog(string LossCsvPath, string QuestionsPath);
 
 /// <summary>
 /// Ce que /train va faire (voir Workbench.Plan) : taille et réglages du modèle, paramètres, et pour chaque phase

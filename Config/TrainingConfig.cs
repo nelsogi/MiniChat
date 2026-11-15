@@ -238,4 +238,26 @@ public sealed record TrainingConfig
     public TrainingConfig ForData(long trainTokens, int blockSize) => Epochs is { } epochs
         ? this with { Steps = FirstStep + Math.Max(1, (int)Math.Ceiling(epochs * trainTokens / MainTokensPerStep(blockSize))) }
         : this;
+
+    /// <summary>La phase avec epochs passages (--epochs), ou ses passages par défaut si null.</summary>
+    public TrainingConfig WithEpochs(double? epochs) => epochs is null ? this : this with { Epochs = epochs };
+
+    /// <summary>
+    /// Vitesse d'apprentissage au pas step : warmup puis cosinus, de FirstStep à Steps (le dernier pas prévu) :
+    ///   - pendant WarmupSteps, la vitesse monte en ligne droite de 0 à LearningRate,
+    ///   - ensuite elle descend doucement en suivant une demi-courbe cosinus, jusqu'à MinLearningRate au pas Steps.
+    /// Grands pas au début pour avancer vite, petits pas à la fin pour affiner.
+    /// </summary>
+    public double LearningRateAt(int step)
+    {
+        // Compté depuis FirstStep : une continuation a son propre warmup et son propre cosinus.
+        int done = step - FirstStep;
+        int total = Steps - FirstStep;
+        if (done < WarmupSteps)
+            return LearningRate * (done + 1) / WarmupSteps;
+
+        double progress = (double)(done - WarmupSteps) / Math.Max(1, total - WarmupSteps);
+        double cosine = 0.5 * (1 + Math.Cos(Math.PI * Math.Min(progress, 1.0)));   // 1 -> 0
+        return MinLearningRate + (LearningRate - MinLearningRate) * cosine;
+    }
 }

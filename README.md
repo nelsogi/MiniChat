@@ -137,7 +137,7 @@ calculé une fois les données découpées, et le cosinus du learning rate va to
 
 Identité : `data/identite.txt` contient 50 conversations sur qui est MiniChat (nom, ce qu'il sait faire, ses
 limites), au même format que `dialogues.txt`. Chacune est glissée 10 fois parmi les dialogues, à des places
-tirées au hasard (`IdentityRepeats` dans `Workbench`) : ~0,3 % des dialogues. Le chat n'ajoute plus de phrase
+tirées au hasard (`IdentityRepeats` dans `App/DatasetFactory.cs`) : ~0,3 % des dialogues. Le chat n'ajoute plus de phrase
 d'identité au début de chaque conversation : toute la mémoire du modèle reste pour la discussion. Après avoir
 modifié `identite.txt`, refais `/finetune`.
 
@@ -145,7 +145,7 @@ Initialisation d'un nouveau modèle (comme GPT-2) : embeddings et couches `Linea
 et les deux projections qui écrivent dans la connexion résiduelle (sortie de l'attention et du SwiGLU) selon
 N(0 ; 0,02/√(2 × Layers)), pour que la somme des 2 × Layers corrections ne grandisse pas avec la profondeur.
 
-Le tokenizer BPE (8000 tokens, `TokenizerVocabSize` dans `App/Workbench.cs`) est entraîné au début
+Le tokenizer BPE (8000 tokens, `TokenizerVocabSize` dans `App/DatasetFactory.cs`) est entraîné au début
 de la phase 1 sur un échantillon de 60 Mo de `texte.txt` et de 20 Mo de `dialogues.txt` (plus `identite.txt`),
 chacun pris en blocs de 1 Mo répartis dans tout le fichier (`TokenizerTextSampleMb`, `TokenizerDialogueSampleMb` ;
 quelques minutes), puis sauvegardé avec le modèle (`tokenizer.json`). Avec 8000 tokens au lieu de 4000, les mots
@@ -360,6 +360,10 @@ Attention : la sortie est **écrasée** (sauf avec `chat --append oui`). Garde u
 | `Evaluation/`    | `QuestionTest`        | Questions de test après l'entraînement, exemples pendant |
 | `Storage/`       | `ModelStore`          | Sauvegarde / chargement du modèle |
 | `App/`           | `Workbench`           | Le modèle chargé et ce qui le change : entraîner, continuer, reprendre, tester |
+|                  | `PretrainPhase`, `FinetunePhase`, `ContinuePhase` | Les phases de l'entraînement (ce qu'elles font pareil : `TrainingPhase`) |
+|                  | `DatasetFactory`      | Les fichiers de `data/` : tokenizer d'un nouveau modèle, datasets de chaque phase |
+|                  | `ModelCatalog`        | Les modèles sauvegardés : `model/`, `model-pretrain/`, `saved/<nom>/` |
+|                  | `ExportService`       | `/export` en `.nelmodel` |
 |                  | `NelShell`            | La boucle de Nel Code : commandes ou messages pour le modèle |
 | `Commands/`      | `ICommand`            | Une commande (`Name`, `Description`, `Usage`, `Execute`) ; une classe par commande |
 |                  | `CommandRegistry`     | Trouve toutes les commandes toute seule (ajouter une classe suffit) |
@@ -368,6 +372,17 @@ Attention : la sortie est **écrasée** (sauf avec `chat --append oui`). Garde u
 |                  | `ChatView`            | La conversation : spinner, puis réponse au fur et à mesure |
 |                  | `InputBox`            | La zone de saisie |
 |                  | `TrainingProgressView`| La barre de progression de l'entraînement |
+
+## Tests
+
+```
+dotnet test MiniChat.Tests
+```
+
+Projet xUnit à part, `MiniChat.Tests/` (sur le CPU, avec libtorch CPU : pas besoin de GPU, quelques secondes) :
+tokenizer BPE, format des conversations et masque de la loss, découpage entraînement/vérification, calendrier
+du learning rate, nombre de pas avec `--epochs`, checkpoint et reprise, cache de tokens. Les tests qui
+entraînent utilisent un modèle minuscule (1 couche, 32 dimensions).
 
 ## Architecture (`ModelConfig.Architecture`)
 

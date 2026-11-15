@@ -48,7 +48,7 @@ public sealed class TextDataset : IDisposable
     private const int SplitSeed = 1234;
 
     /// <summary>Une suite de morceaux voisins du même côté (entraînement ou vérification).</summary>
-    private readonly record struct Segment(int Start, int Length);
+    internal readonly record struct Segment(int Start, int Length);
 
     private readonly Tensor _ids;      // int16, forme (tokens), sur le device
     private readonly Tensor? _mask;    // uint8, forme (tokens), sur le device ; null = noté sur tous les tokens
@@ -243,7 +243,7 @@ public sealed class TextDataset : IDisposable
     /// Coupe length tokens en morceaux, en met un sur validationEvery en vérification, et regroupe les
     /// morceaux voisins du même côté (un extrait peut passer d'un morceau d'entraînement au suivant).
     /// </summary>
-    private static (Segment[] Train, Segment[] Validation) Split(int length, int validationEvery)
+    internal static (Segment[] Train, Segment[] Validation) Split(int length, int validationEvery)
     {
         // Tout petit texte : des morceaux sous MinChunkTokens, pour en avoir au moins validationEvery.
         int chunk = Math.Max(1, Math.Max(Math.Min(length / MinChunks, ChunkTokens),

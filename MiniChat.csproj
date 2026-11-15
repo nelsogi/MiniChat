@@ -90,8 +90,12 @@
   </Target>
 
   <ItemGroup>
-    <!-- Copie les données d'entraînement à côté de l'exécutable (compilation et dotnet publish). -->
-    <None Update="Data\**" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" />
+    <!-- Les données ne sont pas copiées à la compilation (texte.txt fait des Go) : MiniChat lit Data/ du projet,
+         dont le chemin est noté dans l'exécutable (ProjectDataFolder, voir Program.cs). dotnet publish, lui, les met
+         dans le dossier publié pour un autre PC, sans les sources de DataBuilder (*.parquet) ni les sauvegardes. -->
+    <None Update="Data\**" CopyToOutputDirectory="Never" CopyToPublishDirectory="PreserveNewest" />
+    <None Update="Data\**\*.parquet;Data\dialogues-*.txt" CopyToPublishDirectory="Never" />
+    <AssemblyMetadata Include="ProjectDataFolder" Value="$(MSBuildProjectDirectory)\Data" />
   </ItemGroup>
 
   <!-- Après dotnet publish : copie model/ et model-pretrain/ dans le dossier publié, s'ils existent.

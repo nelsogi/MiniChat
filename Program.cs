@@ -13,13 +13,16 @@ Console.InputEncoding = Encoding.UTF8;
 // Ctrl+C pendant une barre de progression : Spectre a caché le curseur, on le remet avant de quitter.
 Console.CancelKeyPress += (_, _) => AnsiConsole.Cursor.Show();
 
-// Deux dossiers, par défaut à côté de l'exécutable (marche avec "dotnet run", F5 et le dossier publié) :
-//   --data <dossier>    texte.txt, dialogues.txt, questions-test.txt
-//   --models <dossier>  model/, model-pretrain/, et ce que l'entraînement écrit : checkpoint/, results/
+// Deux dossiers :
+//   --data <dossier>    texte.txt, dialogues.txt, questions-test.txt, eval.json. Par défaut Data/ à côté de
+//                       l'exécutable s'il existe (dossier publié), sinon Data/ du projet : la compilation ne copie
+//                       plus les données dans bin/ (voir MiniChat.csproj).
+//   --models <dossier>  model/, model-pretrain/, et ce que l'entraînement écrit : checkpoint/, results/, cache/.
+//                       Par défaut à côté de l'exécutable.
 // Un chemin relatif part du dossier courant de la console.
 string? dataOption = ReadOption(args, "--data", @"D:\MiniChat\data");
 string? modelsOption = ReadOption(args, "--models", @"D:\MiniChat\models");
-string dataFolder = Path.GetFullPath(dataOption ?? Path.Combine(AppContext.BaseDirectory, "Data"));
+string dataFolder = Path.GetFullPath(dataOption ?? DefaultDataFolder());
 string modelsFolder = Path.GetFullPath(modelsOption ?? AppContext.BaseDirectory);
 
 if (!Directory.Exists(dataFolder))
@@ -144,6 +147,17 @@ static void RunBenchmarkMeasure(string[] args, Device device)
     var config = ModelConfig.Sizes[args[i + 1]] with { VocabSize = DatasetFactory.TokenizerVocabSize };
     var measure = SpeedBenchmark.Measure(args[i + 2], config, int.Parse(args[i + 3]), device);
     Console.WriteLine(BenchmarkResult + System.Text.Json.JsonSerializer.Serialize(measure));
+}
+
+// Data/ à côté de l'exécutable (dossier publié), sinon Data/ du projet (noté à la compilation, voir MiniChat.csproj).
+static string DefaultDataFolder()
+{
+    string besideExe = Path.Combine(AppContext.BaseDirectory, "Data");
+    if (Directory.Exists(besideExe))
+        return besideExe;
+    return typeof(Workbench).Assembly.GetCustomAttributes(typeof(System.Reflection.AssemblyMetadataAttribute), false)
+        .Cast<System.Reflection.AssemblyMetadataAttribute>()
+        .FirstOrDefault(a => a.Key == "ProjectDataFolder")?.Value ?? besideExe;
 }
 
 // Valeur d'une option "--nom valeur", ou null si l'option n'est pas là. example : montré si la valeur manque.

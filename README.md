@@ -225,10 +225,14 @@ démarrent directement le chat.
 
 GPU NVIDIA utilisé automatiquement s'il y en a un (pilote récent), CPU sinon : rien à configurer.
 
+Les données sont lues directement dans `Data/` du projet : la compilation ne les copie pas dans `bin/` (`texte.txt`
+fait 5,6 Go). Un dossier publié (`publish.ps1`) a son propre `Data/`, à côté de `MiniChat.exe`, qui passe avant.
+Les modèles, eux, restent à côté de l'exécutable (`bin/.../model/`).
+
 Autres dossiers, sans recompiler :
 
 ```bash
-dotnet run -- --data D:\MesDonnees      # texte.txt, dialogues.txt, questions-test.txt
+dotnet run -- --data D:\MesDonnees      # texte.txt, dialogues.txt, questions-test.txt, eval.json
 dotnet run -- --models D:\MesModeles    # model/, model-pretrain/ (+ checkpoint/ et results/ y sont écrits)
 ```
 
@@ -245,7 +249,7 @@ le dossier dans `MiniChat-win-x64.zip`. Le dossier `publish/` contient :
 
 - `MiniChat.exe` et le runtime .NET (rien à installer côté .NET sur l'autre PC),
 - TorchSharp et libtorch (CUDA et CPU),
-- `data/`,
+- `Data/` (sans les sources de DataBuilder, `*.parquet`, ni les sauvegardes `dialogues-*.txt`),
 - `model/` et `model-pretrain/` s'ils existent (pris dans `bin\Debug\net8.0`, là où `dotnet run`
   les crée ; autre source : `publish.ps1 -ModelsSource D:\MesModeles`).
 
@@ -350,7 +354,7 @@ dotnet run --project DataBuilder -- sans-eval Data/dialogues.txt Data/eval.json
   `--skip "champ=a,b;champ2=c"` écarte les conversations dont le champ contient une de ces valeurs.
   Le « œ » mal encodé de certains jeux (`cÅ“ur`, `Åufs`) est réparé.
 
-Le `dialogues.txt` actuel (~312 000 conversations, 93 Mo) se refait ainsi (l'OpenAssistant qu'il contient est
+Le `dialogues.txt` actuel (~321 000 conversations, 101 Mo) se refait ainsi (l'OpenAssistant qu'il contient est
 encore celui de l'ancienne extraction, une conversation par arbre) :
 
 ```bash
@@ -369,7 +373,18 @@ dotnet run --project DataBuilder -- chat Data/dialogues.txt luth_aya_dataset-000
 # Sans les questions de /eval (360 conversations retirées), puis 20 000 dialogues de calcul
 dotnet run --project DataBuilder -- sans-eval Data/dialogues.txt Data/eval.json
 dotnet run --project DataBuilder -- calcul Data/dialogues.txt Data/eval.json --append oui
+# Conversations à plusieurs tours (Apache 2.0) : CATIE-AQ/everyday-conversations-llama3.1-2k-in-french (data/, train et
+#   test : 2 353 gardées) et la partie française de Cyrile/chatverse (data/, 8 fichiers : 6 725 gardées).
+#   Fichiers renommés pour ne pas se marcher dessus : catie-everyday-train.parquet, chatverse-00000-of-00008.parquet...
+dotnet run --project DataBuilder -- chat Data/dialogues.txt Data/catie-everyday-train.parquet Data/catie-everyday-test.parquet \
+    Data/chatverse-0000{0,1,2,3,4,5,6,7}-of-00008.parquet --skip "language=english" --append oui
+dotnet run --project DataBuilder -- sans-eval Data/dialogues.txt Data/eval.json
 ```
+
+Conversations par nombre de tours, avant -> après CATIE-AQ et chatverse : 1 tour 302 261 -> 306 252, 2 tours
+5 269 -> 6 345, 3 tours 3 835 -> 4 887, 4 tours 336 -> 2 567, 5 à 10 tours 468 -> 1 193 (3 tours ou plus :
+4 675 -> 8 682). Beaucoup des conversations ajoutées s'arrêtent avant la fin (un message plus loin trop long,
+avec du code ou un emoji) : 5 670 sur 9 078.
 
 Le `texte.txt` actuel (2,9 Go, 565 611 documents) est la mise bout à bout de deux sorties de **parquet** : l'ancien
 `texte.txt` (~0,1 Go de web FineWeb-2, puis ~1,3 Go de Wikipédia FR, 192 872 documents : ses 1 468 518 614 premiers

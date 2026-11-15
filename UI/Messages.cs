@@ -42,6 +42,13 @@ public static class Messages
             .SpinnerStyle(Theme.Style(Theme.Accent))
             .Start(Markup.Escape(status), _ => work());
 
+    /// <summary>Un spinner dont le travail change le texte en cours de route (setStatus), ex. "question 12/100".</summary>
+    public static T Spin<T>(string status, Func<Action<string>, T> work) =>
+        AnsiConsole.Status()
+            .Spinner(Spinner.Known.Dots)
+            .SpinnerStyle(Theme.Style(Theme.Accent))
+            .Start(Markup.Escape(status), context => work(text => context.Status(Markup.Escape(text))));
+
     /// <summary>"mm:ss", ou "h:mm:ss" à partir d'une heure (un entraînement long peut durer des heures).</summary>
     public static string Duration(TimeSpan? time) =>
         time is not { } t ? "--:--"

@@ -13,6 +13,14 @@ namespace MiniChat.Data;
 public sealed record TokenizedText(short[] Ids, byte[]? Mask, long Characters);
 
 /// <summary>
+/// Des extraits pour le modèle. X = les tokens lus, Y = le token suivant de chacun (la bonne réponse),
+/// Mask = le poids de chaque token de Y dans la loss, tous de forme (extraits, BlockSize).
+/// Documents : le numéro de conversation de chaque token quand un extrait en contient plusieurs (dialogues,
+/// voir MiniGpt.Forward), null pour un texte suivi.
+/// </summary>
+public sealed record Batch(Tensor X, Tensor Y, Tensor Mask, Tensor? Documents = null);
+
+/// <summary>
 /// Le texte d'entraînement, découpé en ~90 % pour apprendre et ~10 % pour vérifier.
 /// La partie "vérification" n'est jamais apprise : si la loss y descend aussi,
 /// le modèle généralise vraiment au lieu de juste apprendre par cœur.
@@ -27,6 +35,15 @@ public sealed record TokenizedText(short[] Ids, byte[]? Mask, long Characters);
 ///
 /// Chaque token a aussi un poids (le "masque") : 1 = le modèle est noté sur ce token,
 /// 0 = il le lit mais n'est pas noté dessus. Voir Tokenize (onlyReplies).
+///
+/// Dialogues (documentToken = &lt;|doc|&gt;) : un extrait ne commence plus n'importe où, mais au début d'une
+/// conversation tirée au hasard, suivie des conversations d'après tant qu'elles tiennent EN ENTIER ; la place qui
+/// reste est du remplissage, jamais noté. Chaque conversation ne voit qu'elle-même et ses positions repartent
+/// de 0 (Batch.Documents, voir DocumentMask) : le modèle apprend chaque conversation comme si elle était seule,
+/// et de son début, comme en discutant. Une conversation plus longue que l'extrait est coupée à BlockSize tokens.
+///   [doc conversation 12 ......][doc conversation 13 ...][doc conversation 14 .....][remplissage]
+/// Une conversation appartient au côté (entraînement ou vérification) où elle commence, et s'arrête à la fin de
+/// son segment : rien ne passe d'un côté à l'autre.
 ///
 /// Les tokens sont gardés directement sur le device (GPU), en int16 : un texte.txt de 1,5 Go donne
 /// ~460 millions de tokens, soit ~0,9 Go de mémoire GPU. Un batch y est découpé par des index :
@@ -50,12 +67,23 @@ public sealed class TextDataset : IDisposable
     /// <summary>Une suite de morceaux voisins du même côté (entraînement ou vérification).</summary>
     internal readonly record struct Segment(int Start, int Length);
 
+    /// <summary>
+    /// Une conversation : Length tokens à partir de Start, du &lt;|doc|&gt; qui l'ouvre au suivant (ou à la fin de son
+    /// segment). Elle occupe Length - 1 places dans un extrait : son dernier token n'est que la réponse attendue
+    /// (Y) du précédent, il n'y a rien à prédire après.
+    /// </summary>
+    internal readonly record struct Conversation(int Start, int Length);
+
     private readonly Tensor _ids;      // int16, forme (tokens), sur le device
     private readonly Tensor? _mask;    // uint8, forme (tokens), sur le device ; null = noté sur tous les tokens
     private readonly Device _device;
     private readonly Segment[] _train;
     private readonly Segment[] _validation;
     private readonly Random _random;
+
+    // Dialogues : les conversations de chaque côté, dans l'ordre du texte. null : texte suivi (extraits n'importe où).
+    private readonly Conversation[]? _trainConversations;
+    private readonly Conversation[]? _validationConversations;
 
     // Graine des extraits de vérification (voir FixedValidation), fixe comme SplitSeed.
     private const int ValidationSeed = 4321;
@@ -64,11 +92,18 @@ public sealed class TextDataset : IDisposable
     private (int BlockSize, long[] Train, long[] Validation)? _starts;
 
     // Les extraits de vérification, tirés une fois (voir FixedValidation).
-    private (int Count, int BlockSize, Tensor X, Tensor Y, Tensor Mask)? _fixedValidation;
+    private (int Count, int BlockSize, Batch Batch)? _fixedValidation;
+
+    // Remplissage moyen des extraits d'entraînement (voir ExtractFill), calculé une fois par BlockSize.
+    private (int BlockSize, double Fill)? _fill;
 
     /// <param name="text">Les tokens (Tokenize, TokenizeFile ou TokenCache), copiés sur le device.</param>
     /// <param name="validationEvery">Un morceau sur combien va en vérification (10 = ~10 %).</param>
-    public TextDataset(TokenizedText text, int seed, Device device, int validationEvery = 10)
+    /// <param name="documentToken">
+    /// L'id de &lt;|doc|&gt; pour des dialogues : chaque extrait est fait de conversations entières, qui ne se voient
+    /// pas entre elles (voir plus haut). null : texte suivi, les extraits commencent n'importe où.
+    /// </param>
+    public TextDataset(TokenizedText text, int seed, Device device, int validationEvery = 10, int? documentToken = null)
     {
         _device = device;
         _ids = ToDevice(tensor(text.Ids), device);
@@ -76,6 +111,12 @@ public sealed class TextDataset : IDisposable
         (_train, _validation) = Split(text.Ids.Length, validationEvery);
         _random = new Random(seed);
         Characters = text.Characters;
+
+        if (documentToken is { } token)
+        {
+            _trainConversations = Conversations(text.Ids, _train, (short)token);
+            _validationConversations = Conversations(text.Ids, _validation, (short)token);
+        }
     }
 
     /// <summary>
@@ -147,9 +188,14 @@ public sealed class TextDataset : IDisposable
     ///
     /// Les débuts sont tirés sur le CPU (même tirage qu'avant, donc les mêmes extraits), puis le GPU découpe :
     /// index[b, t] = début[b] + t, pour t de 0 à BlockSize, et les tokens sont lus d'un coup à ces index.
+    /// Dialogues : une conversation tirée au hasard par extrait, puis les suivantes (voir Pack).
     /// </summary>
-    public (Tensor X, Tensor Y, Tensor Mask) GetBatch(bool validation, int batchSize, int blockSize, Device device)
+    public Batch GetBatch(bool validation, int batchSize, int blockSize, Device device)
     {
+        if (ConversationsOf(validation) is { } conversations)
+            return To(Pack(conversations, Enumerable.Range(0, batchSize).Select(_ => _random.Next(conversations.Length)).ToArray(),
+                blockSize), device);
+
         var segments = validation ? _validation : _train;
         var ends = StartsIndex(blockSize, validation);
         long possibleStarts = ends.Length == 0 ? 0 : ends[^1];
@@ -160,8 +206,7 @@ public sealed class TextDataset : IDisposable
         for (int b = 0; b < batchSize; b++)
             starts[b] = PickStart(segments, ends, _random.NextInt64(possibleStarts));
 
-        var (x, y, mask) = Gather(starts, blockSize);
-        return (x.to(device), y.to(device), mask.to(device));
+        return To(Gather(starts, blockSize), device);
     }
 
     /// <summary>
@@ -169,33 +214,154 @@ public sealed class TextDataset : IDisposable
     /// (ValidationSeed, à part du tirage des batchs) puis gardés sur le device. Toujours les mêmes, à chaque
     /// mesure, reprise ou continuation sur le même texte : la loss de vérification ne bouge que si le modèle change.
     /// </summary>
-    public (Tensor X, Tensor Y, Tensor Mask) FixedValidation(int count, int blockSize)
+    public Batch FixedValidation(int count, int blockSize)
     {
         if (_fixedValidation is { } cached && cached.Count == count && cached.BlockSize == blockSize)
-            return (cached.X, cached.Y, cached.Mask);
-
-        var ends = StartsIndex(blockSize, validation: true);
-        long possibleStarts = ends.Length == 0 ? 0 : ends[^1];
-        if (possibleStarts <= 0)
-            throw new InvalidOperationException("Pas assez de texte pour ce BlockSize : ajoute des données.");
+            return cached.Batch;
 
         var random = new Random(ValidationSeed);
-        var starts = new long[count];
-        for (int i = 0; i < count; i++)
-            starts[i] = PickStart(_validation, ends, random.NextInt64(possibleStarts));
+        Batch Draw()
+        {
+            if (_validationConversations is { } conversations)
+                return conversations.Length > 0
+                    ? Pack(conversations, Enumerable.Range(0, count).Select(_ => random.Next(conversations.Length)).ToArray(), blockSize)
+                    : throw new InvalidOperationException("Aucune conversation dans la vérification : ajoute des données.");
+
+            var ends = StartsIndex(blockSize, validation: true);
+            long possibleStarts = ends.Length == 0 ? 0 : ends[^1];
+            if (possibleStarts <= 0)
+                throw new InvalidOperationException("Pas assez de texte pour ce BlockSize : ajoute des données.");
+
+            var starts = new long[count];
+            for (int i = 0; i < count; i++)
+                starts[i] = PickStart(_validation, ends, random.NextInt64(possibleStarts));
+            return Gather(starts, blockSize);
+        }
 
         DisposeFixedValidation();
         using var scope = NewDisposeScope();
-        var (x, y, mask) = Gather(starts, blockSize);
-        _fixedValidation = (count, blockSize, x.DetachFromDisposeScope(), y.DetachFromDisposeScope(), mask.DetachFromDisposeScope());
-        return (x, y, mask);
+        var batch = Draw();
+        _fixedValidation = (count, blockSize, new Batch(batch.X.DetachFromDisposeScope(), batch.Y.DetachFromDisposeScope(),
+            batch.Mask.DetachFromDisposeScope(), batch.Documents?.DetachFromDisposeScope()));
+        return batch;
     }
+
+    /// <summary>
+    /// Part moyenne d'un extrait d'entraînement qui est du vrai texte, le reste étant du remplissage :
+    /// 1 pour un texte suivi. Dialogues : moyenne exacte sur toutes les conversations de départ possibles
+    /// (voir Runs). Sert à compter les passages sur les données : un extrait à moitié rempli n'en lit que la moitié.
+    /// </summary>
+    public double ExtractFill(int blockSize)
+    {
+        if (_trainConversations is not { Length: > 0 } conversations)
+            return 1;
+        if (_fill is { } fill && fill.BlockSize == blockSize)
+            return fill.Fill;
+
+        double used = 0;
+        for (int first = 0; first < conversations.Length; first++)
+            used += Runs(conversations, first, blockSize).Sum(r => r.Length);
+        _fill = (blockSize, used / conversations.Length / blockSize);
+        return _fill.Value.Fill;
+    }
+
+    /// <summary>
+    /// Les morceaux de texte d'un extrait de dialogues qui commence à la conversation first : elle (coupée à
+    /// blockSize places si elle est trop longue), puis les suivantes tant qu'elles tiennent en entier dans la place
+    /// qui reste. Chaque morceau : Start = son premier token (x), Length = places occupées (x lit Start à
+    /// Start + Length - 1, y attend Start + 1 à Start + Length).
+    /// </summary>
+    internal static List<Conversation> Runs(Conversation[] conversations, int first, int blockSize)
+    {
+        var start = conversations[first];
+        var runs = new List<Conversation> { start with { Length = Math.Min(start.Length - 1, blockSize) } };
+        int used = runs[0].Length;
+        for (int i = first + 1; i < conversations.Length && conversations[i].Length - 1 <= blockSize - used; i++)
+        {
+            runs.Add(conversations[i] with { Length = conversations[i].Length - 1 });
+            used += conversations[i].Length - 1;
+        }
+        return runs;
+    }
+
+    /// <summary>
+    /// Les conversations d'un côté (segments) : chacune commence à un token &lt;|doc|&gt; et va jusqu'au suivant,
+    /// ou jusqu'à la fin de son segment. Le début d'un segment, avant son premier &lt;|doc|&gt;, est la fin d'une
+    /// conversation de l'autre côté : il n'est pas utilisé. Une conversation d'un seul token (rien à prédire) non plus.
+    /// </summary>
+    internal static Conversation[] Conversations(short[] ids, Segment[] segments, short documentToken)
+    {
+        var conversations = new List<Conversation>();
+        foreach (var segment in segments)
+        {
+            int end = segment.Start + segment.Length;
+            int start = -1;
+            for (int i = segment.Start; i <= end; i++)
+            {
+                if (i < end && ids[i] != documentToken)
+                    continue;
+                if (start >= 0 && i - start >= 2)
+                    conversations.Add(new Conversation(start, i - start));
+                start = i;
+            }
+        }
+        return conversations.ToArray();
+    }
+
+    private Conversation[]? ConversationsOf(bool validation)
+    {
+        var conversations = validation ? _validationConversations : _trainConversations;
+        if (conversations is { Length: 0 })
+            throw new InvalidOperationException("Aucune conversation de ce côté : ajoute des données.");
+        return conversations;
+    }
+
+    /// <summary>
+    /// Les extraits de dialogues qui commencent aux conversations firsts (voir Runs), construits sur le CPU puis
+    /// lus d'un coup sur le device : pour chaque place, l'index de son token (x) et de la réponse attendue (y),
+    /// son numéro de conversation, et 1 (vrai texte) ou 0 (remplissage). Le remplissage forme une conversation
+    /// à lui (il ne voit et ne gêne personne) et n'est jamais noté.
+    /// </summary>
+    private Batch Pack(Conversation[] conversations, int[] firsts, int blockSize)
+    {
+        int count = firsts.Length;
+        var xIndex = new long[count * blockSize];
+        var documents = new long[count * blockSize];
+        var real = new float[count * blockSize];
+
+        for (int b = 0; b < count; b++)
+        {
+            int place = b * blockSize;
+            var runs = Runs(conversations, firsts[b], blockSize);
+            for (int document = 0; document < runs.Count; document++)
+                for (int t = 0; t < runs[document].Length; t++, place++)
+                    (xIndex[place], documents[place], real[place]) = (runs[document].Start + t, document, 1);
+
+            for (; place < (b + 1) * blockSize; place++)
+                (xIndex[place], documents[place], real[place]) = (runs[0].Start, runs.Count, 0);
+        }
+
+        var xAt = tensor(xIndex, device: _device);
+        var yAt = xAt + tensor(real, device: _device).to(ScalarType.Int64);   // le token suivant ; remplissage : lui-même
+        var realMask = tensor(real, device: _device).view(count, blockSize);
+        var mask = _mask is null
+            ? realMask
+            : _mask.index_select(0, yAt).view(count, blockSize).to(ScalarType.Float32) * realMask;
+        return new Batch(
+            _ids.index_select(0, xAt).view(count, blockSize).to(ScalarType.Int64),
+            _ids.index_select(0, yAt).view(count, blockSize).to(ScalarType.Int64),
+            mask,
+            tensor(documents, device: _device).view(count, blockSize));
+    }
+
+    private static Batch To(Batch batch, Device device) =>
+        new(batch.X.to(device), batch.Y.to(device), batch.Mask.to(device), batch.Documents?.to(device));
 
     /// <summary>
     /// Les extraits qui commencent à starts, découpés sur le device : index[b, t] = début[b] + t, pour t de 0 à
     /// BlockSize, et les tokens sont lus d'un coup à ces index.
     /// </summary>
-    private (Tensor X, Tensor Y, Tensor Mask) Gather(long[] starts, int blockSize)
+    private Batch Gather(long[] starts, int blockSize)
     {
         int count = starts.Length;
 
@@ -209,7 +375,7 @@ public sealed class TextDataset : IDisposable
         var mask = _mask is null
             ? ones(count, blockSize, ScalarType.Float32, _device)
             : _mask.index_select(0, index.narrow(1, 1, blockSize).reshape(-1)).view(count, blockSize).to(ScalarType.Float32);
-        return (x, y, mask);
+        return new Batch(x, y, mask);
     }
 
     public void Dispose()
@@ -222,9 +388,10 @@ public sealed class TextDataset : IDisposable
     private void DisposeFixedValidation()
     {
         if (_fixedValidation is not { } cached) return;
-        cached.X.Dispose();
-        cached.Y.Dispose();
-        cached.Mask.Dispose();
+        cached.Batch.X.Dispose();
+        cached.Batch.Y.Dispose();
+        cached.Batch.Mask.Dispose();
+        cached.Batch.Documents?.Dispose();
         _fixedValidation = null;
     }
 

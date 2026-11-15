@@ -96,20 +96,28 @@ public sealed class MiniGpt : Module<Tensor, Tensor>
     /// Avec cache : seulement les nouveaux tokens (le prompt la première fois, puis un token à la fois),
     /// qui suivent les cache.Length tokens déjà vus. Sans cache : toute la séquence.
     /// </param>
-    public Tensor Forward(Tensor ids, KvCache? cache)
+    /// <param name="documents">
+    /// Entraînement sur des conversations mises bout à bout dans un extrait (fine-tuning) : le numéro de conversation
+    /// de chaque token, forme (batch, temps). Chacune ne voit qu'elle-même et ses positions repartent de 0
+    /// (voir DocumentMask) : même résultat que si elle était seule. null : un seul texte par extrait.
+    /// </param>
+    public Tensor Forward(Tensor ids, KvCache? cache, Tensor? documents = null)
     {
         long time = ids.shape[1];
         long start = cache?.Length ?? 0;
         if (start + time > Config.BlockSize)
             throw new ArgumentException($"Séquence trop longue ({start + time} > {Config.BlockSize}).");
+        if (documents is not null && cache is not null)
+            throw new ArgumentException("Les documents servent à l'entraînement, pas avec le cache KV.");
 
+        var mask = documents is null ? null : DocumentMask.From(documents);
         var x = _tokenEmbedding.forward(ids);
         if (_positionEmbedding is not null)
-            x = x + _positionEmbedding.forward(arange(start, start + time, 1, ScalarType.Int64, ids.device));
+            x = x + _positionEmbedding.forward(mask?.Positions ?? arange(start, start + time, 1, ScalarType.Int64, ids.device));
         x = DropoutRate.Apply(x, training);
 
         for (int layer = 0; layer < _blocks.Count; layer++)
-            x = _blocks[layer].Forward(x, cache, layer);
+            x = _blocks[layer].Forward(x, cache, layer, mask);
         cache?.Advance(time);
 
         // Weight tying : scores = x · Embeddingᵀ, forme (batch, temps, VocabSize).

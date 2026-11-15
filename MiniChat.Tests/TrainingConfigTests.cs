@@ -119,7 +119,7 @@ public sealed class EpochStepsTests
         var fineTune = TrainingConfig.FineTuning;
         Assert.Equal(3, fineTune.GeneralExtracts);
         Assert.Equal(13 * 4 * BlockSize, fineTune.MainTokensPerStep(BlockSize));
-        Assert.Equal(250, fineTune.ForData(100 * 13 * 4 * BlockSize, BlockSize).Steps);   // 2,5 passages
+        Assert.Equal(150, fineTune.ForData(100 * 13 * 4 * BlockSize, BlockSize).Steps);   // 1,5 passage
     }
 
     [Fact]

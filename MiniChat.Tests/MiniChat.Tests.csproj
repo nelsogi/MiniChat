@@ -22,6 +22,11 @@
     <ProjectReference Include="..\MiniChat.csproj" />
   </ItemGroup>
 
+  <ItemGroup>
+    <!-- Les questions de /eval : les tests vérifient le fichier livré. -->
+    <None Include="..\Data\eval.json" Link="eval.json" CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+
   <!-- MiniChat copie Data\ à côté de son exécutable : les tests n'en ont pas besoin (texte.txt fait des Go). -->
   <Target Name="SkipMiniChatData" AfterTargets="GetCopyToOutputDirectoryItems">
     <ItemGroup>

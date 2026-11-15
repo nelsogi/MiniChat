@@ -42,14 +42,16 @@ public sealed class TrainingPhase
         Messages.Info($"{dataset.TrainLength + dataset.ValidationLength:N0} tokens, {config.Steps - config.FirstStep} étapes.");
         return TrainingProgressView.Run(config.FirstStep, config.Steps, progress =>
             new Trainer(model, dataset, config, _device, run.Checkpoint, progress, generalText, phase, run.Log.LossCsvPath,
-                showSample: step => progress.Log(QuestionTest.Sample(generator, sampleQuestion, step)))
+                showSample: step => progress.Log(QuestionTest.Sample(generator, sampleQuestion, step)), tokenizer: tokenizer)
                 .Train(resume, optimizerPath, run.Cancellation));
     }
 
     // Le dernier pas de la phase : celui de l'entraînement repris (même fin prévue, donc même cosinus), sinon
     // calculé depuis Epochs et la taille des données d'entraînement. Une continuation garde le sien (Epochs null).
     public static TrainingConfig Planned(TrainingConfig config, TextDataset dataset, MiniGpt model, CheckpointState? resume) =>
-        resume?.Steps is { } steps ? config with { Steps = steps } : config.ForData(dataset.TrainLength, model.Config.BlockSize);
+        resume?.Steps is { } steps
+            ? config with { Steps = steps }
+            : config.ForData(dataset.TrainLength, model.Config.BlockSize, dataset.ExtractFill(model.Config.BlockSize));
 
     // Sauvegarde le modèle avec l'état d'AdamW et l'avancement (pas atteint, loss, date du CSV).
     // Une continuation ne remplace l'ancien modèle que si sa loss de vérification est meilleure. Les deux loss sont
@@ -72,7 +74,8 @@ public sealed class TrainingPhase
 
         // ponytail: l'état d'AdamW est celui du dernier pas, les poids ceux du meilleur pas ;
         // assez proches pour repartir, pas la peine de sauvegarder l'optimiseur à chaque meilleur pas.
-        store.Save(model, tokenizer, result.OptimizerStatePath, new TrainingInfo(result.LastStep, result.BestValLoss, runId));
+        store.Save(model, tokenizer, result.OptimizerStatePath,
+            new TrainingInfo(result.LastStep, result.BestValLoss, runId, result.BestValLossPerChar));
         Messages.Success(continuation is null
             ? $"Modèle sauvegardé dans '{name}'."
             : $"Meilleure : modèle remplacé dans '{name}'.");

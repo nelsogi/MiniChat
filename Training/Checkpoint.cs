@@ -22,8 +22,11 @@ public sealed record CheckpointState(string Phase, int Step, string RunId, float
 /// </summary>
 public sealed record ContinueState(string Phase, int FirstStep, int Steps, double LearningRate);
 
-/// <summary>La meilleure loss de vérification de la phase en cours, et à quel pas (va avec best.dat).</summary>
-public sealed record BestScore(float ValLoss, int Step);
+/// <summary>
+/// La meilleure loss de vérification de la phase en cours, et à quel pas (va avec best.dat).
+/// ValLossPerChar : la même par caractère (null sans tokenizer, ou dans un checkpoint d'avant).
+/// </summary>
+public sealed record BestScore(float ValLoss, int Step, float? ValLossPerChar = null);
 
 /// <summary>
 /// Sauvegarde régulière d'un entraînement en cours, pour pouvoir le reprendre (--resume)

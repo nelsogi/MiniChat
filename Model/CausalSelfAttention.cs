@@ -61,7 +61,11 @@ namespace MiniChat.Model
         /// null : x est toute la séquence (entraînement).
         /// </param>
         /// <param name="layer">Numéro de la couche : sa place dans le cache.</param>
-        public Tensor Forward(Tensor x, KvCache? cache, int layer)
+        /// <param name="documents">
+        /// Plusieurs conversations dans chaque extrait (fine-tuning, sans cache) : chacune ne voit qu'elle-même et
+        /// ses positions repartent de 0 (voir DocumentMask). null : un seul texte, masque causal simple.
+        /// </param>
+        public Tensor Forward(Tensor x, KvCache? cache, int layer, DocumentMask? documents = null)
         {
             long batch = x.shape[0], time = x.shape[1], channels = x.shape[2];
             long start = cache?.Length ?? 0;   // position du premier token de x
@@ -74,15 +78,16 @@ namespace MiniChat.Model
 
             if (_rope is not null)
             {
-                q = _rope.Apply(q, start);
-                k = _rope.Apply(k, start);
+                q = documents is null ? _rope.Apply(q, start) : _rope.Apply(q, documents.Positions);
+                k = documents is null ? _rope.Apply(k, start) : _rope.Apply(k, documents.Positions);
             }
 
             // Avec le cache : K et V de tous les tokens jusqu'ici, les anciens viennent du cache.
             // Le masque causal de scaled_dot_product_attention suppose que Q et K commencent au même token :
             // vrai sans cache ou cache vide. Sinon le nouveau token i voit les start + i + 1 premières positions.
-            Tensor? mask = null;
-            bool causal = true;
+            // Avec des documents : leur masque (causal ET même conversation) remplace le masque causal.
+            Tensor? mask = documents?.Attention;
+            bool causal = documents is null;
             if (cache is not null)
             {
                 (k, v) = cache.Append(layer, k, v);

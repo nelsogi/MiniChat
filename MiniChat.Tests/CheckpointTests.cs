@@ -45,7 +45,7 @@ public sealed class CheckpointTests
 
             // ... et le pas suivant, sur le même batch, mène aux mêmes poids (moyennes d'AdamW comprises).
             // Sans dropout : ses masques sont tirés au hasard, ils seraient différents pour les deux modèles.
-            var (x, y, _) = dataset.FixedValidation(4, model.Config.BlockSize);
+            var (x, y, _, _) = dataset.FixedValidation(4, model.Config.BlockSize);
             model.DropoutRate.Value = loaded.DropoutRate.Value = 0;
             Step(model, optimizer, x, y);
             Step(loaded, loadedOptimizer, x, y);
@@ -118,7 +118,7 @@ public sealed class CheckpointTests
     private static void Step(MiniGpt model, optim.Optimizer optimizer, TextDataset dataset)
     {
         using var scope = NewDisposeScope();
-        var (x, y, _) = dataset.GetBatch(validation: false, 4, model.Config.BlockSize, CPU);
+        var (x, y, _, _) = dataset.GetBatch(validation: false, 4, model.Config.BlockSize, CPU);
         Step(model, optimizer, x, y);
     }
 

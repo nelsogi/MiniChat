@@ -37,9 +37,27 @@ public sealed class Rope
     {
         var (_, cosTable, sinTable) = Table(x.device);
         long time = x.shape[2];
-        var cos = cosTable.narrow(0, start, time).to(x.dtype);
-        var sin = sinTable.narrow(0, start, time).to(x.dtype);
+        return Rotate(x, cosTable.narrow(0, start, time).to(x.dtype), sinTable.narrow(0, start, time).to(x.dtype));
+    }
 
+    /// <param name="x">Q ou K, forme (batch, têtes, temps, headDim).</param>
+    /// <param name="positions">
+    /// Position de chaque token, forme (batch, temps) : plusieurs conversations dans un extrait, chacune repart de 0
+    /// (voir DocumentMask).
+    /// </param>
+    public Tensor Apply(Tensor x, Tensor positions)
+    {
+        var (_, cosTable, sinTable) = Table(x.device);
+        long batch = positions.shape[0], time = positions.shape[1];
+        var flat = positions.reshape(-1);
+
+        // (batch, 1, temps, headDim) : les mêmes angles pour toutes les têtes.
+        Tensor Angles(Tensor table) => table.index_select(0, flat).view(batch, 1, time, _headDim).to(x.dtype);
+        return Rotate(x, Angles(cosTable), Angles(sinTable));
+    }
+
+    private static Tensor Rotate(Tensor x, Tensor cos, Tensor sin)
+    {
         // Paire (a, b) = (x[i], x[i + headDim/2]) tournée de l'angle θ : (a cos θ - b sin θ, b cos θ + a sin θ).
         var halves = x.chunk(2, -1);
         var rotated = cat(new[] { -halves[1], halves[0] }, -1);

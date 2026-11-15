@@ -1,7 +1,9 @@
+using System.Text;
 using MiniChat.Config;
 using MiniChat.Evaluation;
 using MiniChat.Generation;
 using MiniChat.Model;
+using MiniChat.Storage;
 using MiniChat.Tokenization;
 using MiniChat.Training;
 using MiniChat.UI;
@@ -39,6 +41,7 @@ public sealed class Workbench
     private readonly PretrainPhase _pretrain;
     private readonly FinetunePhase _finetune;
     private readonly ContinuePhase _continue;
+    private readonly EvalHistory _evalHistory;
 
     // L'arrêt demandé pour l'entraînement en cours (voir Training), vide le reste du temps.
     private CancellationToken _cancellation;
@@ -56,6 +59,7 @@ public sealed class Workbench
         _data = new DatasetFactory(dataFolder, Path.Combine(modelsFolder, "cache"), device);
         _models = new ModelCatalog(modelsFolder);
         _export = new ExportService(_models, Path.Combine(modelsFolder, "exports"));
+        _evalHistory = new EvalHistory(_resultsFolder);
 
         var phase = new TrainingPhase(device);
         _pretrain = new PretrainPhase(_data, phase);
@@ -152,7 +156,7 @@ public sealed class Workbench
 
     /// <summary>
     /// Refait seulement la phase 2, en repartant du modèle pré-entraîné (pas du modèle final).
-    /// epochs : passages sur les dialogues (--epochs), null = TrainingConfig.FineTuning.Epochs (2,5).
+    /// epochs : passages sur les dialogues (--epochs), null = TrainingConfig.FineTuning.Epochs (1,5).
     /// </summary>
     public void FineTuneOnly(double? epochs = null, CancellationToken cancellation = default) => Training(cancellation, () =>
     {
@@ -304,13 +308,15 @@ public sealed class Workbench
 
     /// <summary>
     /// Les questions de test posées à deux modèles sauvegardés, dans les conditions de /test (température
-    /// et graine fixes) : seule la différence entre les modèles compte. cancellation : s'arrête avant la question suivante.
+    /// et graine fixes) : seule la différence entre les modèles compte. Puis l'évaluation notée (/eval) de chacun,
+    /// gardée dans leur historique. cancellation : s'arrête avant la question suivante (sans évaluation).
     /// </summary>
-    public IReadOnlyList<(string Question, string First, string Second)> Compare(string first, string second,
-        CancellationToken cancellation = default)
+    public CompareResult Compare(string first, string second, CancellationToken cancellation = default)
     {
         var (firstStore, secondStore) = (_models.Require(first), _models.Require(second));
+        (first, second) = (_models.NameOf(first), _models.NameOf(second));
         var questions = QuestionTest.ReadQuestions(_data.QuestionsPath);
+        var evalQuestions = EvalTest.ReadQuestions(_data.EvalPath);
         var answers = new List<(string, string, string)>();
 
         var (modelA, tokenizerA) = Messages.Spin($"Chargement de '{first}'...", () => firstStore.Load(Device));
@@ -326,6 +332,12 @@ public sealed class Workbench
                     answers.Add(Messages.Spin($"Question {i + 1}/{questions.Length}... (Échap pour arrêter)",
                         () => (question, QuestionTest.Answer(a, question), QuestionTest.Answer(b, question))));
                 }
+
+                if (cancellation.IsCancellationRequested)
+                    return new CompareResult(answers, null, null);
+                var evalA = Evaluate(first, firstStore, a, evalQuestions, cancellation);
+                var evalB = Evaluate(second, secondStore, b, evalQuestions, cancellation);
+                return new CompareResult(answers, evalA, evalB);
             }
             finally
             {
@@ -336,8 +348,32 @@ public sealed class Workbench
         {
             modelA.Dispose();
         }
-        return answers;
     }
+
+    /// <summary>
+    /// L'évaluation notée (data/eval.json, voir EvalTest) du modèle chargé, ou d'un modèle sauvegardé (name).
+    /// Détail dans results/&lt;date&gt;-eval-&lt;nom&gt;.txt ; le score s'ajoute à l'historique du modèle (si elle est complète).
+    /// cancellation : s'arrête avant la question suivante.
+    /// </summary>
+    public EvalRun Eval(string? name, CancellationToken cancellation = default)
+    {
+        var questions = EvalTest.ReadQuestions(_data.EvalPath);
+        if (name is null || (ModelSource is { } loaded && name.Equals(loaded, StringComparison.OrdinalIgnoreCase)))
+        {
+            if (Generator is not { } generator || ModelSource is not { } source)
+                throw new UserException("Aucun modèle chargé : lance /train, ou /eval <nom> (/models pour la liste).");
+            return Evaluate(source, _models.TryStore(source), generator, questions, cancellation);
+        }
+
+        var store = _models.Require(name);
+        name = _models.NameOf(name);
+        var (model, tokenizer) = Messages.Spin($"Chargement de '{name}'...", () => store.Load(Device));
+        using (model)
+            return Evaluate(name, store, new TextGenerator(model, tokenizer, Device), questions, cancellation);
+    }
+
+    /// <summary>L'historique des évaluations d'un modèle (voir EvalHistory), de la plus ancienne à la plus récente.</summary>
+    public IReadOnlyList<EvalRecord> EvalHistoryOf(string name) => _evalHistory.Read(_models.NameOf(name));
 
     /// <summary>
     /// Exporte un modèle sauvegardé (model, model-pretrain, ou un nom de /save) en exports/&lt;nom&gt;.nelmodel,
@@ -449,6 +485,27 @@ public sealed class Workbench
         Messages.Success("Entraînement terminé.");
     }
 
+    // Pose les questions de eval.json à generator, écrit le détail dans results/, et garde le score dans l'historique
+    // du modèle name (avec l'entraînement qui a produit ses poids : store.ReadInfo()).
+    private EvalRun Evaluate(string name, ModelStore? store, TextGenerator generator, IReadOnlyList<EvalQuestion> questions,
+        CancellationToken cancellation)
+    {
+        var history = _evalHistory.Read(name);
+        var result = Messages.Spin($"Évaluation de '{name}'...", setStatus => EvalTest.Run(generator, questions,
+            i => setStatus($"Évaluation de '{name}' : question {i + 1}/{questions.Count}... (Échap pour arrêter)"), cancellation));
+
+        var info = store is { Exists: true } ? store.ReadInfo() : null;
+        string path = Path.Combine(_resultsFolder, $"{Now()}-eval-{name}.txt");
+        Directory.CreateDirectory(_resultsFolder);
+        File.WriteAllText(path, EvalTest.Report(result, $"Modèle '{name}'" + (info is null ? "" :
+            $" | entraînement du {info.RunId}, pas {info.Step}, loss de vérification {info.ValLoss:F3}")), new UTF8Encoding(false));
+
+        if (result.Complete)
+            _evalHistory.Add(new EvalRecord(DateTime.Now, name, info?.RunId, info?.Step, info?.ValLoss, result.Correct,
+                result.Total, result.Scores));
+        return new EvalRun(name, result, history, path);
+    }
+
     private static void ShowReport(string report, string path)
     {
         AnsiConsole.WriteLine();
@@ -486,3 +543,20 @@ public sealed class Workbench
 /// </summary>
 public sealed record TrainingPlan(string Size, ModelConfig Config, long Parameters, TrainingConfig Pretraining,
     int PretrainSteps, TimeSpan PretrainDuration, int FineTuneSteps, TimeSpan FineTuneDuration);
+
+/// <summary>
+/// Une évaluation (/eval) d'un modèle : son résultat, les évaluations d'avant dans son historique (sans celle-ci),
+/// et le fichier du détail (chaque question, la réponse, juste ou non).
+/// </summary>
+public sealed record EvalRun(string Model, EvalResult Result, IReadOnlyList<EvalRecord> History, string ReportPath)
+{
+    /// <summary>L'évaluation d'avant, null si c'est la première.</summary>
+    public EvalRecord? Previous => History.Count > 0 ? History[^1] : null;
+}
+
+/// <summary>
+/// /compare : les questions de test (question, réponse du premier, réponse du second), puis l'évaluation de chacun
+/// (null si /compare a été arrêté avant).
+/// </summary>
+public sealed record CompareResult(IReadOnlyList<(string Question, string First, string Second)> Answers,
+    EvalRun? FirstEval, EvalRun? SecondEval);

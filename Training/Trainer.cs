@@ -3,6 +3,7 @@ using System.Globalization;
 using MiniChat.Config;
 using MiniChat.Data;
 using MiniChat.Model;
+using MiniChat.Tokenization;
 using TorchSharp;
 using static TorchSharp.torch;
 using static TorchSharp.torch.nn;
@@ -14,8 +15,9 @@ namespace MiniChat.Training;
 /// BestValLoss/BestStep = les poids gardés, LastStep = pas atteint (arrêt anticipé ou fin).
 /// OptimizerStatePath = état d'AdamW à la fin, à sauvegarder avec le modèle pour pouvoir continuer (--continue).
 /// </summary>
+/// BestValLossPerChar = loss de vérification des poids gardés par caractère de texte (voir Trainer), null sans tokenizer.
 public sealed record TrainingResult(float StartValLoss, float BestValLoss, int BestStep, int LastStep,
-    string OptimizerStatePath)
+    string OptimizerStatePath, float? BestValLossPerChar = null)
 {
     /// <summary>Les poids gardés sont meilleurs que ceux du départ (sinon ce sont les mêmes).</summary>
     public bool Improved => BestValLoss < StartValLoss;
@@ -40,7 +42,9 @@ public sealed record TrainingResult(float StartValLoss, float BestValLoss, int B
 ///   - on peut mélanger un peu de texte général dans chaque batch (voir GeneralTextRatio),
 ///   - dropout et betas d'AdamW propres à la phase (voir TrainingConfig.Dropout, Beta1, Beta2),
 ///   - weight decay sur les matrices, et gradient clipping (voir WeightDecay, GradClip),
-///   - accumulation de gradients : plusieurs petits batchs par étape (voir EffectiveBatchSize).
+///   - accumulation de gradients : plusieurs petits batchs par étape (voir EffectiveBatchSize),
+///   - dialogues : plusieurs conversations par extrait, qui ne se voient pas entre elles (voir TextDataset),
+///   - loss de vérification aussi par caractère (avec le tokenizer) : comparable entre deux tokenizers.
 /// </summary>
 public sealed class Trainer
 {
@@ -58,6 +62,10 @@ public sealed class Trainer
     // Meilleure loss de vérification vue (les poids correspondants sont dans le checkpoint).
     private float _bestValLoss = float.MaxValue;
     private int _bestStep;
+    private float? _bestValLossPerChar;
+
+    // Caractères de texte de chaque token du vocabulaire (0 pour les tokens spéciaux), sur le device ; null sans tokenizer.
+    private readonly Tensor? _tokenCharacters;
 
     // Loss de vérification au premier pas de la phase (FirstStep) : celle du modèle de départ.
     private float? _startValLoss;
@@ -82,10 +90,16 @@ public sealed class Trainer
     /// <param name="showSample">Affiche une réponse d'exemple, appelé tous les config.SampleInterval pas.</param>
     /// <param name="checkpoint">Où sauvegarder l'avancement et les meilleurs poids.</param>
     /// <param name="progress">Où montrer l'avancement, les loss et les messages.</param>
+    /// <param name="tokenizer">
+    /// Pour la loss de vérification par caractère (colonne loss_verification_par_caractere du CSV). null : pas mesurée.
+    /// </param>
     public Trainer(MiniGpt model, TextDataset dataset, TrainingConfig config, Device device, Checkpoint checkpoint,
         ITrainingProgress progress, TextDataset? generalText = null, string phase = "", string? lossCsvPath = null,
-        Action<int>? showSample = null)
+        Action<int>? showSample = null, BpeTokenizer? tokenizer = null)
     {
+        if (tokenizer is not null)
+            using (NewDisposeScope())
+                _tokenCharacters = TokenCharacters(tokenizer, device).DetachFromDisposeScope();
         _checkpoint = checkpoint;
         _progress = progress;
         _model = model;
@@ -129,7 +143,7 @@ public sealed class Trainer
             _startStep = resume.Step;
             _startValLoss = resume.StartValLoss;
             if (_checkpoint.ReadBest() is { } best)
-                (_bestValLoss, _bestStep) = (best.ValLoss, best.Step);
+                (_bestValLoss, _bestStep, _bestValLossPerChar) = (best.ValLoss, best.Step, best.ValLossPerChar);
             _progress.Log($"Reprise au pas {_startStep} (meilleure loss de vérification : {_bestValLoss:F3}, au pas {_bestStep}).");
         }
         else if (optimizerPath is not null)
@@ -209,8 +223,7 @@ public sealed class Trainer
             {
                 // Scope par petit batch : ses activations sont libérées avant le suivant.
                 using var microScope = NewDisposeScope();
-                var (x, y, mask) = GetTrainingBatch();
-                (ComputeLoss(x, y, mask) / _accumulation).backward();
+                (ComputeLoss(GetTrainingBatch()) / _accumulation).backward();
             }
 
             nn.utils.clip_grad_norm_(_model.parameters(), _config.GradClip);
@@ -228,7 +241,21 @@ public sealed class Trainer
         if (_peakGpuMb > 0)
             _progress.Log($"Mémoire GPU utilisée au maximum : {_peakGpuMb:N0} Mo.");
 
-        return new TrainingResult(_startValLoss ?? _bestValLoss, _bestValLoss, _bestStep, lastStep, optimizerState);
+        return new TrainingResult(_startValLoss ?? _bestValLoss, _bestValLoss, _bestStep, lastStep, optimizerState,
+            _bestValLossPerChar);
+    }
+
+    /// <summary>
+    /// Le nombre de caractères de texte de chaque token (son texte décodé), forme (VocabSize). Les tokens spéciaux
+    /// (&lt;|doc|&gt;, &lt;|end|&gt;...) comptent 0 : ils ne sont pas du texte, mais leur loss compte quand même
+    /// (savoir s'arrêter fait partie de la réponse). Loss par caractère = somme des loss / caractères notés.
+    /// </summary>
+    internal static Tensor TokenCharacters(BpeTokenizer tokenizer, Device device)
+    {
+        var special = tokenizer.SpecialIds.ToHashSet();
+        var characters = Enumerable.Range(0, tokenizer.VocabSize)
+            .Select(id => special.Contains(id) ? 0f : tokenizer.Decode(id).Length).ToArray();
+        return tensor(characters, device: device);
     }
 
     /// <summary>
@@ -305,16 +332,19 @@ public sealed class Trainer
 
     /// <summary>
     /// Passages faits sur le texte principal au pas step, comptés depuis le pas 0 (une continuation garde ceux d'avant) :
-    /// tokens lus / tokens d'entraînement. 1 = chaque token vu une fois en moyenne.
+    /// tokens lus / tokens d'entraînement. 1 = chaque token vu une fois en moyenne. Dialogues : sans le remplissage
+    /// des extraits (voir TextDataset.ExtractFill).
     /// </summary>
     private double EpochsAt(int step) =>
-        (double)step * _config.MainTokensPerStep(_model.Config.BlockSize) / Math.Max(1, _dataset.TrainLength);
+        (double)step * _config.MainTokensPerStep(_model.Config.BlockSize) * _dataset.ExtractFill(_model.Config.BlockSize)
+        / Math.Max(1, _dataset.TrainLength);
 
     /// <summary>
     /// Un (petit) batch d'entraînement. Exemple avec BatchSize 16 et GeneralTextRatio 0.2 :
     /// 13 extraits du texte principal + 3 extraits du texte général, empilés ensemble.
+    /// Dialogues : les extraits de texte général sont chacun une seule conversation (numéro 0 partout).
     /// </summary>
-    private (Tensor X, Tensor Y, Tensor Mask) GetTrainingBatch()
+    private Batch GetTrainingBatch()
     {
         int blockSize = _model.Config.BlockSize;
         int general = _generalText is null ? 0 : _config.GeneralExtracts;
@@ -324,44 +354,54 @@ public sealed class Trainer
             return main;
 
         var extra = _generalText!.GetBatch(validation: false, general, blockSize, _device);
-        return (cat(new[] { main.X, extra.X }, 0), cat(new[] { main.Y, extra.Y }, 0), cat(new[] { main.Mask, extra.Mask }, 0));
+        Tensor? documents = main.Documents is null && extra.Documents is null ? null : cat(new[]
+        {
+            main.Documents ?? zeros_like(main.X),
+            extra.Documents ?? zeros_like(extra.X),
+        }, 0);
+        return new Batch(cat(new[] { main.X, extra.X }, 0), cat(new[] { main.Y, extra.Y }, 0),
+            cat(new[] { main.Mask, extra.Mask }, 0), documents);
     }
 
     /// <summary>
     /// Cross-entropy moyenne, mais seulement sur les tokens dont le masque vaut 1.
     /// Masque partout à 1 = la cross-entropy classique.
     /// </summary>
-    private Tensor ComputeLoss(Tensor x, Tensor y, Tensor mask)
+    private Tensor ComputeLoss(Batch batch)
     {
-        var (sum, weight) = LossSum(x, y, mask);
+        var (sum, weight, _) = LossSum(batch);
 
         // clamp : un extrait peut tomber entièrement dans des questions (aucun token noté).
         return sum / weight.clamp_min(1);
     }
 
-    /// <summary>Somme des erreurs des tokens notés, et nombre de tokens notés (somme du masque).</summary>
-    private (Tensor Sum, Tensor Weight) LossSum(Tensor x, Tensor y, Tensor mask)
+    /// <summary>
+    /// Somme des erreurs des tokens notés, nombre de tokens notés (somme du masque), et nombre de caractères
+    /// de texte de ces tokens (null sans tokenizer, voir TokenCharacters).
+    /// </summary>
+    private (Tensor Sum, Tensor Weight, Tensor? Characters) LossSum(Batch batch)
     {
-        var logits = _model.forward(x);                       // (batch, temps, vocab)
+        var logits = _model.Forward(batch.X, cache: null, batch.Documents);   // (batch, temps, vocab)
         int vocab = _model.Config.VocabSize;
 
         // Une erreur par token (pas encore de moyenne), puis on éteint ceux qui ne comptent pas.
-        var perToken = functional.cross_entropy(logits.view(-1, vocab), y.view(-1), reduction: Reduction.None);
-        var weights = mask.view(-1);
-        return ((perToken * weights).sum(), weights.sum());
+        var perToken = functional.cross_entropy(logits.view(-1, vocab), batch.Y.view(-1), reduction: Reduction.None);
+        var weights = batch.Mask.view(-1);
+        var characters = _tokenCharacters is null ? null : (_tokenCharacters.index_select(0, batch.Y.view(-1)) * weights).sum();
+        return ((perToken * weights).sum(), weights.sum(), characters);
     }
 
     private void Report(int step, TimeSpan elapsed)
     {
         float train = TrainLossEstimate();
-        float val = ValidationLoss();
+        var (val, valPerChar) = ValidationLoss();
         _startValLoss ??= val;
 
         bool best = val < _bestValLoss;
         if (best)
         {
-            (_bestValLoss, _bestStep) = (val, step);
-            _checkpoint.SaveBest(_model, new BestScore(val, step));
+            (_bestValLoss, _bestStep, _bestValLossPerChar) = (val, step, valPerChar);
+            _checkpoint.SaveBest(_model, new BestScore(val, step, valPerChar));
         }
 
         var gpu = GpuMemoryNow();
@@ -369,7 +409,7 @@ public sealed class Trainer
         _progress.Report(new TrainingReport(step, _config.Steps, train, val, LearningRateAt(step), elapsed,
             Remaining(step, elapsed), best, gpu, epochs));
 
-        WriteCsvLine(step, train, val, elapsed, TokensPerSecond(step, elapsed), gpu?.UsedMb, epochs);
+        WriteCsvLine(step, train, val, elapsed, TokensPerSecond(step, elapsed), gpu?.UsedMb, epochs, valPerChar);
         _previousReport = (step, elapsed);
     }
 
@@ -400,21 +440,21 @@ public sealed class Trainer
     /// Ajoute une ligne au CSV des loss (s'ouvre dans Excel, ou se trace en courbe).
     /// Nombres avec un point (format international), sinon la virgule française casserait les colonnes.
     /// tokens_par_seconde et memoire_gpu_mo (toute la carte, voir GpuMemory) : vides s'ils ne sont pas connus.
+    /// loss_verification_par_caractere : la loss de vérification par caractère de texte (vide sans tokenizer).
     /// </summary>
     private void WriteCsvLine(int step, float train, float val, TimeSpan elapsed, double? tokensPerSecond, long? gpuMb,
-        double epochs)
+        double epochs, float? valPerChar)
     {
         if (_lossCsvPath is null) return;
 
         if (!File.Exists(_lossCsvPath))
         {
             Directory.CreateDirectory(Path.GetDirectoryName(_lossCsvPath)!);
-            File.WriteAllText(_lossCsvPath,
-                "phase,etape,loss_entrainement,loss_verification,learning_rate,secondes,tokens_par_seconde,memoire_gpu_mo,passages\n");
+            File.WriteAllText(_lossCsvPath, LossCsv.Header + "\n");
         }
 
         File.AppendAllText(_lossCsvPath, string.Create(CultureInfo.InvariantCulture,
-            $"{_phase},{step},{train:F4},{val:F4},{LearningRateAt(step):G4},{elapsed.TotalSeconds:F0},{tokensPerSecond:F0},{gpuMb},{epochs:F3}\n"));
+            $"{_phase},{step},{train:F4},{val:F4},{LearningRateAt(step):G4},{elapsed.TotalSeconds:F0},{tokensPerSecond:F0},{gpuMb},{epochs:F3},{valPerChar:F4}\n"));
     }
 
     /// <summary>
@@ -432,8 +472,8 @@ public sealed class Trainer
             // Un scope par batch : TorchSharp ne libère un tenseur qu'à la fin de son scope. Avec un seul
             // scope pour toute la boucle, les activations des EvalBatches passes s'empilaient sur le GPU.
             using var scope = NewDisposeScope();
-            var (x, y, mask) = _dataset.GetBatch(validation: false, _config.BatchSize, _model.Config.BlockSize, _device);
-            total += ComputeLoss(x, y, mask).item<float>();
+            total += ComputeLoss(_dataset.GetBatch(validation: false, _config.BatchSize, _model.Config.BlockSize, _device))
+                .item<float>();
         }
 
         _model.train();
@@ -443,25 +483,29 @@ public sealed class Trainer
     /// <summary>
     /// Loss de vérification : sur les ValidationExtracts extraits fixes (toujours les mêmes), passés par paquets
     /// de BatchSize. Moyenne sur tous les tokens notés de l'ensemble, pas moyenne des moyennes des paquets.
+    /// PerChar : la même somme divisée par les caractères de texte notés au lieu des tokens (null sans tokenizer).
+    /// Elle ne dépend pas du découpage en tokens : deux modèles aux tokenizers différents se comparent avec elle.
     /// </summary>
-    private float ValidationLoss()
+    private (float Loss, float? PerChar) ValidationLoss()
     {
         _model.eval();
         using var noGrad = no_grad();
 
-        var (x, y, mask) = _dataset.FixedValidation(_config.ValidationExtracts, _model.Config.BlockSize);
-        double sum = 0, weight = 0;
+        var all = _dataset.FixedValidation(_config.ValidationExtracts, _model.Config.BlockSize);
+        double sum = 0, weight = 0, characters = 0;
         for (int start = 0; start < _config.ValidationExtracts; start += _config.BatchSize)
         {
             using var scope = NewDisposeScope();
             int count = Math.Min(_config.BatchSize, _config.ValidationExtracts - start);
-            var (batchSum, batchWeight) = LossSum(x.narrow(0, start, count), y.narrow(0, start, count), mask.narrow(0, start, count));
+            var (batchSum, batchWeight, batchCharacters) = LossSum(new Batch(all.X.narrow(0, start, count),
+                all.Y.narrow(0, start, count), all.Mask.narrow(0, start, count), all.Documents?.narrow(0, start, count)));
             sum += batchSum.item<float>();
             weight += batchWeight.item<float>();
+            characters += batchCharacters?.item<float>() ?? 0;
         }
 
         _model.train();
-        return (float)(sum / Math.Max(1, weight));
+        return ((float)(sum / Math.Max(1, weight)), _tokenCharacters is null ? null : (float)(sum / Math.Max(1, characters)));
     }
 
     /// <summary>Temps restant estimé : durée moyenne d'une étape depuis le lancement x étapes restantes.</summary>

@@ -79,8 +79,8 @@ public sealed class TextDatasetSplitTests
         Assert.Equal(a.ValidationLength, b.ValidationLength);
         Assert.Equal(text.Ids.Length, a.TrainLength + a.ValidationLength);
 
-        var (xa, ya, _) = a.FixedValidation(8, 16);
-        var (xb, yb, _) = b.FixedValidation(8, 16);
+        var (xa, ya, _, _) = a.FixedValidation(8, 16);
+        var (xb, yb, _, _) = b.FixedValidation(8, 16);
         Assert.True(xa.equal(xb).all().item<bool>());
         Assert.True(ya.equal(yb).all().item<bool>());
     }

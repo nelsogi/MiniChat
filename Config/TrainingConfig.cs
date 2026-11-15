@@ -48,13 +48,14 @@ public sealed record TrainingConfig
     /// (ModelConfig.Dropout) : les dialogues sont relus plusieurs fois, il faut éviter de les apprendre par cœur.
     ///
     /// dialogues.txt (OpenAssistant + French Alpaca + French Instruct, ~135 000 conversations) fait
-    /// ~10 millions de tokens d'entraînement ; chaque étape en lit 13 312 (13 extraits sur 16, le reste est du
-    /// texte général) : 2,5 passages = ~1 900 étapes, ~14 min. L'arrêt anticipé reste un garde-fou si les
-    /// dialogues sont petits (un fichier de 30 000 tokens était appris par cœur en 50 étapes).
+    /// ~10 millions de tokens d'entraînement ; chaque étape en lit 13 312 places (13 extraits sur 16, le reste est
+    /// du texte général), dont une partie de remplissage (conversations entières, voir TextDataset) : 1,5 passage.
+    /// L'arrêt anticipé reste un garde-fou si les dialogues sont petits (un fichier de 30 000 tokens était appris
+    /// par cœur en 50 étapes).
     /// </summary>
     public static TrainingConfig FineTuning => new()
     {
-        Epochs = 2.5,
+        Epochs = 1.5,
         LearningRate = 2e-4,
         MinLearningRate = 2e-5,
         WarmupSteps = 50,
@@ -73,6 +74,8 @@ public sealed record TrainingConfig
     /// medium et large : contexte de 512 tokens, donc des petits batchs deux fois plus courts pour la mémoire
     /// (8 x 8 et 4 x 16 = 64 extraits de 512 tokens, 32 768 tokens par étape), vitesse max plus basse
     /// (un plus gros modèle est moins stable : 6e-4, comme GPT-3 de cette taille) et warmup plus long.
+    /// large, mesuré avec --benchmark sur une RTX 3060 Ti (8 Go) : micro-batch 4 = 10 400 tokens/s (5,6 Go), 8 ne tient
+    /// pas dans la carte (elle déborde dans la mémoire du PC, des dizaines de fois plus lente). 4 reste le plus rapide.
     /// </summary>
     public static TrainingConfig PretrainingFor(ModelConfig model) => ModelConfig.SizeOf(model) switch
     {
@@ -234,9 +237,11 @@ public sealed record TrainingConfig
     /// <summary>
     /// Steps calculé depuis Epochs et la taille des données d'entraînement (trainTokens) :
     /// Epochs x trainTokens / tokens lus par étape, compté depuis FirstStep. Sans Epochs : inchangé.
+    /// fill : part des places d'un extrait qui sont du vrai texte (dialogues : le reste est du remplissage,
+    /// voir TextDataset.ExtractFill) ; une étape lit d'autant moins de tokens. 1 pour un texte suivi.
     /// </summary>
-    public TrainingConfig ForData(long trainTokens, int blockSize) => Epochs is { } epochs
-        ? this with { Steps = FirstStep + Math.Max(1, (int)Math.Ceiling(epochs * trainTokens / MainTokensPerStep(blockSize))) }
+    public TrainingConfig ForData(long trainTokens, int blockSize, double fill = 1) => Epochs is { } epochs
+        ? this with { Steps = FirstStep + Math.Max(1, (int)Math.Ceiling(epochs * trainTokens / (MainTokensPerStep(blockSize) * fill))) }
         : this;
 
     /// <summary>La phase avec epochs passages (--epochs), ou ses passages par défaut si null.</summary>

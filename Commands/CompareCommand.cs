@@ -9,11 +9,12 @@ namespace MiniChat.Commands;
 /// <summary>
 /// Les questions de test (questions-test.txt) posées à deux modèles, réponses côte à côte.
 /// Mêmes conditions pour les deux (température et graine fixes, comme /test) : les différences viennent des modèles.
+/// Puis l'évaluation notée de chacun (comme /eval), score par catégorie côte à côte.
 /// </summary>
 public sealed class CompareCommand : ICommand
 {
     public string Name => "compare";
-    public string Description => "Fait répondre deux modèles aux questions de test, côte à côte";
+    public string Description => "Fait répondre deux modèles aux questions de test, côte à côte, et compare leur score /eval";
     public string Usage => "/compare <nom1> <nom2>";
 
     public void Execute(CommandContext context, string[] args)
@@ -23,7 +24,8 @@ public sealed class CompareCommand : ICommand
                                     "(/models pour la liste)");
 
         var (first, second) = (args[0], args[1]);
-        var answers = context.Workbench.Compare(first, second, context.Cancellation);
+        var compared = context.Workbench.Compare(first, second, context.Cancellation);
+        var answers = compared.Answers;
 
         var models = context.Workbench.ListModels();
         var table = new Table()
@@ -47,15 +49,22 @@ public sealed class CompareCommand : ICommand
         AnsiConsole.Write(table);
         Messages.Dim($"Réglages des deux côtés : température {QuestionTest.Temperature}, top-k {ChatSession.DefaultTopK}, " +
                      $"top-p {ChatSession.DefaultTopP}, graine {QuestionTest.Seed}.");
+        if (compared is { FirstEval: { } evalA, SecondEval: { } evalB })
+            EvalView.ShowComparison(evalA, evalB);
+        Messages.Dim("Loss = loss de vérification notée à la sauvegarde, par token puis par caractère (/car) : celle par " +
+                     "caractère se compare même entre deux tokenizers différents (? = modèle sauvegardé avant elle).");
         if (context.Cancellation.IsCancellationRequested)
-            Messages.Warning($"Arrêté avant la fin (Échap) : {answers.Count} question(s) posée(s).");
+            Messages.Warning($"Arrêté avant la fin (Échap) : {answers.Count} question(s) posée(s), pas d'évaluation notée.");
     }
 
-    // "model-pretrain · 3,123" : le nom, et la loss de vérification notée à sa sauvegarde.
+    // "model-pretrain · loss 3,123 · 1,042/car" : le nom, et la loss de vérification notée à sa sauvegarde,
+    // par token et par caractère.
     private static string Header(string name, IReadOnlyList<SavedModel> models)
     {
         var model = models.FirstOrDefault(m => m.Name.Equals(name, StringComparison.OrdinalIgnoreCase));
-        string loss = model?.Info is { } info ? $" [{Theme.Dim}]· loss {info.ValLoss:F3}[/]" : "";
+        string loss = model?.Info is { } info
+            ? $" [{Theme.Dim}]· loss {info.ValLoss:F3} · {(info.ValLossPerChar is { } perChar ? perChar.ToString("F3") : "?")}/car[/]"
+            : "";
         return $"[{Theme.Accent}]{Markup.Escape(model?.Name ?? name)}[/]{loss}";
     }
 }

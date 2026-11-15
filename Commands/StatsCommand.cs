@@ -22,7 +22,27 @@ public sealed class StatsCommand : ICommand
 
         Messages.Dim($"Fichier : {path}");
         foreach (var (phase, points) in phases)
+        {
             LossChart.Show(PhaseTitle(phase), points);
+            ShowPerCharacter(points);
+        }
+    }
+
+    // La loss de vérification par caractère : au meilleur pas (celui des poids gardés) et à la dernière mesure.
+    // Elle ne dépend pas du tokenizer : deux entraînements aux vocabulaires différents se comparent avec elle.
+    private static void ShowPerCharacter(IReadOnlyList<LossPoint> points)
+    {
+        var measured = points.Where(p => p.ValLossPerChar is not null).ToList();
+        if (measured.Count == 0)
+        {
+            Messages.Dim("  Loss par caractère : pas mesurée (entraînement d'avant cette mesure).");
+            return;
+        }
+
+        var best = measured.MinBy(p => p.ValLoss)!;
+        var last = measured[^1];
+        Messages.Dim($"  Loss de vérification par caractère : {best.ValLossPerChar:F3} au meilleur pas ({best.Step:N0}), " +
+                     $"{last.ValLossPerChar:F3} à la dernière mesure ({last.Step:N0}).");
     }
 
     private static string PhaseTitle(string phase) => phase switch

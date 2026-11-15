@@ -17,16 +17,17 @@ Au lancement, un cadre d'accueil affiche le modèle chargé (taille), GPU ou CPU
 |---------------------------------------------|-----------------|
 | `/help`                                     | La liste des commandes |
 | `/train [--size small\|medium\|large] [--epochs 1,1]` | Nouveau modèle : pré-entraînement + fine-tuning (taille, voir plus bas ; longueur en passages sur `texte.txt`). Montre les paramètres et la durée estimée, puis demande confirmation |
-| `/finetune [--epochs 2,5]`                  | Refait seulement le fine-tuning, depuis `model-pretrain/` (passages sur les dialogues) |
+| `/finetune [--epochs 1,5]`                  | Refait seulement le fine-tuning, depuis `model-pretrain/` (passages sur les dialogues) |
 | `/continue <étapes> [finetune] [--lr 3e-4]` | Entraîne plus longtemps un modèle existant (voir plus bas) |
 | `/resume`                                   | Reprend un entraînement interrompu |
 | `/test`                                     | Questions de test sur le modèle chargé (réponses dans `results/<date>-test.txt`) |
+| `/eval [nom]`                               | Évaluation notée : les 100 questions de `data/eval.json`, score par catégorie, comparé à l'évaluation d'avant (voir plus bas) |
 | `/models`                                   | Les modèles sauvegardés : taille, loss de vérification, pas, dates |
 | `/save <nom>`                               | Garde le modèle chargé sous un nom (`saved/<nom>/`), avant un `/train` ou un `/continue` par exemple |
 | `/load <nom>`                               | Charge un modèle (`model`, `model-pretrain` ou un nom de `/save`) pour le chat |
 | `/export <nom> [description] [--from model-pretrain]` | Exporte un modèle (par défaut `model`) en `exports/<nom>.nelmodel`, pour `/import` dans Nel Code (format version 2, avec `model.safetensors` et `reference.json` : `NELMODEL-FORMAT.md`) |
-| `/compare <nom1> <nom2>`                    | Les questions de test posées aux deux modèles, réponses côte à côte |
-| `/stats`                                    | Courbes de loss (entraînement et vérification) du dernier entraînement, meilleur point marqué ★ |
+| `/compare <nom1> <nom2>`                    | Les questions de test posées aux deux modèles, réponses côte à côte, puis leur score `/eval` et leur loss par caractère |
+| `/stats`                                    | Courbes de loss (entraînement et vérification) du dernier entraînement, meilleur point marqué ★, et loss par caractère |
 | `/temp 0.8`, `/topk 20`, `/topp 0.9`        | Réglages de génération pour la conversation en cours (sans nombre : affiche la valeur) |
 | `/config [réglage valeur]`                  | Affiche ou modifie les réglages enregistrés dans `settings.json` |
 | `/save-chat [fichier]`                      | Sauvegarde la conversation en texte (par défaut `chats/<date>.txt`) |
@@ -130,10 +131,16 @@ calculé une fois les données découpées, et le cosinus du learning rate va to
    restent sur le GPU, 2 octets chacun (2,9 Go de texte -> ~920 M tokens -> ~1,9 Go de mémoire GPU).
    Le découpage en tokens (~1 min) n'est fait qu'une fois : il est gardé dans `bin/.../cache/` et relu
    en ~1 s tant que `texte.txt` et le tokenizer ne changent pas (même chose pour `dialogues.txt`).
-2. **Fine-tuning** sur `data/dialogues.txt` et `data/identite.txt` -> sauvegardé dans `model/`. 2,5 passages
-   (~4 500 étapes estimées, ~35 min) à 2e-4 sur les ~292 000 conversations (OpenAssistant, French Alpaca, French Instruct,
+2. **Fine-tuning** sur `data/dialogues.txt` et `data/identite.txt` -> sauvegardé dans `model/`. 1,5 passage
+   (~1 450 étapes pour le modèle large) à 2e-4 sur les ~292 000 conversations (OpenAssistant, French Alpaca, French Instruct,
    Luth-SFT : voir DataBuilder). Dropout 0,1 (`ModelConfig.Dropout`), betas (0,9 ; 0,999), weight decay aussi sur l'embedding.
    Avec de petits dialogues, l'arrêt anticipé s'arrête avant qu'il les apprenne par cœur.
+   Chaque extrait commence au début d'une conversation (`<|doc|>`), suivie des conversations d'après tant qu'elles
+   tiennent en entier ; le reste de l'extrait est du remplissage, jamais noté (~9 % en contexte 512, ~17 % en 256).
+   Un masque d'attention par conversation (`DocumentMask`) fait que chacune ne voit qu'elle-même, et ses positions
+   (RoPE) repartent de 0 : le modèle apprend chaque conversation comme s'il la lisait seule, depuis son début,
+   comme en discutant. Une conversation plus longue que le contexte est coupée. Les passages ne comptent pas le
+   remplissage (`TextDataset.ExtractFill`).
 
 Identité : `data/identite.txt` contient 50 conversations sur qui est MiniChat (nom, ce qu'il sait faire, ses
 limites), au même format que `dialogues.txt`. Chacune est glissée 10 fois parmi les dialogues, à des places
@@ -188,7 +195,7 @@ Trois tailles (`ModelConfig.Sizes`), toutes avec des têtes d'attention de 64 di
 | `large`  | 768 | 12 | 12 | 512 | ~91 M | 4 x 16 extraits = 32 768 tokens | 6e-4 | 1000 pas |
 
 \* avec 8000 tokens de vocabulaire. La vitesse descend en cosinus jusqu'à LR max / 10. Le fine-tuning garde
-ses réglages (2e-4, 2,5 passages) avec les mêmes paquets que le pré-entraînement (8 ou 4 extraits) ; le texte
+ses réglages (2e-4, 1,5 passage) avec les mêmes paquets que le pré-entraînement (8 ou 4 extraits) ; le texte
 général y est arrondi à 2 extraits sur 8 (1 sur 4 pour large), soit 25 %.
 
 Avant de commencer, `/train` affiche le nombre exact de paramètres, le nombre d'étapes de chaque phase et la
@@ -249,7 +256,7 @@ Attention à la taille : libtorch CUDA fait plusieurs Go (voir la taille affich�
 2. Lance `MiniChat.exe` depuis ce dossier, ou depuis n'importe où :
    `C:\MiniChat\MiniChat.exe`. Les options marchent pareil :
    `MiniChat.exe --train`, `--finetune`, `--resume`, `--continue <pas>`, `--continue-finetune <pas>`, `--lr <vitesse>`, `--epochs <passages>`,
-   `--data <dossier>`, `--models <dossier>`.
+   `--data <dossier>`, `--models <dossier>`, `--benchmark [taille]`.
 3. Pré-requis sur l'autre PC :
    - Windows 10/11 64 bits.
    - [Visual C++ Redistributable x64](https://aka.ms/vs/17/release/vc_redist.x64.exe) (libtorch en a besoin ;
@@ -267,7 +274,26 @@ Chaque entraînement (`--train` ou `--finetune`) laisse deux fichiers avec la m�
   une température (0.7) et une graine (1234) fixes. Seul le modèle change : compare les fichiers entre eux.
 - `<date>-loss.csv` : les loss mesurées pendant l'entraînement (s'ouvre dans Excel pour tracer les courbes),
   avec la vitesse (`tokens_par_seconde`, entre deux mesures) et la mémoire GPU utilisée (`memoire_gpu_mo`, toute la carte)
-  et les passages faits sur les données (`passages`).
+  et les passages faits sur les données (`passages`), puis la loss de vérification par caractère de texte
+  (`loss_verification_par_caractere`, voir plus bas).
+- `<date>-eval-<nom>.txt` (`/eval`, `/compare`) : chaque question de `data/eval.json`, la réponse du modèle, juste ou non.
+- `eval-<nom>.jsonl` : l'historique des évaluations de ce modèle, une ligne par `/eval` complet (date, entraînement
+  et pas du modèle, score par catégorie). `model` garde le même historique d'un entraînement à l'autre.
+
+Loss par caractère : la loss de vérification divisée par les caractères de texte des tokens notés, au lieu du
+nombre de tokens (les tokens spéciaux comptent 0 caractère, mais leur erreur compte). Elle ne dépend pas du
+tokenizer : un modèle à 8000 tokens et un à 4000 se comparent avec elle, pas avec la loss par token. Elle est
+notée avec le modèle (`training.json`) et affichée par `/stats` et `/compare` ; `?` pour un modèle d'avant.
+
+Évaluation notée (`/eval`) : 100 questions de `data/eval.json` (20 par catégorie : capitales, sciences,
+histoire, vocabulaire, calcul), chacune avec ses réponses acceptées. Le modèle répond en glouton (toujours le
+token le plus probable, 48 tokens au plus) : même modèle, mêmes réponses. Une réponse est juste si elle contient
+l'une des réponses acceptées, sans tenir compte des majuscules, des accents ni de la ponctuation, en mots entiers
+(« 4 » n'est pas trouvé dans « 14 »). Le fichier se modifie à la main (catégories et réponses libres).
+
+Vitesse : `MiniChat.exe --benchmark [small|medium|large]` (large par défaut) mesure les tokens/s du pré-entraînement
+et du fine-tuning avec des micro-batchs de 4, 8 et 16 extraits (même nombre d'extraits par étape), sans données
+ni écriture sur le disque, puis quitte. À lancer GPU libre (pas de jeu ni d'autre entraînement en même temps).
 
 Pendant l'entraînement, une réponse d'exemple à la première question s'affiche tous les 1000 pas
 (`SampleInterval` dans `TrainingConfig`).
@@ -345,19 +371,23 @@ Attention : la sortie est **écrasée** (sauf avec `chat --append oui`). Garde u
 | `Config/`        | `ModelConfig`         | Taille du réseau (couches, têtes, mémoire) |
 |                  | `TrainingConfig`      | Nombre d'étapes, vitesse d'apprentissage |
 | `Tokenization/`  | `BpeTokenizer`        | Texte ↔ nombres, par morceaux de mots (BPE appris sur nos textes) |
-| `Data/`          | `TextDataset`         | Découpe le texte en extraits pour l'entraînement |
+| `Data/`          | `TextDataset`         | Découpe le texte en extraits pour l'entraînement (dialogues : conversations entières) |
+|                  | `TokenCache`          | Les tokens de `texte.txt` et des dialogues gardés dans `cache/` |
 | `Model/`         | `CausalSelfAttention` | L'attention : regarder les tokens d'avant |
 |                  | `FeedForward`         | Petit réseau appliqué à chaque position, GELU (Classic) |
 |                  | `SwiGlu`              | Le même rôle, avec une « vanne » SiLU (Modern) |
 |                  | `RmsNorm`             | Normalisation sans moyenne ni biais (Modern ; Classic : LayerNorm) |
 |                  | `Rope`                | Positions par rotation de Q et K dans l'attention (Modern) |
+|                  | `DocumentMask`        | Plusieurs conversations par extrait : chacune ne voit qu'elle-même, positions depuis 0 |
 |                  | `KvCache`             | Keys/Values déjà calculées, pour générer sans tout recalculer |
 |                  | `TransformerBlock`    | Attention + FeedForward + connexions résiduelles |
 |                  | `MiniGpt`             | Le modèle complet |
 | `Training/`      | `Trainer`             | La boucle d'apprentissage |
+|                  | `SpeedBenchmark`      | Vitesse d'entraînement selon le micro-batch (`--benchmark`) |
 | `Generation/`    | `TextGenerator`       | Écrit du texte token par token (top-k, top-p) |
 | `Chat/`          | `ChatSession`         | Transforme la génération en conversation |
 | `Evaluation/`    | `QuestionTest`        | Questions de test après l'entraînement, exemples pendant |
+|                  | `EvalTest`, `EvalHistory` | `/eval` : questions notées toutes seules, historique par modèle |
 | `Storage/`       | `ModelStore`          | Sauvegarde / chargement du modèle |
 | `App/`           | `Workbench`           | Le modèle chargé et ce qui le change : entraîner, continuer, reprendre, tester |
 |                  | `PretrainPhase`, `FinetunePhase`, `ContinuePhase` | Les phases de l'entraînement (ce qu'elles font pareil : `TrainingPhase`) |
@@ -380,8 +410,11 @@ dotnet test MiniChat.Tests
 ```
 
 Projet xUnit à part, `MiniChat.Tests/` (sur le CPU, avec libtorch CPU : pas besoin de GPU, quelques secondes) :
-tokenizer BPE, format des conversations et masque de la loss, découpage entraînement/vérification, calendrier
-du learning rate, nombre de pas avec `--epochs`, checkpoint et reprise, cache de tokens. Les tests qui
+tokenizer BPE, format des conversations et masque de la loss, découpage entraînement/vérification, extraits de
+conversations et masque d'attention par conversation (des conversations mises bout à bout donnent les mêmes logits
+que chacune seule), calendrier du learning rate, nombre de pas avec `--epochs`, checkpoint et reprise, cache de
+tokens, loss par caractère, `/eval` (réponses acceptées, historique). Les tests tournent un par un (ils partagent
+le tokenizer de test et la graine de TorchSharp). Les tests qui
 entraînent utilisent un modèle minuscule (1 couche, 32 dimensions).
 
 ## Architecture (`ModelConfig.Architecture`)

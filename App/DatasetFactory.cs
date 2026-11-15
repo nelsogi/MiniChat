@@ -42,6 +42,7 @@ public sealed class DatasetFactory
         DialoguesPath = Path.Combine(dataFolder, "dialogues.txt");
         _identityPath = Path.Combine(dataFolder, "identite.txt");
         QuestionsPath = Path.Combine(dataFolder, "questions-test.txt");
+        EvalPath = Path.Combine(dataFolder, "eval.json");
         _cacheFolder = cacheFolder;
         _device = device;
     }
@@ -54,6 +55,9 @@ public sealed class DatasetFactory
 
     /// <summary>questions-test.txt : les questions posées après chaque entraînement et par /test.</summary>
     public string QuestionsPath { get; }
+
+    /// <summary>eval.json : les questions notées toutes seules de /eval (voir EvalTest).</summary>
+    public string EvalPath { get; }
 
     /// <summary>
     /// Nouveau tokenizer BPE, appris sur les DEUX fichiers : il connaît les mots des dialogues,
@@ -71,20 +75,22 @@ public sealed class DatasetFactory
             () => TextDataset.TokenizeFile(TextPath, tokenizer));
 
     // Les dialogues et identite.txt : le cache change si l'un des deux change (ou IdentityRepeats).
+    // Chaque extrait est fait de conversations entières, qui commencent à <|doc|> et ne se voient pas entre elles.
     public TextDataset Dialogues(BpeTokenizer tokenizer, int seed) =>
         Dataset("dialogues", DialogueSources(), $"identite x{IdentityRepeats}, graine {IdentitySeed}", tokenizer, seed,
-            onlyReplies: true, () => TextDataset.Tokenize(ReadDialogues(), tokenizer, onlyReplies: true));
+            onlyReplies: true, () => TextDataset.Tokenize(ReadDialogues(), tokenizer, onlyReplies: true),
+            documentToken: tokenizer.SpecialId(BpeTokenizer.DocToken));
 
     public static string CheckExists(string path) =>
         File.Exists(path) ? path : throw new UserException($"Fichier de données introuvable : {path}");
 
     private TextDataset Dataset(string name, IReadOnlyList<string> sources, string settings, BpeTokenizer tokenizer,
-        int seed, bool onlyReplies, Func<TokenizedText> tokenize)
+        int seed, bool onlyReplies, Func<TokenizedText> tokenize, int? documentToken = null)
     {
         var (text, fromCache) = Messages.Spin($"Lecture de {Label(sources)}...",
             () => TokenCache.Load(_cacheFolder, name, sources, settings, tokenizer, onlyReplies, tokenize));
         Messages.Dim($"{Label(sources)} : " + (fromCache ? "tokens relus depuis cache/." : "découpé en tokens, gardé dans cache/."));
-        return new TextDataset(text, seed, _device);
+        return new TextDataset(text, seed, _device, documentToken: documentToken);
     }
 
     // Lit un fichier de données. Sur Windows les fins de ligne sont "\r\n" : on garde seulement "\n".

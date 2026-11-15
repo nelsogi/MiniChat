@@ -10,8 +10,9 @@ namespace MiniChat.Storage;
 /// <summary>
 /// Ce qui a produit les poids sauvegardés. Step = pas atteint à la fin (une continuation repart de là),
 /// ValLoss = loss de vérification des poids gardés, RunId = date de l'entraînement (nom de son CSV de loss).
+/// ValLossPerChar = la même loss par caractère de texte (null pour un modèle sauvegardé avant elle).
 /// </summary>
-public sealed record TrainingInfo(int Step, float ValLoss, string RunId);
+public sealed record TrainingInfo(int Step, float ValLoss, string RunId, float? ValLossPerChar = null);
 
 /// <summary>
 /// Sauvegarde et recharge un modèle entraîné dans un dossier :

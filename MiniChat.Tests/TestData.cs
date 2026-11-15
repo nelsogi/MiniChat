@@ -4,7 +4,12 @@ using MiniChat.Data;
 using MiniChat.Model;
 using MiniChat.Tokenization;
 using MiniChat.Training;
+using Xunit;
 using static TorchSharp.torch;
+
+// Les tests partagent le tokenizer de TestData (son cache d'encodage n'est pas fait pour plusieurs threads) et la graine
+// globale de TorchSharp (manual_seed) : ils tournent un par un. Tous ensemble, ~1 s.
+[assembly: CollectionBehavior(DisableTestParallelization = true)]
 
 namespace MiniChat.Tests;
 
@@ -28,13 +33,13 @@ internal static class TestData
     public static BpeTokenizer Tokenizer => SharedTokenizer.Value;
 
     /// <summary>Un modèle minuscule : 1 couche, 32 dimensions, contexte de 16 tokens.</summary>
-    public static ModelConfig TinyConfig(int vocabSize) =>
-        new() { VocabSize = vocabSize, BlockSize = 16, EmbedDim = 32, Heads = 2, Layers = 1 };
+    public static ModelConfig TinyConfig(int vocabSize, ModelArchitecture architecture = ModelArchitecture.Modern) =>
+        new() { VocabSize = vocabSize, BlockSize = 16, EmbedDim = 32, Heads = 2, Layers = 1, Architecture = architecture };
 
-    public static MiniGpt TinyModel(int seed = 1)
+    public static MiniGpt TinyModel(int seed = 1, ModelArchitecture architecture = ModelArchitecture.Modern)
     {
         manual_seed(seed);
-        return new MiniGpt(TinyConfig(Tokenizer.VocabSize));
+        return new MiniGpt(TinyConfig(Tokenizer.VocabSize, architecture));
     }
 
     /// <summary>length tokens tirés au hasard (graine fixe) dans le vocabulaire de Tokenizer.</summary>
@@ -45,6 +50,25 @@ internal static class TestData
         for (int i = 0; i < length; i++)
             ids[i] = (short)random.Next(Tokenizer.VocabSize);
         return new TokenizedText(ids, null, length);
+    }
+
+    /// <summary>
+    /// count conversations de 1 à 3 tours, de longueurs variées (graine fixe), au format du modèle, découpées
+    /// en tokens avec le masque des réponses (comme dialogues.txt au fine-tuning).
+    /// </summary>
+    public static TokenizedText Conversations(int count, int seed = 5) =>
+        TextDataset.Tokenize(ChatFormat.FromDialogueFile(DialogueFile(count, seed)), Tokenizer, onlyReplies: true);
+
+    /// <summary>Les mêmes conversations, au format de dialogues.txt (Toi: / IA:, une ligne vide entre deux).</summary>
+    public static string DialogueFile(int count, int seed = 5)
+    {
+        string[] questions = ["Bonjour !", "Comment vas-tu ?", "Quelle est la capitale de la France ?", "Le chat dort ?"];
+        string[] replies = ["Bien.", "Paris est la capitale de la France.", "Le chien joue dans le jardin avec une balle rouge.",
+            "Très bien, merci, et toi ?", "Oui."];
+        var random = new Random(seed);
+        return string.Join("\n\n", Enumerable.Range(0, count).Select(_ => string.Join("\n",
+            Enumerable.Range(0, random.Next(1, 4)).Select(_ =>
+                $"Toi: {questions[random.Next(questions.Length)]}\nIA: {replies[random.Next(replies.Length)]}"))));
     }
 
     /// <summary>Réglages d'un entraînement de quelques pas sur le modèle minuscule.</summary>

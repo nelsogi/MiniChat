@@ -45,9 +45,10 @@ public sealed class TransformerBlock : Module<Tensor, Tensor>
     public override Tensor forward(Tensor x) => Forward(x, cache: null, layer: 0);
 
     /// <param name="cache">Génération avec cache KV (voir CausalSelfAttention.Forward), null à l'entraînement.</param>
-    public Tensor Forward(Tensor x, KvCache? cache, int layer)
+    /// <param name="documents">Plusieurs conversations par extrait (voir DocumentMask), null sinon.</param>
+    public Tensor Forward(Tensor x, KvCache? cache, int layer, DocumentMask? documents = null)
     {
-        x = x + _attention.Forward(_norm1.forward(x), cache, layer);
+        x = x + _attention.Forward(_norm1.forward(x), cache, layer, documents);
         x = x + _feedForward.forward(_norm2.forward(x));
         return x;
     }

@@ -2,17 +2,26 @@ using System.Globalization;
 
 namespace MiniChat.Training;
 
-/// <summary>Une ligne du CSV des loss : une mesure pendant l'entraînement (voir Trainer.WriteCsvLine).</summary>
-public sealed record LossPoint(string Phase, int Step, float TrainLoss, float ValLoss, double LearningRate);
+/// <summary>
+/// Une ligne du CSV des loss : une mesure pendant l'entraînement (voir Trainer.WriteCsvLine).
+/// ValLossPerChar : loss de vérification par caractère, null si elle n'est pas dans le CSV (CSV d'avant).
+/// </summary>
+public sealed record LossPoint(string Phase, int Step, float TrainLoss, float ValLoss, double LearningRate,
+    float? ValLossPerChar = null);
 
 /// <summary>
-/// Relit le CSV des loss écrit par le Trainer (results/&lt;date&gt;-loss.csv) :
-///   phase,etape,loss_entrainement,loss_verification,learning_rate,secondes,tokens_par_seconde,memoire_gpu_mo
-/// (les CSV d'avant n'ont pas les deux dernières colonnes ; seules les cinq premières sont relues ici).
-/// Les deux phases sont dans le même fichier, et leurs pas repartent chacun de 0.
+/// Relit le CSV des loss écrit par le Trainer (results/&lt;date&gt;-loss.csv) : voir Header.
+/// Les CSV d'avant n'ont pas les dernières colonnes ; seules les cinq premières et la loss par caractère
+/// sont relues ici. Les deux phases sont dans le même fichier, et leurs pas repartent chacun de 0.
 /// </summary>
 public static class LossCsv
 {
+    public const string Header =
+        "phase,etape,loss_entrainement,loss_verification,learning_rate,secondes,tokens_par_seconde,memoire_gpu_mo,passages," +
+        "loss_verification_par_caractere";
+
+    private const int PerCharColumn = 9;
+
     /// <summary>
     /// Les mesures de chaque phase, dans l'ordre du fichier, triées par pas.
     /// Après une reprise (--resume), les pas refaits depuis le checkpoint sont mesurés deux fois :
@@ -49,11 +58,13 @@ public static class LossCsv
             return null;
 
         var culture = CultureInfo.InvariantCulture;
+        float? perChar = fields.Length > PerCharColumn
+                         && float.TryParse(fields[PerCharColumn], NumberStyles.Float, culture, out float value) ? value : null;
         return int.TryParse(fields[1], NumberStyles.Integer, culture, out int step)
                && float.TryParse(fields[2], NumberStyles.Float, culture, out float train)
                && float.TryParse(fields[3], NumberStyles.Float, culture, out float val)
                && double.TryParse(fields[4], NumberStyles.Float, culture, out double lr)
-            ? new LossPoint(fields[0], step, train, val, lr)
+            ? new LossPoint(fields[0], step, train, val, lr, perChar)
             : null;
     }
 }

@@ -20,7 +20,7 @@ public sealed class TextDatasetSplitTests
             .Concat(validation.Select(s => (s.Start, s.Length, Validation: true)))
             .OrderBy(s => s.Start)
             .ToList();
-        int position = 0;
+        long position = 0;
         foreach (var segment in all)
         {
             Assert.Equal(position, segment.Start);

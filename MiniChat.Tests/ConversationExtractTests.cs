@@ -33,7 +33,7 @@ public sealed class ConversationExtractTests
             {
                 Assert.Equal(Doc, Text.Ids[conversation.Start]);
                 // Aucun <|doc|> à l'intérieur : une conversation s'arrête au début de la suivante.
-                Assert.DoesNotContain(Text.Ids.Skip(conversation.Start + 1).Take(conversation.Length - 1), id => id == Doc);
+                Assert.DoesNotContain(Text.Ids.Skip((int)conversation.Start + 1).Take(conversation.Length - 1), id => id == Doc);
                 // Elle reste dans un segment de son côté.
                 Assert.Contains(segments, s => conversation.Start >= s.Start
                                                && conversation.Start + conversation.Length <= s.Start + s.Length);

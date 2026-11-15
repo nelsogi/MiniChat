@@ -128,8 +128,11 @@ calculé une fois les données découpées, et le cosinus du learning rate va to
    Dropout 0 (le modèle ne revoit presque jamais le même texte), AdamW betas (0,9 ; 0,95), weight decay 0,1
    sur les matrices des couches mais pas sur l'embedding des tokens.
    `texte.txt` peut faire plusieurs Go : il est lu ligne par ligne, et ses tokens
-   restent sur le CPU, 2 octets chacun (2,9 Go de texte -> ~820 M tokens -> ~1,6 Go de mémoire du PC) : seuls
-   les extraits de chaque micro-batch passent sur le GPU (0,3 ms pour 4 x 512 tokens), la carte reste pour l'entraînement.
+   restent sur le CPU, 2 octets chacun (5,6 Go de texte -> 1,6 milliard de tokens -> 3,2 Go de mémoire du PC) : seuls
+   les extraits de chaque micro-batch passent sur le GPU (0,2 ms pour 4 x 512 tokens), la carte reste pour l'entraînement.
+   Ils sont rangés en morceaux de 268 millions (`ChunkedArray`, index en `long`) : pas de limite de taille (un tableau
+   .NET s'arrête à 2,1 milliards), et ils ne sont gardés qu'une fois en mémoire (pic à ~4 Go pour charger `texte.txt`,
+   ~7 Go avant).
    Le découpage en tokens (~1 min) n'est fait qu'une fois : il est gardé dans `bin/.../cache/` et relu
    en ~1 s tant que `texte.txt` et le tokenizer ne changent pas (même chose pour `dialogues.txt`).
 2. **Fine-tuning** sur `data/dialogues.txt` et `data/identite.txt` -> sauvegardé dans `model/`. 1,5 passage
@@ -428,6 +431,7 @@ Attention : la sortie est **écrasée** (sauf avec `chat --append oui`). Garde u
 | `Tokenization/`  | `BpeTokenizer`        | Texte ↔ nombres, par morceaux de mots (BPE appris sur nos textes) |
 | `Data/`          | `TextDataset`         | Découpe le texte en extraits pour l'entraînement (dialogues : conversations entières) |
 |                  | `TokenCache`          | Les tokens de `texte.txt` et des dialogues gardés dans `cache/` |
+|                  | `ChunkedArray`        | Un tableau en morceaux, index en `long` : les tokens au-delà de 2,1 milliards |
 | `Model/`         | `CausalSelfAttention` | L'attention : regarder les tokens d'avant |
 |                  | `FeedForward`         | Petit réseau appliqué à chaque position, GELU (Classic) |
 |                  | `SwiGlu`              | Le même rôle, avec une « vanne » SiLU (Modern) |

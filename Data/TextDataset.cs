@@ -9,8 +9,16 @@ namespace MiniChat.Data;
 /// Un texte découpé en tokens, avant TextDataset : ce que TokenCache garde sur le disque.
 /// Ids sur 2 octets (short, vocabulaire &lt;= 32 768). Mask : le poids (0 ou 1) de chaque token dans la loss,
 /// null = le modèle est noté sur tous les tokens. Characters = nombre de caractères du texte de départ.
+/// En morceaux (ChunkedArray) : un texte peut dépasser les 2,1 milliards de tokens d'un tableau .NET.
 /// </summary>
-public sealed record TokenizedText(short[] Ids, byte[]? Mask, long Characters);
+public sealed record TokenizedText(ChunkedArray<short> Ids, ChunkedArray<byte>? Mask, long Characters)
+{
+    /// <summary>Depuis des tableaux (petits textes, tests), recopiés en morceaux de chunkSize tokens.</summary>
+    public TokenizedText(short[] ids, byte[]? mask, long characters, int chunkSize = ChunkedArray<short>.DefaultChunkSize)
+        : this(ChunkedArray<short>.From(ids, chunkSize), mask is null ? null : ChunkedArray<byte>.From(mask, chunkSize), characters)
+    {
+    }
+}
 
 /// <summary>
 /// Des extraits pour le modèle. X = les tokens lus, Y = le token suivant de chacun (la bonne réponse),
@@ -45,9 +53,11 @@ public sealed record Batch(Tensor X, Tensor Y, Tensor Mask, Tensor? Documents = 
 /// Une conversation appartient au côté (entraînement ou vérification) où elle commence, et s'arrête à la fin de
 /// son segment : rien ne passe d'un côté à l'autre.
 ///
-/// Les tokens sont gardés sur le CPU, en int16 : un texte.txt de 3 Go donne ~820 millions de tokens (1,6 Go), qui
-/// prendraient au GPU la place de l'entraînement. Un batch y est découpé par des index, puis seuls ses tokens
-/// (quelques milliers) passent sur le device : 0,3 ms par micro-batch de 4 x 512 (mesuré, 820 M tokens, RTX 3060 Ti). À libérer (Dispose) après la phase.
+/// Les tokens sont gardés sur le CPU, en int16, en morceaux de 268 millions (ChunkedArray, index en long) : le
+/// texte.txt de 5,6 Go donne 1,6 milliard de tokens (3,2 Go), qui prendraient au GPU la place de l'entraînement, et
+/// un texte plus grand dépasserait la taille d'un tableau .NET. Un batch est recopié depuis les morceaux (un extrait
+/// peut être à cheval sur deux), puis seuls ses tokens (quelques milliers) passent sur le device. Les tokens ne sont
+/// gardés qu'une fois : pas de copie dans un tenseur. À libérer (Dispose) après la phase.
 /// </summary>
 public sealed class TextDataset : IDisposable
 {
@@ -65,17 +75,17 @@ public sealed class TextDataset : IDisposable
     private const int SplitSeed = 1234;
 
     /// <summary>Une suite de morceaux voisins du même côté (entraînement ou vérification).</summary>
-    internal readonly record struct Segment(int Start, int Length);
+    internal readonly record struct Segment(long Start, long Length);
 
     /// <summary>
     /// Une conversation : Length tokens à partir de Start, du &lt;|doc|&gt; qui l'ouvre au suivant (ou à la fin de son
     /// segment). Elle occupe Length - 1 places dans un extrait : son dernier token n'est que la réponse attendue
     /// (Y) du précédent, il n'y a rien à prédire après.
     /// </summary>
-    internal readonly record struct Conversation(int Start, int Length);
+    internal readonly record struct Conversation(long Start, int Length);
 
-    private readonly Tensor _ids;      // int16, forme (tokens), sur le CPU (voir plus bas)
-    private readonly Tensor? _mask;    // uint8, forme (tokens), sur le CPU ; null = noté sur tous les tokens
+    private readonly ChunkedArray<short> _ids;
+    private readonly ChunkedArray<byte>? _mask;    // null = noté sur tous les tokens
     private readonly Device _device;
     private readonly Segment[] _train;
     private readonly Segment[] _validation;
@@ -107,8 +117,8 @@ public sealed class TextDataset : IDisposable
     public TextDataset(TokenizedText text, int seed, Device device, int validationEvery = 10, int? documentToken = null)
     {
         _device = device;
-        _ids = tensor(text.Ids).DetachFromDisposeScope();
-        _mask = text.Mask is null ? null : tensor(text.Mask).DetachFromDisposeScope();
+        _ids = text.Ids;
+        _mask = text.Mask;
         (_train, _validation) = Split(text.Ids.Length, validationEvery);
         _random = new Random(seed);
         Characters = text.Characters;
@@ -127,31 +137,35 @@ public sealed class TextDataset : IDisposable
     /// s'arrêter (voir ChatFormat.ReplyWeights). Les questions restent lues comme contexte, mais il n'a pas
     /// à apprendre à les écrire : c'est l'humain qui les tape. false : le modèle est noté sur tout le texte.
     /// </summary>
-    public static TokenizedText Tokenize(string text, BpeTokenizer tokenizer, bool onlyReplies)
+    public static TokenizedText Tokenize(string text, BpeTokenizer tokenizer, bool onlyReplies,
+        int chunkSize = ChunkedArray<short>.DefaultChunkSize)
     {
         CheckVocabulary(tokenizer);
         var weights = onlyReplies ? ChatFormat.ReplyWeights(text) : null;
 
         // Un token prend le poids du dernier caractère de son mot (ou de son token spécial). Un mot ne
         // traverse jamais un token spécial, donc "Coucou" (après <|assistant|>) compte, <|assistant|> non.
-        var tokens = tokenizer.EncodeWithPositions(text).ToArray();
-        var ids = tokens.Select(t => (short)t.Id).ToArray();
-        var mask = weights is null ? null : tokens.Select(t => (byte)weights[t.Position]).ToArray();
-        return new TokenizedText(ids, mask, text.Length);
+        var ids = new ChunkedArray<short>.Builder(chunkSize);
+        var mask = weights is null ? null : new ChunkedArray<byte>.Builder(chunkSize);
+        foreach (var token in tokenizer.EncodeWithPositions(text))
+        {
+            ids.Add((short)token.Id);
+            mask?.Add((byte)weights![token.Position]);
+        }
+        return new TokenizedText(ids.Build(), mask?.Build(), text.Length);
     }
 
     /// <summary>
     /// Lit un gros fichier ligne par ligne, sans jamais le charger en entier : au-delà d'environ
     /// 1 milliard de caractères, il ne tient même pas dans une chaîne .NET. Le modèle est noté sur tout le texte.
     /// Même résultat que Tokenize : un mot ne traverse jamais une ligne, on peut donc encoder ligne par ligne.
+    /// Les tokens vont en morceaux de chunkSize (ChunkedArray) : pas de limite de taille, et jamais un grand tableau
+    /// recopié dans un plus grand (seul le dernier morceau est raccourci à la fin).
     /// </summary>
-    public static TokenizedText TokenizeFile(string path, BpeTokenizer tokenizer)
+    public static TokenizedText TokenizeFile(string path, BpeTokenizer tokenizer, int chunkSize = ChunkedArray<short>.DefaultChunkSize)
     {
         CheckVocabulary(tokenizer);
-
-        // Taille de départ : ~1 token pour 3 octets en français (mesuré). Agrandi si besoin.
-        var ids = new short[Math.Clamp(new FileInfo(path).Length / 3, 1024, Array.MaxLength)];
-        int count = 0;
+        var ids = new ChunkedArray<short>.Builder(chunkSize);
         long characters = 0;
 
         // ReadLine enlève aussi les "\r" des fins de ligne Windows.
@@ -160,23 +174,13 @@ public sealed class TextDataset : IDisposable
         {
             characters += line.Length + 1;
             foreach (long id in tokenizer.Encode(line + "\n"))
-            {
-                if (count == ids.Length)
-                {
-                    if (count == Array.MaxLength)
-                        throw new InvalidDataException($"{Path.GetFileName(path)} : plus de {Array.MaxLength:N0} tokens, réduis le fichier (DataBuilder --max-mo).");
-                    Array.Resize(ref ids, (int)Math.Min(2L * ids.Length, Array.MaxLength));
-                }
-                ids[count++] = (short)id;
-            }
+                ids.Add((short)id);
         }
-
-        Array.Resize(ref ids, count);
-        return new TokenizedText(ids, null, characters);
+        return new TokenizedText(ids.Build(), null, characters);
     }
 
-    public long TrainLength => _train.Sum(s => (long)s.Length);
-    public long ValidationLength => _validation.Sum(s => (long)s.Length);
+    public long TrainLength => _train.Sum(s => s.Length);
+    public long ValidationLength => _validation.Sum(s => s.Length);
 
     /// <summary>Nombre de caractères du texte de départ.</summary>
     public long Characters { get; }
@@ -187,8 +191,8 @@ public sealed class TextDataset : IDisposable
     /// mask = le poids de chaque token de y dans la loss.
     /// Exemple : x = [" Bon", "jour", " à"], y = ["jour", " à", " toi"].
     ///
-    /// Les débuts sont tirés sur le CPU (même tirage qu'avant, donc les mêmes extraits), puis le CPU découpe :
-    /// index[b, t] = début[b] + t, pour t de 0 à BlockSize, et les tokens sont lus d'un coup à ces index.
+    /// Les débuts sont tirés sur le CPU (même tirage qu'avant, donc les mêmes extraits), puis chaque extrait et le
+    /// token qui le suit sont recopiés depuis les morceaux (voir Gather).
     /// Dialogues : une conversation tirée au hasard par extrait, puis les suivantes (voir Pack).
     /// </summary>
     public Batch GetBatch(bool validation, int batchSize, int blockSize, Device device)
@@ -290,19 +294,20 @@ public sealed class TextDataset : IDisposable
     /// ou jusqu'à la fin de son segment. Le début d'un segment, avant son premier &lt;|doc|&gt;, est la fin d'une
     /// conversation de l'autre côté : il n'est pas utilisé. Une conversation d'un seul token (rien à prédire) non plus.
     /// </summary>
-    internal static Conversation[] Conversations(short[] ids, Segment[] segments, short documentToken)
+    internal static Conversation[] Conversations(ChunkedArray<short> ids, Segment[] segments, short documentToken)
     {
         var conversations = new List<Conversation>();
         foreach (var segment in segments)
         {
-            int end = segment.Start + segment.Length;
-            int start = -1;
-            for (int i = segment.Start; i <= end; i++)
+            long end = segment.Start + segment.Length;
+            long start = -1;
+            for (long i = segment.Start; i <= end; i++)
             {
                 if (i < end && ids[i] != documentToken)
                     continue;
+                // Une conversation plus longue que 2,1 milliards de tokens n'aurait pas de sens : sa longueur reste un int.
                 if (start >= 0 && i - start >= 2)
-                    conversations.Add(new Conversation(start, i - start));
+                    conversations.Add(new Conversation(start, (int)Math.Min(i - start, int.MaxValue)));
                 start = i;
             }
         }
@@ -318,17 +323,18 @@ public sealed class TextDataset : IDisposable
     }
 
     /// <summary>
-    /// Les extraits de dialogues qui commencent aux conversations firsts (voir Runs), construits et lus sur le
-    /// CPU : pour chaque place, l'index de son token (x) et de la réponse attendue (y),
-    /// son numéro de conversation, et 1 (vrai texte) ou 0 (remplissage). Le remplissage forme une conversation
-    /// à lui (il ne voit et ne gêne personne) et n'est jamais noté.
+    /// Les extraits de dialogues qui commencent aux conversations firsts (voir Runs), construits sur le CPU : pour
+    /// chaque place, son token (x), la réponse attendue (y, le token suivant), son numéro de conversation, et son
+    /// poids : celui de y si c'est du vrai texte, 0 pour le remplissage. Le remplissage (x = y = le premier token de
+    /// l'extrait) forme une conversation à lui : il ne voit et ne gêne personne, et n'est jamais noté.
     /// </summary>
     private Batch Pack(Conversation[] conversations, int[] firsts, int blockSize)
     {
         int count = firsts.Length;
-        var xIndex = new long[count * blockSize];
+        var x = new long[count * blockSize];
+        var y = new long[count * blockSize];
         var documents = new long[count * blockSize];
-        var real = new float[count * blockSize];
+        var mask = new float[count * blockSize];
 
         for (int b = 0; b < count; b++)
         {
@@ -336,55 +342,54 @@ public sealed class TextDataset : IDisposable
             var runs = Runs(conversations, firsts[b], blockSize);
             for (int document = 0; document < runs.Count; document++)
                 for (int t = 0; t < runs[document].Length; t++, place++)
-                    (xIndex[place], documents[place], real[place]) = (runs[document].Start + t, document, 1);
+                {
+                    long at = runs[document].Start + t;
+                    (x[place], y[place], documents[place]) = (_ids[at], _ids[at + 1], document);
+                    mask[place] = _mask is null ? 1 : _mask[at + 1];
+                }
 
             for (; place < (b + 1) * blockSize; place++)
-                (xIndex[place], documents[place], real[place]) = (runs[0].Start, runs.Count, 0);
+                (x[place], y[place], documents[place], mask[place]) = (_ids[runs[0].Start], _ids[runs[0].Start], runs.Count, 0);
         }
 
-        var xAt = tensor(xIndex, device: CPU);
-        var yAt = xAt + tensor(real, device: CPU).to(ScalarType.Int64);   // le token suivant ; remplissage : lui-même
-        var realMask = tensor(real, device: CPU).view(count, blockSize);
-        var mask = _mask is null
-            ? realMask
-            : _mask.index_select(0, yAt).view(count, blockSize).to(ScalarType.Float32) * realMask;
-        return new Batch(
-            _ids.index_select(0, xAt).view(count, blockSize).to(ScalarType.Int64),
-            _ids.index_select(0, yAt).view(count, blockSize).to(ScalarType.Int64),
-            mask,
-            tensor(documents, device: CPU).view(count, blockSize));
+        long[] shape = [count, blockSize];
+        return new Batch(tensor(x, shape), tensor(y, shape), tensor(mask, shape), tensor(documents, shape));
     }
 
     private static Batch To(Batch batch, Device device) =>
         new(batch.X.to(device), batch.Y.to(device), batch.Mask.to(device), batch.Documents?.to(device));
 
     /// <summary>
-    /// Les extraits qui commencent à starts, découpés sur le CPU : index[b, t] = début[b] + t, pour t de 0 à
-    /// BlockSize, et les tokens sont lus d'un coup à ces index.
+    /// Les extraits qui commencent à starts : les BlockSize + 1 tokens à partir de chaque début (l'extrait et le
+    /// token qui le suit), recopiés depuis les morceaux, même à cheval sur deux. x = les BlockSize premiers,
+    /// y = les BlockSize derniers.
     /// </summary>
     private Batch Gather(long[] starts, int blockSize)
     {
         int count = starts.Length;
+        var x = new long[count * blockSize];
+        var y = new long[count * blockSize];
+        var mask = _mask is null ? null : new float[count * blockSize];
+        var tokens = new short[blockSize + 1];
+        var weights = new byte[blockSize + 1];
 
-        // (extraits, BlockSize + 1) : chaque extrait et le token qui le suit.
-        var index = tensor(starts, device: CPU).unsqueeze(1)
-                    + arange(blockSize + 1, ScalarType.Int64, CPU).unsqueeze(0);
-        var tokens = _ids.index_select(0, index.view(-1)).view(count, blockSize + 1).to(ScalarType.Int64);
+        for (int b = 0; b < count; b++)
+        {
+            _ids.CopyTo(starts[b], tokens);
+            for (int t = 0; t < blockSize; t++)
+                (x[b * blockSize + t], y[b * blockSize + t]) = (tokens[t], tokens[t + 1]);
+            if (mask is null) continue;
+            _mask!.CopyTo(starts[b], weights);
+            for (int t = 0; t < blockSize; t++)
+                mask[b * blockSize + t] = weights[t + 1];
+        }
 
-        var x = tokens.narrow(1, 0, blockSize).contiguous();
-        var y = tokens.narrow(1, 1, blockSize).contiguous();
-        var mask = _mask is null
-            ? ones(count, blockSize, ScalarType.Float32, CPU)
-            : _mask.index_select(0, index.narrow(1, 1, blockSize).reshape(-1)).view(count, blockSize).to(ScalarType.Float32);
-        return new Batch(x, y, mask);
+        long[] shape = [count, blockSize];
+        return new Batch(tensor(x, shape), tensor(y, shape),
+            mask is null ? ones(count, blockSize, ScalarType.Float32, CPU) : tensor(mask, shape));
     }
 
-    public void Dispose()
-    {
-        _ids.Dispose();
-        _mask?.Dispose();
-        DisposeFixedValidation();
-    }
+    public void Dispose() => DisposeFixedValidation();
 
     private void DisposeFixedValidation()
     {
@@ -400,12 +405,12 @@ public sealed class TextDataset : IDisposable
     /// Coupe length tokens en morceaux, en met un sur validationEvery en vérification, et regroupe les
     /// morceaux voisins du même côté (un extrait peut passer d'un morceau d'entraînement au suivant).
     /// </summary>
-    internal static (Segment[] Train, Segment[] Validation) Split(int length, int validationEvery)
+    internal static (Segment[] Train, Segment[] Validation) Split(long length, int validationEvery)
     {
         // Tout petit texte : des morceaux sous MinChunkTokens, pour en avoir au moins validationEvery.
-        int chunk = Math.Max(1, Math.Max(Math.Min(length / MinChunks, ChunkTokens),
-                                         Math.Min(MinChunkTokens, length / validationEvery)));
-        int chunks = (length + chunk - 1) / chunk;
+        int chunk = (int)Math.Max(1, Math.Max(Math.Min(length / MinChunks, ChunkTokens),
+                                              Math.Min(MinChunkTokens, length / validationEvery)));
+        int chunks = checked((int)((length + chunk - 1) / chunk));
 
         var random = new Random(SplitSeed);
         var isValidation = new bool[chunks];
@@ -427,8 +432,8 @@ public sealed class TextDataset : IDisposable
             if (i < chunks && isValidation[i] == isValidation[first])
                 continue;
 
-            int start = first * chunk;
-            var segment = new Segment(start, Math.Min(i * chunk, length) - start);
+            long start = (long)first * chunk;
+            var segment = new Segment(start, Math.Min((long)i * chunk, length) - start);
             (isValidation[first] ? validation : train).Add(segment);
             first = i;
         }
@@ -463,7 +468,7 @@ public sealed class TextDataset : IDisposable
     }
 
     /// <summary>Le début d'extrait n° index (voir StartsIndex) : son segment, puis la position dans le segment.</summary>
-    private static int PickStart(Segment[] segments, long[] ends, long index)
+    private static long PickStart(Segment[] segments, long[] ends, long index)
     {
         // Premier segment dont ends dépasse index. BinarySearch renvoie ~position quand la valeur manque ;
         // quand elle est là (index == ends[i]), le début est dans un segment suivant.
@@ -472,7 +477,7 @@ public sealed class TextDataset : IDisposable
         while (ends[i] == (i == 0 ? 0 : ends[i - 1]))   // segments trop courts pour un extrait : sautés
             i++;
         long before = i == 0 ? 0 : ends[i - 1];
-        return segments[i].Start + (int)(index - before);
+        return segments[i].Start + (index - before);
     }
 
     private static void CheckVocabulary(BpeTokenizer tokenizer)

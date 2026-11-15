@@ -21,6 +21,10 @@ public static class TokenCache
     private const int FormatVersion = 1;
     private static readonly byte[] Magic = "MCTK"u8.ToArray();
 
+    // Les ids sont lus et écrits par morceaux : au-delà de ~1 milliard de tokens, leurs octets ne tiennent pas dans un
+    // seul Span (2 Go au plus). Le texte.txt de 5,6 Go en donne 1,6 milliard (3,2 Go).
+    private const int ChunkIds = 1 << 26;
+
     /// <summary>
     /// Les tokens tirés des fichiers sources : depuis le cache s'il correspond, sinon tokenize(), puis écrits dans le cache.
     /// settings : ce qui change le résultat sans être dans les fichiers (ex. le nombre de copies d'identite.txt).
@@ -71,7 +75,8 @@ public static class TokenCache
 
             long characters = reader.ReadInt64();
             var ids = new short[reader.ReadInt32()];
-            reader.BaseStream.ReadExactly(MemoryMarshal.AsBytes(ids.AsSpan()));
+            for (int start = 0; start < ids.Length; start += ChunkIds)
+                reader.BaseStream.ReadExactly(MemoryMarshal.AsBytes(ids.AsSpan(start, Math.Min(ChunkIds, ids.Length - start))));
             byte[]? mask = null;
             if (onlyReplies)
             {
@@ -103,7 +108,8 @@ public static class TokenCache
             writer.Write(onlyReplies);
             writer.Write(text.Characters);
             writer.Write(text.Ids.Length);
-            writer.Write(MemoryMarshal.AsBytes(text.Ids.AsSpan()));
+            for (int start = 0; start < text.Ids.Length; start += ChunkIds)
+                writer.Write(MemoryMarshal.AsBytes(text.Ids.AsSpan(start, Math.Min(ChunkIds, text.Ids.Length - start))));
             if (onlyReplies)
                 writer.Write(text.Mask!);
         }
